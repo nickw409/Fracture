@@ -235,6 +235,52 @@ mod tests {
     }
 
     #[test]
+    fn test_generation_config_default() {
+        let config = GenerationConfig::default();
+        assert_eq!(config.max_tokens, 256);
+        assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.top_k, 0);
+        assert_eq!(config.top_p, 1.0);
+        assert!(config.stop_tokens.contains(&128001));
+        assert!(config.stop_tokens.contains(&128008));
+        assert!(config.stop_tokens.contains(&128009));
+    }
+
+    #[test]
+    fn test_chat_template_system_wrapping() {
+        let messages = vec![
+            ("system".to_string(), "Be concise.".to_string()),
+            ("user".to_string(), "Hi".to_string()),
+        ];
+        let result = apply_chat_template(&messages);
+        // System message must be wrapped with header tags
+        assert!(result.contains("<|start_header_id|>system<|end_header_id|>\n\nBe concise.<|eot_id|>"));
+    }
+
+    #[test]
+    fn test_chat_template_assistant_suffix() {
+        // Single user message
+        let messages = vec![("user".to_string(), "Hello".to_string())];
+        let result = apply_chat_template(&messages);
+        assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+        // Multi-turn with system
+        let messages = vec![
+            ("system".to_string(), "You are helpful.".to_string()),
+            ("user".to_string(), "Hello".to_string()),
+            ("assistant".to_string(), "Hi".to_string()),
+            ("user".to_string(), "Bye".to_string()),
+        ];
+        let result = apply_chat_template(&messages);
+        assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+        // Empty messages list
+        let messages: Vec<(String, String)> = vec![];
+        let result = apply_chat_template(&messages);
+        assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
     fn test_chat_template_empty_content() {
         let messages = vec![
             ("system".to_string(), "".to_string()),

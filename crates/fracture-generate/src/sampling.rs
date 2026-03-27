@@ -185,6 +185,124 @@ mod tests {
     }
 
     #[test]
+    fn test_greedy_determinism() {
+        let logits = simple_logits();
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let first = Sampler::sample(&logits, &params).unwrap();
+        for _ in 0..99 {
+            assert_eq!(Sampler::sample(&logits, &params).unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn test_sampling_params_default() {
+        let params = SamplingParams::default();
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_k, 0);
+        assert_eq!(params.top_p, 1.0);
+    }
+
+    #[test]
+    fn test_top_p_disables_at_one() {
+        // With top_p=1.0, all tokens should be candidates.
+        // Use a fairly flat distribution so multiple tokens can appear.
+        let logits = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(Sampler::sample(&logits, &params).unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "with top_p=1.0 and uniform logits, multiple distinct tokens should appear, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_top_k_disables_at_zero() {
+        // top_k=0 means no filtering — all tokens are candidates.
+        let logits = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(Sampler::sample(&logits, &params).unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "with top_k=0, all tokens should be candidates, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_top_k_equals_vocab_size_disables() {
+        // top_k equal to vocab size means no filtering.
+        let logits = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 5,
+            top_p: 1.0,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(Sampler::sample(&logits, &params).unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "with top_k=vocab_size, all tokens should be candidates, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_weighted_random_selection() {
+        // Higher-logit tokens should appear more frequently.
+        let logits = vec![10.0, 0.0, 0.0, 0.0, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let mut counts = [0u32; 5];
+        for _ in 0..1000 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            counts[token as usize] += 1;
+        }
+        // Token 0 has logit 10.0, should dominate heavily
+        assert!(
+            counts[0] > counts[1],
+            "token 0 (logit=10.0) should appear more than token 1 (logit=0.0): {} vs {}",
+            counts[0],
+            counts[1]
+        );
+        assert!(
+            counts[0] > counts[2],
+            "token 0 (logit=10.0) should appear more than token 2 (logit=0.0): {} vs {}",
+            counts[0],
+            counts[2]
+        );
+        // Token 0 should have the majority of samples
+        assert!(
+            counts[0] > 500,
+            "token 0 should appear in >50% of 1000 samples, got {}",
+            counts[0]
+        );
+    }
+
+    #[test]
     fn test_combined_top_k_top_p() {
         // top_k=3 keeps indices 1,2,0 (logits 3.0, 2.0, 1.0)
         // top_p=0.5 further filters to only highest-prob tokens

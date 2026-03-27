@@ -406,4 +406,31 @@ mod tests {
     fn test_valid_chat_request_passes() {
         assert!(validate_chat_request(&valid_chat_request()).is_ok());
     }
+
+    #[test]
+    fn test_valid_params_with_streaming() {
+        let mut req = valid_completion_request();
+        req.stream = true;
+        assert!(validate_completion_request(&req).is_ok());
+
+        let mut chat_req = valid_chat_request();
+        chat_req.stream = true;
+        assert!(validate_chat_request(&chat_req).is_ok());
+    }
+
+    #[test]
+    fn test_temperature_zero_is_valid() {
+        assert!(validate_sampling_params(0.0, 1.0, 0, 256).is_ok());
+    }
+
+    #[test]
+    fn test_top_p_boundary_values() {
+        assert!(validate_sampling_params(1.0, 0.0, 0, 256).is_ok());
+        assert!(validate_sampling_params(1.0, 1.0, 0, 256).is_ok());
+    }
+
+    #[test]
+    fn test_max_tokens_one_is_valid() {
+        assert!(validate_sampling_params(1.0, 1.0, 0, 1).is_ok());
+    }
 }

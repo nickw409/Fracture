@@ -79,4 +79,13 @@ mod tests {
         let t = DeviceTensor::new(TensorId(0), vec![1023], DType::INT4);
         assert_eq!(t.size_bytes(), 512);
     }
+
+    #[test]
+    fn test_device_tensor_is_opaque() {
+        // Verify DeviceTensor is composed of TensorId + shape + dtype (no raw pointers).
+        let t = DeviceTensor::new(TensorId(42), vec![3, 4], DType::FP16);
+        assert_eq!(t.id, TensorId(42));
+        assert_eq!(t.shape, vec![3, 4]);
+        assert_eq!(t.dtype, DType::FP16);
+    }
 }

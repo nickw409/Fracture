@@ -226,3 +226,502 @@ impl WeightStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use fracture_core::{DType, DeviceTimer, TensorId};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct MockBackend {
+        next_id: AtomicU64,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+            }
+        }
+    }
+
+    impl Backend for MockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_to_host(&self, _src: &DeviceTensor, _dst: &mut [u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn matmul(
+            &self,
+            _a: &DeviceTensor,
+            _b: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rmsnorm(
+            &self,
+            _input: &DeviceTensor,
+            _weight: &DeviceTensor,
+            _eps: f64,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rope(
+            &self,
+            _q: &DeviceTensor,
+            _k: &DeviceTensor,
+            _positions: &[u32],
+            _theta: f64,
+            _head_dim: usize,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn attention(
+            &self,
+            _q: &DeviceTensor,
+            _k_cache: &DeviceTensor,
+            _v_cache: &DeviceTensor,
+            _num_kv_heads: usize,
+            _start_pos: usize,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn silu_mul(
+            &self,
+            _gate: &DeviceTensor,
+            _up: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn embedding(
+            &self,
+            _token_ids: &[u32],
+            _embedding_table: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn add(
+            &self,
+            _a: &DeviceTensor,
+            _b: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn copy_rows(
+            &self,
+            _src: &DeviceTensor,
+            _dst: &DeviceTensor,
+            _src_offset: usize,
+            _dst_offset: usize,
+            _count: usize,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn device_name(&self) -> &str {
+            "mock"
+        }
+
+        fn total_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn available_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn synchronize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_timer(&self) -> Result<DeviceTimer> {
+            Ok(DeviceTimer(0))
+        }
+
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> {
+            Ok(0.0)
+        }
+
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── GGUF builder helpers ──────────────────────────────────────────
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.write_u64::<LittleEndian>(s.len() as u64).unwrap();
+        buf.write_all(s.as_bytes()).unwrap();
+    }
+
+    fn write_metadata_kv_u32(buf: &mut Vec<u8>, key: &str, val: u32) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(4).unwrap(); // Uint32
+        buf.write_u32::<LittleEndian>(val).unwrap();
+    }
+
+    fn write_metadata_kv_f32(buf: &mut Vec<u8>, key: &str, val: f32) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(6).unwrap(); // Float32
+        buf.write_f32::<LittleEndian>(val).unwrap();
+    }
+
+    fn write_metadata_kv_string(buf: &mut Vec<u8>, key: &str, val: &str) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(8).unwrap(); // String
+        write_gguf_string(buf, val);
+    }
+
+    fn write_metadata_kv_string_array(buf: &mut Vec<u8>, key: &str, vals: &[&str]) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(9).unwrap(); // Array
+        buf.write_u32::<LittleEndian>(8).unwrap(); // String element type
+        buf.write_u64::<LittleEndian>(vals.len() as u64).unwrap();
+        for s in vals {
+            write_gguf_string(buf, s);
+        }
+    }
+
+    fn write_tensor_info(buf: &mut Vec<u8>, name: &str, shape: &[u64], dtype: u32, offset: u64) {
+        write_gguf_string(buf, name);
+        buf.write_u32::<LittleEndian>(shape.len() as u32).unwrap();
+        for &dim in shape {
+            buf.write_u64::<LittleEndian>(dim).unwrap();
+        }
+        buf.write_u32::<LittleEndian>(dtype).unwrap();
+        buf.write_u64::<LittleEndian>(offset).unwrap();
+    }
+
+    fn align_offset(offset: usize, alignment: usize) -> usize {
+        (offset + alignment - 1) & !(alignment - 1)
+    }
+
+    /// Build a complete GGUF with N layers.
+    /// hidden_size=64, num_q_heads=4, num_kv_heads=2, head_dim=16, ffn=128, vocab=4
+    /// All tensors FP16 (dtype code 1).
+    fn build_complete_gguf(
+        num_layers: usize,
+        extra_tensors: &[(&str, &[u64])],
+    ) -> Vec<u8> {
+        // Layer tensor suffixes and their shapes:
+        // attn_q.weight: [hidden, hidden] = [64, 64]
+        // attn_k.weight: [kv_heads * head_dim, hidden] = [32, 64]
+        // attn_v.weight: [kv_heads * head_dim, hidden] = [32, 64]
+        // attn_output.weight: [hidden, hidden] = [64, 64]
+        // ffn_gate.weight: [ffn, hidden] = [128, 64]
+        // ffn_up.weight: [ffn, hidden] = [128, 64]
+        // ffn_down.weight: [hidden, ffn] = [64, 128]
+        // attn_norm.weight: [hidden] = [64]
+        // ffn_norm.weight: [hidden] = [64]
+
+        let hidden: u64 = 64;
+        let kv_dim: u64 = 32; // num_kv_heads * head_dim = 2 * 16
+        let ffn: u64 = 128;
+        let vocab: u64 = 4;
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+        }
+
+        let mut tensors: Vec<TensorSpec> = Vec::new();
+
+        // Global tensors
+        tensors.push(TensorSpec {
+            name: "token_embd.weight".into(),
+            shape: vec![vocab, hidden],
+        });
+        tensors.push(TensorSpec {
+            name: "output_norm.weight".into(),
+            shape: vec![hidden],
+        });
+        tensors.push(TensorSpec {
+            name: "output.weight".into(),
+            shape: vec![vocab, hidden],
+        });
+
+        // Per-layer tensors
+        for layer in 0..num_layers {
+            let layer_tensors: Vec<(&str, Vec<u64>)> = vec![
+                ("attn_q.weight", vec![hidden, hidden]),
+                ("attn_k.weight", vec![kv_dim, hidden]),
+                ("attn_v.weight", vec![kv_dim, hidden]),
+                ("attn_output.weight", vec![hidden, hidden]),
+                ("ffn_gate.weight", vec![ffn, hidden]),
+                ("ffn_up.weight", vec![ffn, hidden]),
+                ("ffn_down.weight", vec![hidden, ffn]),
+                ("attn_norm.weight", vec![hidden]),
+                ("ffn_norm.weight", vec![hidden]),
+            ];
+            for (suffix, shape) in layer_tensors {
+                tensors.push(TensorSpec {
+                    name: format!("blk.{layer}.{suffix}"),
+                    shape,
+                });
+            }
+        }
+
+        // Extra tensors
+        for &(name, shape) in extra_tensors {
+            tensors.push(TensorSpec {
+                name: name.to_string(),
+                shape: shape.to_vec(),
+            });
+        }
+
+        // Compute offsets (all FP16, 2 bytes per element)
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut data_size: u64 = 0;
+        for t in &tensors {
+            offsets.push(data_size);
+            let numel: u64 = t.shape.iter().product();
+            data_size += numel * 2; // FP16
+        }
+
+        let tensor_count = tensors.len();
+        let metadata_count = 8;
+
+        let mut buf = Vec::new();
+
+        // Header
+        buf.write_u32::<LittleEndian>(0x46475547).unwrap(); // GGUF_MAGIC
+        buf.write_u32::<LittleEndian>(3).unwrap(); // version
+        buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
+        buf.write_u64::<LittleEndian>(metadata_count as u64).unwrap();
+
+        // Metadata
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", hidden as u32);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", num_layers as u32);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", ffn as u32);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &["a", "b", "c", "d"],
+        );
+
+        // Tensor infos
+        for (i, t) in tensors.iter().enumerate() {
+            write_tensor_info(&mut buf, &t.name, &t.shape, 1, offsets[i]); // 1 = FP16
+        }
+
+        // Align
+        let current = buf.len();
+        let aligned = align_offset(current, 32);
+        buf.resize(aligned, 0);
+
+        // Tensor data
+        buf.extend(vec![0u8; data_size as usize]);
+
+        buf
+    }
+
+    /// Like build_complete_gguf but allows omitting specific tensor names.
+    fn build_gguf_without(num_layers: usize, omit: &[&str]) -> Vec<u8> {
+        let hidden: u64 = 64;
+        let kv_dim: u64 = 32;
+        let ffn: u64 = 128;
+        let vocab: u64 = 4;
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+        }
+
+        let mut tensors: Vec<TensorSpec> = Vec::new();
+
+        let globals: Vec<(&str, Vec<u64>)> = vec![
+            ("token_embd.weight", vec![vocab, hidden]),
+            ("output_norm.weight", vec![hidden]),
+            ("output.weight", vec![vocab, hidden]),
+        ];
+
+        for (name, shape) in globals {
+            if !omit.contains(&name) {
+                tensors.push(TensorSpec {
+                    name: name.into(),
+                    shape,
+                });
+            }
+        }
+
+        for layer in 0..num_layers {
+            let layer_tensors: Vec<(&str, Vec<u64>)> = vec![
+                ("attn_q.weight", vec![hidden, hidden]),
+                ("attn_k.weight", vec![kv_dim, hidden]),
+                ("attn_v.weight", vec![kv_dim, hidden]),
+                ("attn_output.weight", vec![hidden, hidden]),
+                ("ffn_gate.weight", vec![ffn, hidden]),
+                ("ffn_up.weight", vec![ffn, hidden]),
+                ("ffn_down.weight", vec![hidden, ffn]),
+                ("attn_norm.weight", vec![hidden]),
+                ("ffn_norm.weight", vec![hidden]),
+            ];
+            for (suffix, shape) in layer_tensors {
+                let name = format!("blk.{layer}.{suffix}");
+                if !omit.contains(&name.as_str()) {
+                    tensors.push(TensorSpec { name, shape });
+                }
+            }
+        }
+
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut data_size: u64 = 0;
+        for t in &tensors {
+            offsets.push(data_size);
+            let numel: u64 = t.shape.iter().product();
+            data_size += numel * 2;
+        }
+
+        let tensor_count = tensors.len();
+        let metadata_count = 8;
+
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(0x46475547).unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
+        buf.write_u64::<LittleEndian>(metadata_count as u64).unwrap();
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", hidden as u32);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", num_layers as u32);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", ffn as u32);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &["a", "b", "c", "d"],
+        );
+
+        for (i, t) in tensors.iter().enumerate() {
+            write_tensor_info(&mut buf, &t.name, &t.shape, 1, offsets[i]);
+        }
+
+        let current = buf.len();
+        let aligned = align_offset(current, 32);
+        buf.resize(aligned, 0);
+
+        buf.extend(vec![0u8; data_size as usize]);
+
+        buf
+    }
+
+    fn write_gguf_to_file(data: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.gguf");
+        std::fs::write(&path, data).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn test_weight_store_load_full() {
+        let data = build_complete_gguf(2, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+        assert_eq!(store.config.num_layers, 2);
+        assert_eq!(store.config.hidden_size, 64);
+        assert_eq!(store.layers.len(), 2);
+    }
+
+    #[test]
+    fn test_weight_store_layer_range() {
+        let data = build_complete_gguf(2, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, Some(0..1)).unwrap();
+        assert_eq!(store.layers.len(), 1);
+    }
+
+    #[test]
+    fn test_weight_store_missing_tensor() {
+        let data = build_gguf_without(2, &["blk.0.attn_q.weight"]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("attn_q.weight"),
+            "expected mention of attn_q.weight in: {err}"
+        );
+    }
+
+    #[test]
+    fn test_weight_store_unknown_tensor_warning() {
+        // Extra tensor "custom.weight" should be ignored (load succeeds).
+        let data = build_complete_gguf(2, &[("custom.weight", &[16, 16])]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+        assert_eq!(store.layers.len(), 2);
+    }
+
+    #[test]
+    fn test_truncated_gguf() {
+        let mut data = build_complete_gguf(2, &[]);
+        // Truncate: remove last 1000 bytes of tensor data
+        let truncate_to = data.len().saturating_sub(1000);
+        data.truncate(truncate_to);
+
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("exceeds mmap"),
+            "expected 'exceeds mmap' in: {err}"
+        );
+    }
+}

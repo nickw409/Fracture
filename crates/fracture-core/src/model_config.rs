@@ -116,4 +116,36 @@ mod tests {
         let cfg = llama3_8b_config();
         assert_eq!(cfg.gqa_group_size(), 4);
     }
+
+    #[test]
+    fn test_zero_num_layers_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.num_layers = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("num_layers"));
+    }
+
+    #[test]
+    fn test_zero_num_q_heads_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.num_q_heads = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("num_q_heads"));
+    }
+
+    #[test]
+    fn test_zero_num_kv_heads_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.num_kv_heads = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("num_kv_heads"));
+    }
+
+    #[test]
+    fn test_zero_vocab_size_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.vocab_size = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("vocab_size"));
+    }
 }

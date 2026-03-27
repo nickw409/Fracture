@@ -578,6 +578,8 @@ mod tests {
         assert_eq!(gguf.config.head_dim, 16); // 64 / 4
         assert_eq!(gguf.config.intermediate_size, 128);
         assert_eq!(gguf.config.vocab_size, 4);
+        assert_eq!(gguf.config.rope_theta, 500000.0);
+        assert!((gguf.config.rms_norm_eps - 1e-5).abs() < 1e-10);
 
         // Tensors
         assert_eq!(gguf.tensors.len(), 1);
@@ -607,5 +609,178 @@ mod tests {
         assert_eq!(align_offset(31, 32), 32);
         assert_eq!(align_offset(32, 32), 32);
         assert_eq!(align_offset(33, 32), 64);
+    }
+
+    #[test]
+    fn test_missing_embedding_length() {
+        let mut buf = Vec::new();
+
+        // Header
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(0).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(2).unwrap(); // metadata_kv_count
+
+        // Only general.architecture and block_count, no embedding_length
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_embed.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = GgufParser::parse(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("embedding_length"),
+            "expected 'embedding_length' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vocab_size_from_arch_key() {
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(8).unwrap(); // metadata_kv_count
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        // Use arch key for vocab_size instead of tokenizer.ggml.tokens
+        write_metadata_kv_u32(&mut buf, "llama.vocab_size", 100);
+
+        // One tensor [100, 64] FP16
+        write_gguf_string(&mut buf, "token_embd.weight");
+        buf.write_u32::<LittleEndian>(2).unwrap();
+        buf.write_u64::<LittleEndian>(100).unwrap();
+        buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap(); // FP16
+        buf.write_u64::<LittleEndian>(0).unwrap();
+
+        let alignment = 32;
+        let current = buf.len();
+        let aligned = align_offset(current, alignment);
+        buf.resize(aligned, 0);
+        buf.extend(vec![0u8; 100 * 64 * 2]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vocab_arch.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+        assert_eq!(gguf.config.vocab_size, 100);
+    }
+
+    #[test]
+    fn test_parse_multiple_tensors() {
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(3).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(8).unwrap(); // metadata_kv_count
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+
+        // Tensor 0: [4, 64] FP16 at offset 0
+        write_gguf_string(&mut buf, "tensor_a");
+        buf.write_u32::<LittleEndian>(2).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
+        buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap(); // FP16
+        buf.write_u64::<LittleEndian>(0).unwrap();
+
+        // Tensor 1: [10] FP32 at offset 512
+        write_gguf_string(&mut buf, "tensor_b");
+        buf.write_u32::<LittleEndian>(1).unwrap();
+        buf.write_u64::<LittleEndian>(10).unwrap();
+        buf.write_u32::<LittleEndian>(0).unwrap(); // FP32
+        buf.write_u64::<LittleEndian>(512).unwrap();
+
+        // Tensor 2: [2, 3, 4] BF16 at offset 552
+        write_gguf_string(&mut buf, "tensor_c");
+        buf.write_u32::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(2).unwrap();
+        buf.write_u64::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
+        buf.write_u32::<LittleEndian>(30).unwrap(); // BF16
+        buf.write_u64::<LittleEndian>(552).unwrap();
+
+        let alignment = 32;
+        let current = buf.len();
+        let aligned = align_offset(current, alignment);
+        buf.resize(aligned, 0);
+
+        // Tensor data: 512 (tensor_a) + 40 (tensor_b) + 48 (tensor_c) = 600 total, but
+        // tensor_c starts at 552 so we need 552 + 48 = 600 bytes
+        buf.extend(vec![0u8; 600]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+        assert_eq!(gguf.tensors.len(), 3);
+
+        assert_eq!(gguf.tensors[0].name, "tensor_a");
+        assert_eq!(gguf.tensors[0].shape, vec![4, 64]);
+        assert_eq!(gguf.tensors[0].dtype, DType::FP16);
+
+        assert_eq!(gguf.tensors[1].name, "tensor_b");
+        assert_eq!(gguf.tensors[1].shape, vec![10]);
+        assert_eq!(gguf.tensors[1].dtype, DType::FP32);
+
+        assert_eq!(gguf.tensors[2].name, "tensor_c");
+        assert_eq!(gguf.tensors[2].shape, vec![2, 3, 4]);
+        assert_eq!(gguf.tensors[2].dtype, DType::BF16);
+    }
+
+    #[test]
+    fn test_unsupported_dtype_q4_0() {
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(8).unwrap(); // metadata_kv_count
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+
+        // Tensor with dtype code 2 (Q4_0)
+        write_gguf_string(&mut buf, "quantized.weight");
+        buf.write_u32::<LittleEndian>(1).unwrap();
+        buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u32::<LittleEndian>(2).unwrap(); // Q4_0
+        buf.write_u64::<LittleEndian>(0).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q4_0.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = GgufParser::parse(&path).unwrap_err();
+        assert!(
+            matches!(err, FractureError::UnsupportedDType(_)),
+            "expected UnsupportedDType, got: {err}"
+        );
     }
 }

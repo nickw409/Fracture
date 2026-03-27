@@ -51,6 +51,25 @@ mod tests {
         assert!(!DType::INT8.is_packed());
         assert!(DType::INT4.is_packed());
     }
+
+    #[test]
+    fn test_dtype_display() {
+        assert_eq!(format!("{}", DType::FP16), "fp16");
+        assert_eq!(format!("{}", DType::FP32), "fp32");
+        assert_eq!(format!("{}", DType::BF16), "bf16");
+        assert_eq!(format!("{}", DType::INT8), "int8");
+        assert_eq!(format!("{}", DType::INT4), "int4");
+    }
+
+    #[test]
+    fn test_dtype_serde_roundtrip() {
+        let variants = [DType::FP16, DType::FP32, DType::BF16, DType::INT8, DType::INT4];
+        for dt in &variants {
+            let json = serde_json::to_string(dt).unwrap();
+            let back: DType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*dt, back, "roundtrip failed for {dt}");
+        }
+    }
 }
 
 impl std::fmt::Display for DType {
