@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "fracture-validation"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone reference tensor comparison utility for Fracture validation tests"
+
+# This crate has ZERO dependencies on any Fracture crate.
+# It reads binary tensor files and compares numbers.
+[dependencies]
+half = "2"
