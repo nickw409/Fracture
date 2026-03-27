@@ -88,4 +88,35 @@ mod tests {
         assert_eq!(t.shape, vec![3, 4]);
         assert_eq!(t.dtype, DType::FP16);
     }
+
+    #[test]
+    fn test_device_tensor_all_dtypes() {
+        let dtypes = [DType::FP16, DType::FP32, DType::BF16, DType::INT8, DType::INT4];
+        let shape = vec![4, 8]; // 32 elements
+
+        for (i, dtype) in dtypes.iter().enumerate() {
+            let t = DeviceTensor::new(TensorId(i as u64), shape.clone(), *dtype);
+            assert_eq!(t.numel(), 32, "numel wrong for {dtype}");
+
+            let expected_bytes = if dtype.is_packed() {
+                (32 + 1) / 2 // INT4: ceil(32/2) = 16
+            } else {
+                32 * dtype.size_bytes()
+            };
+            assert_eq!(
+                t.size_bytes(),
+                expected_bytes,
+                "size_bytes wrong for {dtype}: got {} expected {}",
+                t.size_bytes(),
+                expected_bytes
+            );
+        }
+
+        // Verify specific expected values
+        assert_eq!(DeviceTensor::new(TensorId(0), vec![32], DType::FP16).size_bytes(), 64);
+        assert_eq!(DeviceTensor::new(TensorId(0), vec![32], DType::FP32).size_bytes(), 128);
+        assert_eq!(DeviceTensor::new(TensorId(0), vec![32], DType::BF16).size_bytes(), 64);
+        assert_eq!(DeviceTensor::new(TensorId(0), vec![32], DType::INT8).size_bytes(), 32);
+        assert_eq!(DeviceTensor::new(TensorId(0), vec![32], DType::INT4).size_bytes(), 16);
+    }
 }

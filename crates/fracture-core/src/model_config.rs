@@ -43,6 +43,27 @@ impl ModelConfig {
             )));
         }
 
+        if self.intermediate_size == 0 {
+            return Err(FractureError::ModelConfig(
+                "intermediate_size must be > 0".into(),
+            ));
+        }
+        if self.max_seq_len == 0 {
+            return Err(FractureError::ModelConfig(
+                "max_seq_len must be > 0".into(),
+            ));
+        }
+        if self.rope_theta <= 0.0 {
+            return Err(FractureError::ModelConfig(
+                "rope_theta must be > 0.0".into(),
+            ));
+        }
+        if self.rms_norm_eps <= 0.0 {
+            return Err(FractureError::ModelConfig(
+                "rms_norm_eps must be > 0.0".into(),
+            ));
+        }
+
         if self.num_q_heads % self.num_kv_heads != 0 {
             return Err(FractureError::ModelConfig(format!(
                 "num_q_heads ({}) must be divisible by num_kv_heads ({})",
@@ -147,5 +168,51 @@ mod tests {
         cfg.vocab_size = 0;
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("vocab_size"));
+    }
+
+    #[test]
+    fn test_zero_intermediate_size_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.intermediate_size = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("intermediate_size"));
+    }
+
+    #[test]
+    fn test_invalid_rope_theta_fails() {
+        let mut cfg = llama3_8b_config();
+
+        // Zero should fail
+        cfg.rope_theta = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("rope_theta"));
+
+        // Negative should fail
+        cfg.rope_theta = -1.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("rope_theta"));
+    }
+
+    #[test]
+    fn test_invalid_rms_norm_eps_fails() {
+        let mut cfg = llama3_8b_config();
+
+        // Zero should fail
+        cfg.rms_norm_eps = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("rms_norm_eps"));
+
+        // Negative should fail
+        cfg.rms_norm_eps = -1e-5;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("rms_norm_eps"));
+    }
+
+    #[test]
+    fn test_zero_max_seq_len_fails() {
+        let mut cfg = llama3_8b_config();
+        cfg.max_seq_len = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_seq_len"));
     }
 }
