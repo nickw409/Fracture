@@ -52,3 +52,6 @@ byteorder = "1"
 memmap2 = "0.9"
 half = { version = "2", features = ["serde"] }
 rand = "0.9"
+async-stream = "0.3"
+futures-core = "0.3"
+tempfile = "3"
