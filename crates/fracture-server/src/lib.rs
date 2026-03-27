@@ -1,5 +1,5 @@
-mod api;
+pub mod api;
 mod routes;
 
 pub use api::{ChatCompletionRequest, CompletionRequest, CompletionResponse};
-pub use routes::create_router;
+pub use routes::{create_router, AppState};

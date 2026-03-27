@@ -1,4 +1,11 @@
 use anyhow::Result;
+use fracture_core::Backend;
+use fracture_cuda::CudaBackend;
+use fracture_engine::{Engine, KvCacheManager};
+use fracture_gguf::WeightStore;
+use fracture_server::{create_router, AppState};
+use std::sync::{Arc, Mutex};
+use tokenizers::Tokenizer;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -7,17 +14,93 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Parse CLI args
+    let args: Vec<String> = std::env::args().collect();
+    let model_path = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1))
+        .expect("usage: fracture-server-cuda --model <path-to-gguf> [--port <port>] [--tokenizer <path>]");
+
+    let port: u16 = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+
+    let tokenizer_path = args
+        .iter()
+        .position(|a| a == "--tokenizer")
+        .and_then(|i| args.get(i + 1).cloned());
+
     tracing::info!("Fracture inference server (CUDA backend)");
+    tracing::info!("model: {model_path}");
 
-    // TODO: Parse CLI args (model path, port, max_seq_len)
-    // TODO: Initialize CUDA backend
-    // TODO: Load model weights
-    // TODO: Create engine
-    // TODO: Start HTTP server
+    // Initialize CUDA backend
+    let mut backend = CudaBackend::new(0)?;
+    tracing::info!(
+        "GPU: {} ({:.1} GB total, {:.1} GB available)",
+        backend.device_name(),
+        backend.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0),
+        backend.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
 
-    let router = fracture_server::create_router();
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("Listening on {}", listener.local_addr()?);
+    // Load model weights
+    tracing::info!("loading model weights...");
+    let weights = WeightStore::load(std::path::Path::new(model_path), &backend, None)?;
+    let config = weights.config.clone();
+    tracing::info!(
+        "model loaded: {}L, d={}, vocab={}",
+        config.num_layers,
+        config.hidden_size,
+        config.vocab_size
+    );
+
+    // Pre-compute RoPE frequencies
+    backend.precompute_rope_freqs(config.head_dim, config.rope_theta)?;
+
+    // Create engine with full layer range
+    let layer_range = 0..config.num_layers;
+    let engine = Arc::new(Engine::new(backend, weights, layer_range));
+
+    // Create KV cache manager
+    let cache = KvCacheManager::new(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config.max_seq_len,
+    );
+
+    // Load tokenizer
+    let tokenizer = if let Some(path) = tokenizer_path {
+        Tokenizer::from_file(&path).map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?
+    } else {
+        // Try loading from same directory as model
+        let model_dir = std::path::Path::new(model_path).parent().unwrap_or(std::path::Path::new("."));
+        let tokenizer_file = model_dir.join("tokenizer.json");
+        if tokenizer_file.exists() {
+            Tokenizer::from_file(&tokenizer_file)
+                .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?
+        } else {
+            anyhow::bail!(
+                "no tokenizer found. Provide --tokenizer <path> or place tokenizer.json next to the model file"
+            );
+        }
+    };
+
+    // Build app state and router
+    let state = Arc::new(AppState {
+        engine,
+        cache: Mutex::new(cache),
+        tokenizer,
+    });
+    let router = create_router(state);
+
+    // Start server
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("listening on {}", listener.local_addr()?);
     axum::serve(listener, router).await?;
 
     Ok(())
