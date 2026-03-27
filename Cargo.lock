@@ -411,6 +411,7 @@ version = "0.1.0"
 dependencies = [
  "fracture-core",
  "fracture-engine",
+ "fracture-gguf",
  "half",
  "rand",
  "serde",
@@ -468,6 +469,8 @@ dependencies = [
  "fracture-generate",
  "fracture-gguf",
  "fracture-server",
+ "half",
+ "rand",
  "tokenizers",
  "tokio",
  "tracing",

@@ -5,7 +5,9 @@ every kernel and layer in the Fracture inference engine.
 
 ## Model
 
-- **HuggingFace ID:** `meta-llama/Meta-Llama-3.1-8B-Instruct`
+- **Architecture:** Llama 3.1 8B Instruct
+- **Canonical HuggingFace ID:** `meta-llama/Meta-Llama-3.1-8B-Instruct` (requires Meta license approval)
+- **Community mirror:** `NousResearch/Meta-Llama-3.1-8B-Instruct` (same weights, no approval needed)
 - **Precision:** FP16 model weights, all intermediate tensors stored as **float32**
 - **Seed:** `torch.manual_seed(42)`
 
@@ -63,26 +65,37 @@ Each `.bin` file uses this format:
 
 ```
 [4 bytes] u32 LE — number of dimensions (ndim)
-[4 × ndim bytes] u32 LE — shape per dimension
+[4 x ndim bytes] u32 LE — shape per dimension
 [4 bytes] u32 LE — dtype enum: 0=float16, 1=float32, 2=int32
 [remaining] raw tensor data in little-endian byte order
 ```
 
 ## How to Generate
 
-Requires: NVIDIA GPU, PyTorch with CUDA, HuggingFace `transformers`, access to
-`meta-llama/Meta-Llama-3.1-8B-Instruct` weights.
+Requires: NVIDIA GPU with CUDA, Python 3.10+, ~16GB VRAM, ~20GB disk for model cache.
 
 ```bash
-pip install torch transformers numpy
-python scripts/dump_reference.py
-python scripts/verify_reference.py
+python3 -m venv .venv
+.venv/bin/pip install -r scripts/requirements.txt
+.venv/bin/python scripts/dump_reference.py --model-path NousResearch/Meta-Llama-3.1-8B-Instruct
+.venv/bin/python scripts/verify_reference.py
 ```
 
 The script accepts flags:
 - `--model-path PATH` — local model directory or HuggingFace model ID
 - `--layers 0,1,31` — dump only specific layers (default: all)
 - `--generate-tokens N` — number of greedy tokens to generate (default: 50)
+
+The generated `.bin` files are gitignored due to their size (~several GB total).
+Each developer regenerates locally by running the script above.
+
+## Consuming Reference Data
+
+The Rust comparison utility at `tests/validation/` loads these binary files and
+compares them element-wise against Fracture engine outputs. See:
+- `tensor_compare.rs` — load reference tensors, compare with configurable rtol/atol
+- `golden_compare.rs` — load golden token sequences, report first divergence
+- `lib.rs` — convenience functions: `require_reference()`, `assert_tensors_close()`
 
 ## Status
 
