@@ -11,5 +11,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 
+[dev-dependencies]
+rand = { workspace = true }
+
 [build-dependencies]
 cc = { version = "1", features = ["parallel"] }
