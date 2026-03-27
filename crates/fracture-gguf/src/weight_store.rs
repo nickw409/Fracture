@@ -703,6 +703,270 @@ mod tests {
     }
 
     #[test]
+    fn test_weight_field_shapes_correct() {
+        // Build a 1-layer GGUF with known shapes and verify each LayerWeights field.
+        // Config: hidden=64, num_q_heads=4, num_kv_heads=2, head_dim=16, ffn=128, vocab=4
+        let data = build_complete_gguf(1, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+        assert_eq!(store.layers.len(), 1);
+
+        let layer = &store.layers[0];
+
+        // Q projection: [hidden, hidden] = [64, 64]
+        assert_eq!(layer.q_proj.shape, vec![64, 64], "q_proj shape mismatch");
+        // K projection: [kv_dim, hidden] = [32, 64]
+        assert_eq!(layer.k_proj.shape, vec![32, 64], "k_proj shape mismatch");
+        // V projection: [kv_dim, hidden] = [32, 64]
+        assert_eq!(layer.v_proj.shape, vec![32, 64], "v_proj shape mismatch");
+        // Output projection: [hidden, hidden] = [64, 64]
+        assert_eq!(layer.o_proj.shape, vec![64, 64], "o_proj shape mismatch");
+        // Gate projection: [ffn, hidden] = [128, 64]
+        assert_eq!(layer.gate_proj.shape, vec![128, 64], "gate_proj shape mismatch");
+        // Up projection: [ffn, hidden] = [128, 64]
+        assert_eq!(layer.up_proj.shape, vec![128, 64], "up_proj shape mismatch");
+        // Down projection: [hidden, ffn] = [64, 128]
+        assert_eq!(layer.down_proj.shape, vec![64, 128], "down_proj shape mismatch");
+        // Attention norm: [hidden] = [64]
+        assert_eq!(layer.attn_norm.shape, vec![64], "attn_norm shape mismatch");
+        // FFN norm: [hidden] = [64]
+        assert_eq!(layer.ffn_norm.shape, vec![64], "ffn_norm shape mismatch");
+
+        // Global tensors
+        assert_eq!(store.token_embedding.shape, vec![4, 64], "token_embedding shape mismatch");
+        assert_eq!(store.output_norm.shape, vec![64], "output_norm shape mismatch");
+        assert_eq!(store.lm_head.shape, vec![4, 64], "lm_head shape mismatch");
+    }
+
+    /// FailingMockBackend: fails on the Nth alloc call with a WeightLoad-like error.
+    struct FailingMockBackend {
+        next_id: AtomicU64,
+        alloc_count: std::sync::atomic::AtomicU64,
+        fail_at: u64,
+    }
+
+    impl FailingMockBackend {
+        fn new(fail_at: u64) -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+                alloc_count: AtomicU64::new(0),
+                fail_at,
+            }
+        }
+    }
+
+    impl Backend for FailingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let count = self.alloc_count.fetch_add(1, Ordering::SeqCst);
+            if count >= self.fail_at {
+                return Err(FractureError::Backend("alloc failed: out of memory".into()));
+            }
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_to_host(&self, _src: &DeviceTensor, _dst: &mut [u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn device_name(&self) -> &str {
+            "failing-mock"
+        }
+
+        fn total_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn available_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn synchronize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_timer(&self) -> Result<DeviceTimer> {
+            Ok(DeviceTimer(0))
+        }
+
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> {
+            Ok(0.0)
+        }
+
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_weight_loading_alignment() {
+        // GGUF file alignment (default 32 bytes, spec mentions 256-byte alignment for some files)
+        // is handled by the parser at the file level: tensor_data_offset is aligned so that
+        // tensor data starts at a properly aligned position within the mmap. Individual tensor
+        // offsets within tensor_data are relative to this aligned start.
+        //
+        // This alignment is a GGUF file format concern, NOT a GPU allocation concern.
+        // cudaMalloc returns 256-byte aligned pointers by default — the backend handles
+        // device memory alignment independently of GGUF file alignment.
+        //
+        // Verify that the parser sets tensor_data_offset to an aligned position.
+        let data = build_complete_gguf(1, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+
+        let gguf = crate::parser::GgufParser::parse(&path).unwrap();
+        assert_eq!(
+            gguf.tensor_data_offset % 32,
+            0,
+            "tensor_data_offset should be 32-byte aligned, got {}",
+            gguf.tensor_data_offset
+        );
+    }
+
+    #[test]
+    fn test_weight_tensor_size_validation() {
+        // Verify that upload_tensor checks byte range against mmap bounds and that the
+        // error message includes the tensor name. This is already triggered by
+        // test_truncated_gguf, but here we add an explicit assertion about the tensor name.
+        let mut data = build_complete_gguf(2, &[]);
+        // Truncate significantly to ensure at least one tensor exceeds the mmap bounds
+        let truncate_to = data.len().saturating_sub(1000);
+        data.truncate(truncate_to);
+
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds mmap"),
+            "expected 'exceeds mmap' in: {msg}"
+        );
+        // The error should contain the name of the tensor that exceeded bounds
+        // (some tensor name like "blk.1.ffn_down.weight" or similar)
+        assert!(
+            msg.contains(".weight") || msg.contains("token_embd") || msg.contains("output"),
+            "expected tensor name in error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_weight_alloc_failure() {
+        // Use FailingMockBackend that fails on the 3rd alloc call.
+        // The first alloc is token_embedding, second is output_norm, third is lm_head.
+        // Failing at alloc #3 (0-indexed: fail_at=2) should cause a Backend error
+        // that propagates as a load failure.
+        let data = build_complete_gguf(1, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = FailingMockBackend::new(2);
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err(), "expected alloc failure to propagate");
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::Backend(_)),
+            "expected Backend error from failed alloc, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_weight_name_to_field_mapping() {
+        // Load a 1-layer GGUF with MockBackend, verify each LayerWeights field
+        // has the correct shape from the GGUF tensor info.
+        let data = build_complete_gguf(1, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+        assert_eq!(store.layers.len(), 1);
+        let layer = &store.layers[0];
+
+        // hidden=64, kv_dim=32 (num_kv_heads=2, head_dim=16), ffn=128
+        assert_eq!(layer.q_proj.shape, vec![64, 64], "q_proj: [hidden, hidden]");
+        assert_eq!(layer.k_proj.shape, vec![32, 64], "k_proj: [kv_dim, hidden]");
+        assert_eq!(layer.v_proj.shape, vec![32, 64], "v_proj: [kv_dim, hidden]");
+        assert_eq!(layer.o_proj.shape, vec![64, 64], "o_proj: [hidden, hidden]");
+        assert_eq!(layer.gate_proj.shape, vec![128, 64], "gate_proj: [ffn, hidden]");
+        assert_eq!(layer.up_proj.shape, vec![128, 64], "up_proj: [ffn, hidden]");
+        assert_eq!(layer.down_proj.shape, vec![64, 128], "down_proj: [hidden, ffn]");
+        assert_eq!(layer.attn_norm.shape, vec![64], "attn_norm: [hidden]");
+        assert_eq!(layer.ffn_norm.shape, vec![64], "ffn_norm: [hidden]");
+    }
+
+    #[test]
+    fn test_weight_store_layer_range_validation() {
+        // Load with layer_range=Some(0..10) on a 2-layer model.
+        // Should fail because range end (10) exceeds layer count (2).
+        let data = build_complete_gguf(2, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, Some(0..10));
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("layer_range end 10") && msg.contains("2"),
+            "expected error about range exceeding layer count: {msg}"
+        );
+    }
+
+    #[test]
     fn test_truncated_gguf() {
         let mut data = build_complete_gguf(2, &[]);
         // Truncate: remove last 1000 bytes of tensor data
