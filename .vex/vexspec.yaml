@@ -36,28 +36,15 @@ sections:
   # ============================================================
   - name: Core Types
     path: crates/fracture-core/src
+    status: implemented
     description: |
       Shared types used by all crates: DeviceTensor, Backend trait, ModelConfig,
       DType, error types. This crate defines the contract between the engine and
       any GPU backend.
     shared: [error-handling, backend-agnostic]
     behaviors:
-      - name: device-tensor-opaque
-        description: |
-          DeviceTensor contains a TensorId (opaque u64), shape (Vec<usize>), and
-          dtype (DType enum). It does NOT contain device pointers, CUDA types, or
-          Metal types. The engine can inspect shape and dtype but cannot access
-          device memory directly.
-
-      - name: backend-trait-completeness
-        description: |
-          The Backend trait defines all operations the engine needs: alloc, free,
-          copy_to_device, copy_to_host, matmul, rmsnorm, rope, attention, silu_mul,
-          embedding, add, copy_slice, device_name, total_memory, available_memory.
-          The engine can execute a full transformer forward pass using only these methods.
-          No operation requires backend-specific imports.
-
       - name: model-config-validation
+        status: implemented
         description: |
           ModelConfig validates required fields: hidden_size, num_layers,
           num_q_heads, num_kv_heads, head_dim, intermediate_size, vocab_size,
@@ -65,31 +52,42 @@ sections:
           (head_dim == hidden_size / num_q_heads). Errors on missing or
           inconsistent values.
 
+      - name: gqa-divisibility-validation
+        status: implemented
+        description: |
+          ModelConfig validates that num_q_heads is evenly divisible by
+          num_kv_heads (required for GQA grouping). Returns an error if
+          num_q_heads % num_kv_heads != 0. This invariant is assumed by
+          the attention kernel where group_size = num_q_heads / num_kv_heads.
+
       - name: dtype-support
+        status: implemented
         description: |
           DType enum covers FP16, FP32, BF16, INT8, INT4. Size-in-bytes
           calculation is correct for each variant. DType is used in DeviceTensor
           metadata and tensor serialization.
 
-sections:
   # ============================================================
   # GGUF PARSER AND WEIGHT LOADING
   # ============================================================
   - name: GGUF Parser
     path: crates/fracture-gguf/src
+    status: implemented
     description: |
       Parses GGUF binary files and loads model weights to GPU memory.
-      Must handle the GGUF v3 format including metadata, tensor info table,
-      and tensor data with correct alignment.
+      Handles the GGUF v3 format including metadata, tensor info table,
+      and tensor data with memory mapping.
     shared: [error-handling]
     behaviors:
       - name: header-parsing
+        status: implemented
         description: |
           Reads GGUF magic number (0x46475547) and version. Rejects files with
           wrong magic number. Rejects unsupported versions (only v3 supported).
           Extracts tensor count and metadata KV count from header.
 
       - name: metadata-extraction
+        status: implemented
         description: |
           Parses metadata key-value pairs from the GGUF file. Extracts model
           architecture config: hidden_size, num_layers, num_attention_heads,
@@ -97,6 +95,7 @@ sections:
           Returns typed ModelConfig struct. Errors on missing required keys.
 
       - name: tensor-info-parsing
+        status: implemented
         description: |
           Parses the tensor info table. Extracts tensor name, shape, data type,
           and byte offset for each tensor. Validates that expected tensors exist
@@ -104,39 +103,63 @@ sections:
           output norm, LM head). Errors on missing required tensors.
 
       - name: weight-loading
+        status: implemented
         description: |
           Memory-maps the GGUF file and copies tensor data to GPU memory.
           Respects alignment requirements (256-byte aligned GPU allocations).
           Handles FP16 tensor data type. Validates tensor byte sizes match
-          expected shape × dtype size. Returns WeightStore with all tensors
+          expected shape x dtype size. Returns WeightStore with all tensors
           on GPU. Errors on size mismatches or GPU allocation failures.
 
+      - name: truncated-file-detection
+        status: implemented
+        description: |
+          When the GGUF file is truncated or corrupted (tensor data section
+          is shorter than what tensor offsets + sizes require), weight loading
+          returns a clear error rather than reading out of bounds. Validates
+          that each tensor's byte range falls within the memory-mapped file.
+
+      - name: unsupported-dtype-rejection
+        status: implemented
+        description: |
+          When the GGUF file contains tensors with quantization types other
+          than FP16/FP32/BF16 (e.g. Q4_0, Q8_0, Q4_K_M), parsing returns a
+          clear UnsupportedDType error identifying the unsupported dtype.
+          This prevents silently misinterpreting quantized tensor data.
+
       - name: weight-naming
+        status: implemented
         description: |
           Maps GGUF tensor names (token_embd.weight, blk.{i}.attn_q.weight, etc.)
-          to the LayerWeights struct fields. Handles all Llama 3 weight names.
-          Ignores unknown tensor names with a warning rather than failing.
+          to the LayerWeights struct fields. Handles all Llama 3 weight names
+          including embedding, per-layer Q/K/V/O/gate/up/down/norms, output norm,
+          and LM head. Ignores unknown tensor names with a warning rather than failing.
 
   # ============================================================
   # CUDA KERNELS
   # ============================================================
   - name: RMSNorm Kernel
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::rmsnorm method. Root Mean Square
       Layer Normalization applied before attention and FFN sublayers.
+      Uses FP32 accumulation with warp reduction.
       A Metal backend would implement the same operation independently.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: rmsnorm-forward
+        status: implemented
         description: |
           Computes RMSNorm: output = (x / sqrt(mean(x^2) + eps)) * weight.
           Input x is [N, 4096], weight is [4096], eps is 1e-5.
           Sum-of-squares accumulation uses FP32 to prevent precision loss.
+          Warp reduction used for parallel sum computation.
           Output is FP16. Must match PyTorch reference for N=1 (decode)
           and N>1 (prefill, e.g. N=128, N=512).
 
       - name: rmsnorm-numerical-stability
+        status: implemented
         description: |
           Handles edge cases: all-zero input (should produce all-zero output),
           very large input values (no overflow in FP32 accumulator),
@@ -144,12 +167,15 @@ sections:
 
   - name: RoPE Kernel
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::rope method. Rotary Positional
       Embeddings applied to Q and K tensors after projection, before attention.
+      Uses pre-computed frequency table.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: rope-precomputation
+        status: implemented
         description: |
           Pre-computes sin/cos frequency table on initialization for all
           positions up to max_seq_len. Uses base theta=500000.
@@ -157,6 +183,7 @@ sections:
           Table stored on GPU, reused across all layers and forward passes.
 
       - name: rope-apply
+        status: implemented
         description: |
           Applies rotary embedding to Q [N, 32, 128] and K [N, 8, 128] tensors.
           Rotates pairs of adjacent dimensions using pre-computed sin/cos values
@@ -166,12 +193,14 @@ sections:
 
   - name: SiLU Multiply Kernel
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::silu_mul method. Fused SiLU activation
       and elementwise multiplication used in SwiGLU FFN.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: silu-mul-forward
+        status: implemented
         description: |
           Computes silu(gate) * up where silu(x) = x * sigmoid(x).
           Both gate and up are [N, 14336]. Output is [N, 14336].
@@ -180,12 +209,15 @@ sections:
 
   - name: Attention Kernel
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::attention method. Scaled dot-product
-      attention with causal masking and GQA. The most complex kernel in any backend.
+      attention with causal masking and GQA. Naive implementation with
+      FP32 softmax accumulation. The most complex kernel in any backend.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: attention-prefill
+        status: implemented
         description: |
           Computes causal self-attention during prefill. Q is [N, 32, 128],
           K_cache and V_cache are [N, 8, 128] (no prior cache, all new).
@@ -195,6 +227,7 @@ sections:
           Output is [N, 32, 128]. Must match PyTorch reference.
 
       - name: attention-decode
+        status: implemented
         description: |
           Computes attention during decode. Q is [1, 32, 128] (single new token).
           K_cache and V_cache are [seq_len, 8, 128] (all prior tokens + current).
@@ -202,7 +235,16 @@ sections:
           GQA head expansion applies. Output is [1, 32, 128].
           Must match PyTorch reference for various cache lengths.
 
+      - name: attention-score-scaling
+        status: implemented
+        description: |
+          Attention scores are divided by sqrt(head_dim) = sqrt(128) before
+          softmax. Uses rsqrtf for efficient computation. Without this scaling,
+          softmax saturates and produces near-one-hot distributions, causing
+          incorrect attention output.
+
       - name: attention-gqa-correctness
+        status: implemented
         description: |
           Validates that GQA head sharing is correct: Q heads 0-3 share KV head 0,
           Q heads 4-7 share KV head 1, etc. Compare against explicit per-head
@@ -210,12 +252,14 @@ sections:
 
   - name: Embedding Lookup
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::embedding method. Token ID to
-      embedding vector lookup on device.
+      embedding vector lookup on device with bounds checking.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: embedding-gather
+        status: implemented
         description: |
           Given token IDs [N] and embedding table [128256, 4096], produces
           output [N, 4096] by gathering rows. Handles out-of-vocabulary IDs
@@ -226,14 +270,16 @@ sections:
   # ============================================================
   - name: Matrix Multiplication
     path: backends/fracture-cuda
+    status: implemented
     description: |
       CUDA implementation of the Backend::matmul method. Wraps cuBLAS GEMM
       for FP16 matrix multiplication with FP32 accumulation. Handles the
-      row-major to column-major translation internally — the engine always
-      passes row-major tensors.
+      row-major to column-major translation via the transpose trick internally
+      — the engine always passes row-major tensors.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: gemm-correctness
+        status: implemented
         description: |
           Computes C = A @ B where A is [M, K] and B is [K, N], all FP16 row-major.
           Uses cublasGemmEx with CUBLAS_COMPUTE_32F. Row-major convention handled
@@ -243,40 +289,126 @@ sections:
           [1, 4096]x[4096, 128256].
 
       - name: gemm-edge-cases
+        status: implemented
         description: |
           Handles M=1 (decode) and large M (prefill) correctly. Handles the
           asymmetric shapes in GQA (K/V projections are [4096, 1024] not [4096, 4096]).
           Does not crash or produce NaN for any valid input shape.
 
   # ============================================================
+  # CUDA BACKEND (MEMORY MANAGEMENT)
+  # ============================================================
+  - name: CUDA Memory Management
+    path: backends/fracture-cuda
+    status: implemented
+    description: |
+      CUDA implementation of Backend memory operations: alloc, free,
+      copy_to_device, copy_to_host, and copy_rows. Manages GPU memory
+      allocation and host-device transfers.
+    shared: [error-handling]
+    behaviors:
+      - name: alloc-free
+        status: implemented
+        description: |
+          Allocates GPU memory for tensors of arbitrary shape and dtype.
+          Free releases GPU memory and invalidates the TensorId.
+          Double-free or use-after-free returns an error.
+
+      - name: host-device-transfer
+        status: implemented
+        description: |
+          copy_to_device transfers host FP16 data to a GPU tensor.
+          copy_to_host transfers GPU tensor data back to host memory.
+          Both validate that buffer sizes match tensor shape x dtype size.
+
+      - name: copy-rows
+        status: implemented
+        description: |
+          Copies a contiguous range of rows from one tensor to another.
+          Used by the KV cache to write new K/V entries into pre-allocated
+          buffers at the correct offset.
+
+  # ============================================================
+  # ADD KERNEL
+  # ============================================================
+  - name: Elementwise Add Kernel
+    path: backends/fracture-cuda
+    status: implemented
+    description: |
+      CUDA implementation of the Backend::add method. Elementwise addition
+      of two tensors, used for residual connections in the transformer.
+    shared: [numerical-correctness, error-handling]
+    behaviors:
+      - name: add-forward
+        status: implemented
+        description: |
+          Computes output = a + b elementwise. Both inputs and output are FP16.
+          Used for residual connections after attention and FFN sublayers.
+
+  # ============================================================
+  # CUDA PROFILING
+  # ============================================================
+  - name: CUDA Profiling
+    path: backends/fracture-cuda
+    status: implemented
+    description: |
+      GPU timer and NVTX marker implementations for the CUDA backend.
+      Timers use CUDA events for accurate kernel timing. NVTX markers
+      annotate GPU operations for Nsight Systems profiling.
+    shared: [error-handling]
+    behaviors:
+      - name: gpu-timers
+        status: implemented
+        description: |
+          Implements create_timer, start_timer, stop_timer, destroy_timer
+          using CUDA event pairs (cudaEventCreate/Record/ElapsedTime/Destroy).
+          Managed by TimerManager which tracks event pairs by DeviceTimer ID.
+          Returns elapsed milliseconds with GPU-accurate timing.
+
+      - name: nvtx-markers
+        status: implemented
+        description: |
+          Implements marker_push and marker_pop using NVTX range API
+          (nvtxRangePushA/nvtxRangePop). All Backend compute operations
+          (matmul, rmsnorm, rope, attention, silu_mul, embedding, add)
+          are annotated with NVTX ranges for profiling visibility in
+          Nsight Systems. Zero overhead when not profiling.
+
+  # ============================================================
   # KV CACHE MANAGER
   # ============================================================
   - name: KV Cache Manager
     path: crates/fracture-engine/src
+    status: implemented
     description: |
       Manages GPU memory for key/value cache across all layers and sequences.
-      Phase 1 uses contiguous allocation per sequence.
+      Phase 1 uses contiguous allocation per sequence. Tracks per-layer
+      seq_len for cache append and retrieval.
     shared: [error-handling]
     behaviors:
       - name: cache-allocation
+        status: implemented
         description: |
           Allocates KV cache for a new sequence. Pre-allocates buffers for
           max_seq_len tokens across all 32 layers. Returns opaque CacheHandle.
           Fails with error if GPU memory is insufficient.
 
       - name: cache-append-prefill
+        status: implemented
         description: |
           During prefill, appends K and V tensors for multiple positions at once
           (e.g. positions 0..512 for a 512-token prompt). Writes to correct
           offsets within the pre-allocated buffer for each layer.
 
       - name: cache-append-decode
+        status: implemented
         description: |
           During decode, appends K and V tensors for a single new position.
           Writes to the next available slot in the buffer for each layer.
           Tracks current sequence length correctly.
 
       - name: cache-retrieval
+        status: implemented
         description: |
           Returns cached K and V tensors up to the current sequence length
           for a given layer. The returned tensors must be contiguous views
@@ -284,12 +416,14 @@ sections:
           [current_seq_len, 8, 128] for both K and V.
 
       - name: cache-lifecycle
+        status: implemented
         description: |
           Free releases all GPU memory for a completed sequence.
           After free, the CacheHandle is invalid and any operation on it
           returns an error. Memory is available for reuse by new sequences.
 
       - name: cache-bounds
+        status: implemented
         description: |
           Append at a position beyond max_seq_len returns an error rather
           than writing out of bounds. Retrieval with seq_len=0 returns
@@ -300,39 +434,59 @@ sections:
   # ============================================================
   - name: Compute Engine
     path: crates/fracture-engine/src
+    status: implemented
     description: |
       Orchestrates the transformer forward pass by dispatching operations through
       the Backend trait. Contains no CUDA or Metal imports — all GPU operations
-      are Backend trait method calls.
+      are Backend trait method calls. Full forward pass: embed -> 32 layers
+      (rmsnorm -> QKV proj -> rope -> cache update -> GQA attention -> output
+      proj -> residual -> rmsnorm -> SwiGLU FFN -> residual) -> final norm ->
+      LM head. Uses scratch tensor reuse to minimize allocations.
     shared: [numerical-correctness, error-handling, backend-agnostic]
     behaviors:
       - name: single-layer-forward
+        status: implemented
         description: |
-          Executes a single transformer layer: RMSNorm → QKV projection →
-          RoPE → KV cache update → GQA attention → output projection →
-          residual add → RMSNorm → SwiGLU FFN → residual add.
+          Executes a single transformer layer: RMSNorm -> QKV projection ->
+          RoPE -> KV cache update -> GQA attention -> output projection ->
+          residual add -> RMSNorm -> SwiGLU FFN -> residual add.
           Output hidden state matches PyTorch reference for layer 0.
 
       - name: full-forward-prefill
+        status: implemented
         description: |
           Executes all 32 layers on a multi-token input (prefill).
           Final logits match PyTorch reference for a known test prompt.
           KV cache is populated for all layers at all prompt positions.
 
       - name: full-forward-decode
+        status: implemented
         description: |
           Executes all 32 layers on a single-token input (decode step).
           Reads from KV cache for prior tokens, appends new KV entry.
           Logits match PyTorch reference for the specific decode step.
 
       - name: layer-range-execution
+        status: implemented
         description: |
           Accepts a layer_range parameter. When range is a subset (e.g. 0..16),
           accepts activation tensor as input and returns activation tensor
           (not logits). When range is 0..32, accepts token IDs and returns logits.
           This is the Phase 2 hook for distributed inference.
 
+      - name: profiling-dispatch
+        status: implemented
+        description: |
+          When profiling is enabled (profile parameter is Some), the engine
+          creates GPU timers via timed_op() and records per-layer timing for
+          each operation (rmsnorm, QKV projection, RoPE, attention, output
+          projection, FFN). NVTX markers are always emitted via marker_push/
+          marker_pop. When profiling is disabled (None), no timers are created
+          and there is zero overhead. Results are collected into ForwardProfile
+          with per-layer LayerProfile structs.
+
       - name: prefill-decode-consistency
+        status: not-tested
         description: |
           The logits produced by decode step N+1 are identical to what you'd
           get by running prefill on the full sequence [0..N+1] and taking
@@ -344,115 +498,236 @@ sections:
   # ============================================================
   - name: Sampling
     path: crates/fracture-generate/src
+    status: implemented
     description: |
       Token selection from logit distributions. Runs on CPU.
+      Supports temperature scaling, top-k, top-p, and greedy determinism.
     shared: [error-handling]
     behaviors:
       - name: temperature-scaling
+        status: implemented
         description: |
           Divides logits by temperature before softmax. Temperature=0 produces
           argmax (greedy) selection. Temperature=1.0 leaves distribution unchanged.
           Higher temperatures flatten the distribution. Temperature must be >= 0.
 
       - name: top-k-filtering
+        status: implemented
         description: |
           Keeps only the K highest logits, setting all others to -inf before
           softmax. K=1 is equivalent to greedy. K=vocab_size disables filtering.
           K=0 disables filtering.
 
       - name: top-p-filtering
+        status: implemented
         description: |
           After softmax, sorts tokens by probability descending and keeps the
           smallest set whose cumulative probability exceeds top_p. top_p=1.0
           disables filtering. top_p=0.0 keeps only the most probable token.
 
       - name: greedy-determinism
+        status: implemented
         description: |
           With temperature=0 (or temperature=1 with top_k=1), the same logits
           always produce the same token. No randomness involved.
 
       - name: combined-filtering
+        status: implemented
         description: |
           Top-K is applied before top-P. The filters compose correctly:
           top_k=50, top_p=0.9 first restricts to 50 tokens then further
           restricts by cumulative probability.
+
+      - name: softmax-correctness
+        status: implemented
+        description: |
+          The softmax step that converts logits to probabilities uses the
+          numerically stable form: subtract the maximum logit before
+          exponentiation to prevent overflow. The resulting probabilities
+          form a valid distribution (sum to 1.0). This is applied after
+          top-K filtering and before top-P filtering.
+
+      - name: weighted-random-selection
+        status: implemented
+        description: |
+          After top-K filtering, softmax, and top-P filtering produce a valid
+          probability distribution, a token is drawn via weighted random
+          sampling from that distribution. A uniform random value is generated
+          and used to select a token proportional to its probability via
+          cumulative sum traversal.
+
+      - name: seeded-reproducibility
+        status: not-implemented
+        description: |
+          With temperature > 0, providing the same random seed produces the
+          same token sequence. Without a seed, sampling is non-deterministic.
+          Requires accepting an optional seed parameter and using it to
+          initialize the RNG for reproducible generation.
 
   # ============================================================
   # GENERATION LOOP
   # ============================================================
   - name: Generation Loop
     path: crates/fracture-generate/src
+    status: implemented
     description: |
-      Orchestrates the full generation pipeline: tokenize, prefill,
-      decode loop, detokenize, and streaming.
+      Orchestrates the generation pipeline: prefill, decode loop, and
+      streaming. Accepts pre-tokenized input — tokenization and
+      detokenization are handled by the server layer via the tokenizers
+      crate. Emits per-request metrics (TTFT, tokens/sec, VRAM usage)
+      to stderr as JSON.
     shared: [error-handling]
     behaviors:
-      - name: tokenization
-        description: |
-          Converts input text to token IDs using the Llama 3 tokenizer.
-          Handles special tokens (BOS). Round-trips correctly:
-          detokenize(tokenize(text)) == text for ASCII inputs.
-
       - name: prefill-to-decode-transition
+        status: implemented
         description: |
           After prefill, the generation loop correctly transitions to decode mode.
-          The first decode step uses the last token from prefill as input.
+          The first decode step uses the sampled token from prefill logits as input.
+          Position tracking increments correctly from prompt length.
           KV cache state is consistent between prefill and first decode.
 
       - name: stop-conditions
+        status: implemented
         description: |
           Generation stops on: EOS token (128001 or 128008 or 128009 for Llama 3),
-          max_tokens reached, or stop string encountered in output.
-          The stop token itself is not included in the output.
+          or max_tokens reached. The stop token itself is not included in the output.
+          Cache is always freed on completion, even on error.
 
       - name: token-streaming
+        status: implemented
         description: |
           Each generated token is sent through the output channel immediately
           after generation, not buffered until completion. The channel is
-          a tokio mpsc channel that the HTTP layer reads from.
+          a tokio unbounded mpsc channel that the HTTP layer reads from.
+
+      - name: request-metrics
+        status: implemented
+        description: |
+          Emits RequestMetrics as JSON to stderr after each generation request.
+          Tracks: time-to-first-token (TTFT), total generation time, tokens/sec,
+          average decode step latency, peak VRAM usage, and KV cache occupancy.
+
+      - name: generation-cancellation
+        status: not-implemented
+        description: |
+          The generation loop supports cooperative cancellation via a signal
+          (e.g., CancellationToken or channel). When cancelled, the decode
+          loop exits early and frees the KV cache. Required for the HTTP
+          server's stream-cancellation to propagate client disconnects.
+
+      - name: prompt-exceeds-max-seq-len
+        status: not-implemented
+        description: |
+          When the tokenized prompt length exceeds max_seq_len, the generation
+          loop returns a clear error before attempting prefill rather than
+          failing deep in cache append. Returns a meaningful "prompt too long"
+          error with the actual vs maximum lengths.
 
   # ============================================================
   # HTTP SERVER
   # ============================================================
   - name: HTTP Server
     path: crates/fracture-server/src
+    status: implemented
     description: |
-      OpenAI-compatible HTTP API for completions and chat.
+      OpenAI-compatible HTTP API for completions and chat. Tokenization
+      handled at this layer via the tokenizers crate. Generation runs in
+      a blocking task to avoid holding the async runtime.
     shared: [error-handling]
     behaviors:
       - name: completions-endpoint
+        status: implemented
         description: |
           POST /v1/completions accepts JSON with model, prompt, max_tokens,
           temperature, top_p, top_k, and stream fields. Returns JSON response
-          with choices array containing generated text. Validates required
-          fields. Returns 400 on malformed requests.
+          with choices array containing generated text. Tokenizes the prompt
+          via the tokenizers crate. Returns 400 on malformed requests.
 
       - name: chat-completions-endpoint
+        status: implemented
         description: |
           POST /v1/chat/completions accepts messages array with role/content
           objects. Applies Llama 3 chat template to convert messages to prompt.
           Returns response in chat completion format with message object.
 
       - name: sse-streaming
+        status: implemented
         description: |
           When stream=true, returns text/event-stream content type. Sends
           data: {json}\n\n for each token. Sends data: [DONE]\n\n at end.
           Each SSE event contains a delta object with the new token content.
+          Generation runs in a spawn_blocking task, tokens streamed via
+          async_stream.
 
       - name: non-streaming
+        status: implemented
         description: |
           When stream=false (default), waits for full generation to complete
           and returns the complete response in a single JSON object.
+          Includes usage stats (prompt_tokens, completion_tokens, total_tokens).
 
       - name: request-validation
+        status: implemented
         description: |
-          Returns 400 for: missing prompt/messages field, invalid temperature
-          (negative), invalid top_p (not in 0..1), invalid top_k (negative),
-          max_tokens=0. Returns 415 for non-JSON content type.
+          Returns 400 for: empty prompt/messages, negative temperature,
+          top_p outside [0, 1], max_tokens=0. Content-type validation
+          is handled by axum's Json extractor (rejects non-JSON bodies).
 
       - name: chat-template
+        status: implemented
         description: |
           Applies the Llama 3 chat template correctly. System messages are
           wrapped in the appropriate header tags. User and assistant messages
           alternate with correct delimiters. The template output matches
           what HuggingFace tokenizer.apply_chat_template produces.
+
+      - name: model-name-validation
+        status: not-implemented
+        description: |
+          When a request specifies a model name that doesn't match the loaded
+          model, the server returns an appropriate error (e.g., 404 or 400)
+          rather than silently using the loaded model. Prevents confusion when
+          clients target a specific model that isn't available.
+
+      - name: models-endpoint
+        status: not-implemented
+        description: |
+          GET /v1/models returns the list of loaded models in OpenAI-compatible
+          format. Returns a JSON object with a data array containing model
+          objects with id, object, created, and owned_by fields. Required by
+          client libraries to discover available models.
+
+      - name: concurrent-requests
+        status: not-implemented
+        description: |
+          Multiple simultaneous generation requests are handled correctly,
+          each with independent KV cache and generation state. One request
+          completing or erroring does not affect others in flight. Phase 1
+          uses a shared Mutex on the KV cache manager, limiting to sequential
+          request processing. True concurrent serving requires Phase 4
+          continuous batching.
+
+      - name: error-response-format
+        status: not-implemented
+        description: |
+          Error responses (400, 500, etc.) return the standard OpenAI error
+          object format: {"error": {"message": "...", "type": "...", "code": ...}}.
+          Currently errors return a simpler {"error": "message"} format.
+          Client libraries depend on the nested object structure for error handling.
+
+      - name: health-endpoint
+        status: not-implemented
+        description: |
+          GET /health returns server readiness status. Returns 200 with
+          {"status": "ready"} when the model is loaded and ready to serve.
+          Returns 503 during model loading. Enables load balancer and
+          orchestration health checks.
+
+      - name: stream-cancellation
+        status: not-implemented
+        description: |
+          When a client disconnects during SSE streaming, the server detects
+          the closed connection, aborts the in-flight generation, and frees
+          associated resources (KV cache). Without this, disconnected clients
+          cause the server to generate tokens into the void, wasting GPU
+          compute and leaking cache memory.

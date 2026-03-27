@@ -1,0 +1,8 @@
+[env]
+# WSL2 requires the CUDA driver library from /usr/lib/wsl/lib/ and the toolkit
+# libraries from /usr/local/cuda/lib64/. Without this, dynamically linked CUDA
+# libraries (cublas, cublasLt) fail to find the driver at runtime.
+#
+# Note: cudart is statically linked (libcudart_static.a) to work around a WSL2
+# segfault with the dynamic libcudart.so. See README.md for details.
+LD_LIBRARY_PATH = { value = "/usr/local/cuda/lib64:/usr/lib/wsl/lib", force = false }

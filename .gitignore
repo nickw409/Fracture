@@ -8,11 +8,21 @@
 # Model files (large)
 *.gguf
 *.safetensors
-*.bin
 
-# Reference test data (generated)
+# Reference test data (generated, large binary tensors)
+tests/reference/**/*.bin
+tests/reference/**/metadata.json
+tests/golden/**/*.bin
 tests/reference/*.npy
 tests/reference/*.pt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Validation crate build artifacts
+tests/validation/target/
 
 # Vex output (keep .vex/vexspec.yaml tracked)
 .vex/report.json

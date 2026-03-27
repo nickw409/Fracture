@@ -79,7 +79,7 @@ Source: Llama 3.1 8B config from HuggingFace / Meta release.
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                     HTTP Server (axum)                     │
-│              /v1/completions  /v1/chat/completions         │
+│      /v1/completions  /v1/chat/completions  /v1/profile   │
 │                  SSE streaming support                     │
 └────────────────────────┬─────────────────────────────────┘
                          │ CompletionRequest
@@ -470,6 +470,96 @@ For `stream: true`, emit `data: {"choices": [{"delta": {"content": "token"}}]}` 
 
 ---
 
+## Component 6: Profiling Infrastructure
+
+### Design Principles
+1. **Zero overhead when disabled.** No timers are created and no timing calls are made when profiling is not requested. NVTX markers are no-ops unless a backend overrides them.
+2. **GPU-accurate timing.** CPU-side `Instant` cannot measure async GPU kernel execution. Profiling uses CUDA events (`cudaEventRecord`/`cudaEventElapsedTime`) to capture actual GPU time.
+3. **Backend-agnostic.** Timer and marker methods are on the `Backend` trait with default no-ops. The engine never imports CUDA.
+
+### Backend Trait: Timer + Marker Methods
+```rust
+// Timer lifecycle for GPU-accurate kernel timing
+fn create_timer(&self) -> Result<DeviceTimer>;
+fn start_timer(&self, timer: &DeviceTimer) -> Result<()>;
+fn stop_timer(&self, timer: &DeviceTimer) -> Result<f32>;  // elapsed ms
+fn destroy_timer(&self, timer: &DeviceTimer) -> Result<()>;
+
+// Profiling markers (NVTX on CUDA, no-ops elsewhere)
+fn marker_push(&self, _name: &str) {}  // default no-op
+fn marker_pop(&self) {}                // default no-op
+```
+
+`DeviceTimer` is an opaque `u64` handle, same pattern as `TensorId`.
+
+### CUDA Backend Implementation
+- **Timers:** `TimerManager` maps timer IDs to `(cudaEvent_t, cudaEvent_t)` start/stop pairs. `stop_timer` records the stop event, synchronizes, and returns elapsed time via `cudaEventElapsedTime`.
+- **NVTX:** Every compute method (matmul, rmsnorm, rope, attention, silu_mul, embedding, add, copy_rows) is wrapped with `nvtxRangePushA`/`nvtxRangePop`. These show up in Nsight Systems profiling.
+- **Linking:** `build.rs` links `nvToolsExt` alongside `cudart` and `cublas`.
+
+### Engine: Per-Layer Forward Pass Profiling
+The `forward()` method accepts `profile: Option<&mut ForwardProfile>`. When `Some`, each operation within each layer is timed using `Backend::create_timer`/`start_timer`/`stop_timer`/`destroy_timer`:
+
+```rust
+pub struct ForwardProfile {
+    pub total_ms: f32,
+    pub prefill: bool,
+    pub seq_len: usize,
+    pub layer_profiles: Vec<LayerProfile>,
+}
+
+pub struct LayerProfile {
+    pub layer_idx: usize,
+    pub total_ms: f32,
+    pub rmsnorm_attn_ms: f32,
+    pub qkv_proj_ms: f32,
+    pub rope_ms: f32,
+    pub attention_ms: f32,
+    pub output_proj_ms: f32,
+    pub rmsnorm_ffn_ms: f32,
+    pub gate_up_proj_ms: f32,
+    pub silu_mul_ms: f32,
+    pub down_proj_ms: f32,
+}
+```
+
+NVTX layer markers (`layer_0`, `layer_1`, ...) are always emitted regardless of whether timing is active.
+
+**Note:** Profiling mode calls `cudaEventSynchronize` after every operation, serializing the GPU pipeline. Timing numbers reflect isolated operation costs, not overlapped execution.
+
+### Generation Loop: Per-Request Metrics
+After each completed request, `RequestMetrics` is serialized as a JSON line to stderr:
+
+```rust
+pub struct RequestMetrics {
+    pub request_id: String,     // random hex ID
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub ttft_ms: f64,           // time to first token (wall-clock prefill time)
+    pub total_ms: f64,          // total generation wall time
+    pub tokens_per_sec: f64,    // generated_tokens / decode_time (excludes prefill)
+    pub avg_decode_ms: f64,     // average per-token decode latency
+    pub peak_vram_mb: f64,      // VRAM usage at request completion
+    pub kv_cache_tokens: usize, // final sequence length
+}
+```
+
+TTFT and decode times use CPU-side `std::time::Instant` (valid because `synchronize()` is called before returning logits). `tokens_per_sec` is computed from decode time only — prefill time is excluded.
+
+### HTTP Server: `/v1/profile` Endpoint
+`GET /v1/profile` — stub endpoint for returning aggregated metrics. Primary profiling interface is the stderr JSON output.
+
+### Files
+| File | Purpose |
+|---|---|
+| `fracture-core/src/profiling.rs` | `DeviceTimer`, `ForwardProfile`, `LayerProfile`, `RequestMetrics` types |
+| `fracture-core/src/backend.rs` | Timer + marker methods on `Backend` trait |
+| `fracture-cuda/src/timers.rs` | `TimerManager` — CUDA event pair lifecycle |
+| `fracture-cuda/src/nvtx.rs` | NVTX FFI wrappers (`range_push`/`range_pop`) |
+| `fracture-cuda/src/ffi.rs` | CUDA Event + NVTX C API bindings |
+
+---
+
 ## Data Flow Summary
 
 ```
@@ -541,30 +631,32 @@ fracture/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── tensor.rs       # DeviceTensor, TensorId, DType
-│   │       ├── backend.rs      # Backend trait (all GPU ops go through this)
+│   │       ├── backend.rs      # Backend trait (all GPU ops + timer/marker methods)
+│   │       ├── profiling.rs    # DeviceTimer, ForwardProfile, LayerProfile, RequestMetrics
 │   │       ├── config.rs       # ModelConfig
 │   │       └── error.rs        # Error types
 │   ├── fracture-gguf/          # GGUF parser (backend-agnostic, returns host buffers)
 │   │   └── src/
 │   ├── fracture-engine/        # Compute engine + KV cache (uses Backend trait, no CUDA imports)
 │   │   └── src/
-│   ├── fracture-generate/      # Generation loop, sampling, tokenizer
+│   ├── fracture-generate/      # Generation loop, sampling, tokenizer, request metrics
 │   │   └── src/
-│   └── fracture-server/        # HTTP server (axum)
+│   └── fracture-server/        # HTTP server (axum), /v1/profile endpoint
 │       └── src/
 ├── backends/
 │   └── fracture-cuda/          # CUDA backend (implements Backend trait)
 │       ├── src/
-│       │   ├── lib.rs          # CudaBackend struct + Backend impl
-│       │   ├── memory.rs       # CUDA memory pool, TensorId → CUdeviceptr map
-│       │   ├── cublas.rs       # cuBLAS wrapper (row-major trick lives here)
-│       │   └── kernels.rs      # CUDA kernel dispatch
+│       │   ├── lib.rs          # CudaBackend struct + Backend impl + NVTX on all ops
+│       │   ├── ffi.rs          # Raw FFI: CUDA runtime, cuBLAS, CUDA events, NVTX
+│       │   ├── timers.rs       # TimerManager: CUDA event-based GPU timing
+│       │   └── nvtx.rs         # NVTX range_push/range_pop wrappers
 │       └── kernels/            # .cu files
 │           ├── rmsnorm.cu
 │           ├── rope.cu
 │           ├── attention.cu
 │           ├── silu_mul.cu
-│           └── embedding.cu
+│           ├── embedding.cu
+│           └── add.cu
 ├── bins/
 │   └── fracture-server-cuda/   # Binary: wires CudaBackend into engine + server
 │       └── src/main.rs
@@ -726,6 +818,15 @@ pub trait Backend: Send + Sync {
     fn device_name(&self) -> String;
     fn total_memory(&self) -> usize;
     fn available_memory(&self) -> usize;
+    fn synchronize(&self) -> Result<()>;
+
+    // ── Profiling ────────────────────────────────────────────
+    fn create_timer(&self) -> Result<DeviceTimer>;
+    fn start_timer(&self, timer: &DeviceTimer) -> Result<()>;
+    fn stop_timer(&self, timer: &DeviceTimer) -> Result<f32>;  // elapsed ms
+    fn destroy_timer(&self, timer: &DeviceTimer) -> Result<()>;
+    fn marker_push(&self, _name: &str) {}  // default no-op
+    fn marker_pop(&self) {}                // default no-op
 }
 ```
 
@@ -803,7 +904,7 @@ Some things are intentionally left backend-specific:
 ### Dependency Graph
 
 ```
-fracture-core          (Backend trait, DeviceTensor, ModelConfig)
+fracture-core          (Backend trait, DeviceTensor, DeviceTimer, ModelConfig, profiling types)
     ↑
 fracture-engine        (uses Backend trait generically)
     ↑
@@ -872,4 +973,5 @@ These need answers before or during implementation:
 - [ ] OpenAI-compatible /v1/completions and /v1/chat/completions endpoints working
 - [ ] SSE streaming delivers tokens as they're generated
 - [ ] Benchmarked tokens/sec on at least one GPU (documented)
+- [ ] Profiling infrastructure: per-layer GPU timing, NVTX markers for Nsight Systems, per-request metrics to stderr
 - [ ] Code structured so Phase 2 (layer-range execution) requires config change, not rewrite
