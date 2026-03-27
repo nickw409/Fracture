@@ -1,4 +1,4 @@
-use crate::{DType, DeviceTensor, Result};
+use crate::{DType, DeviceTensor, DeviceTimer, Result};
 
 /// The GPU backend trait. All GPU operations go through this interface.
 ///
@@ -103,4 +103,24 @@ pub trait Backend: Send + Sync {
 
     /// Synchronize all pending device operations.
     fn synchronize(&self) -> Result<()>;
+
+    // ── Profiling ────────────────────────────────────────────────
+
+    /// Create a GPU timer for measuring kernel execution time.
+    fn create_timer(&self) -> Result<DeviceTimer>;
+
+    /// Record the start timestamp on the current stream.
+    fn start_timer(&self, timer: &DeviceTimer) -> Result<()>;
+
+    /// Record the stop timestamp, synchronize, and return elapsed milliseconds.
+    fn stop_timer(&self, timer: &DeviceTimer) -> Result<f32>;
+
+    /// Destroy a GPU timer and free its resources.
+    fn destroy_timer(&self, timer: &DeviceTimer) -> Result<()>;
+
+    /// Push a named profiling marker (e.g., NVTX range). Default no-op.
+    fn marker_push(&self, _name: &str) {}
+
+    /// Pop the most recent profiling marker. Default no-op.
+    fn marker_pop(&self) {}
 }

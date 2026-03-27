@@ -30,6 +30,29 @@ impl DType {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_bytes() {
+        assert_eq!(DType::FP16.size_bytes(), 2);
+        assert_eq!(DType::FP32.size_bytes(), 4);
+        assert_eq!(DType::BF16.size_bytes(), 2);
+        assert_eq!(DType::INT8.size_bytes(), 1);
+        assert_eq!(DType::INT4.size_bytes(), 1);
+    }
+
+    #[test]
+    fn test_is_packed() {
+        assert!(!DType::FP16.is_packed());
+        assert!(!DType::FP32.is_packed());
+        assert!(!DType::BF16.is_packed());
+        assert!(!DType::INT8.is_packed());
+        assert!(DType::INT4.is_packed());
+    }
+}
+
 impl std::fmt::Display for DType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
