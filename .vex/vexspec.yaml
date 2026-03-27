@@ -328,6 +328,16 @@ sections:
           Used by the KV cache to write new K/V entries into pre-allocated
           buffers at the correct offset.
 
+      - name: copy-rows-bounds-validation
+        status: not-implemented
+        description: |
+          copy_rows validates that the source row range (offset + count)
+          does not exceed the source tensor's row dimension, and that the
+          destination has sufficient capacity at the target offset. Returns
+          an error on out-of-bounds rather than performing an invalid GPU
+          memory access. This is the safety boundary that the KV cache's
+          cache-bounds behavior depends on.
+
   # ============================================================
   # ADD KERNEL
   # ============================================================
@@ -722,6 +732,15 @@ sections:
           {"status": "ready"} when the model is loaded and ready to serve.
           Returns 503 during model loading. Enables load balancer and
           orchestration health checks.
+
+      - name: streaming-error-propagation
+        status: not-implemented
+        description: |
+          When generation fails mid-stream (e.g., GPU OOM during decode),
+          the server communicates the error to the client over the already-open
+          SSE connection. Since HTTP status is already 200, the server sends
+          an SSE event with an error payload before closing the stream, so
+          clients can distinguish failure from truncated output.
 
       - name: stream-cancellation
         status: not-implemented
