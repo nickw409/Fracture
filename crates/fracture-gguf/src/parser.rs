@@ -1,21 +1,611 @@
-use fracture_core::{FractureError, ModelConfig, Result};
+use byteorder::{LittleEndian, ReadBytesExt};
+use fracture_core::{DType, FractureError, ModelConfig, Result};
+use memmap2::Mmap;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Cursor, Read};
+use std::path::Path;
+
+/// GGUF magic number: "GGUF" in little-endian.
+const GGUF_MAGIC: u32 = 0x46475547;
+/// Only GGUF version 3 is supported.
+const GGUF_VERSION: u32 = 3;
+
+/// GGUF metadata value types.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgufMetadataType {
+    Uint8 = 0,
+    Int8 = 1,
+    Uint16 = 2,
+    Int16 = 3,
+    Uint32 = 4,
+    Int32 = 5,
+    Float32 = 6,
+    Bool = 7,
+    String = 8,
+    Array = 9,
+    Uint64 = 10,
+    Int64 = 11,
+    Float64 = 12,
+}
+
+impl GgufMetadataType {
+    fn from_u32(v: u32) -> Result<Self> {
+        match v {
+            0 => Ok(Self::Uint8),
+            1 => Ok(Self::Int8),
+            2 => Ok(Self::Uint16),
+            3 => Ok(Self::Int16),
+            4 => Ok(Self::Uint32),
+            5 => Ok(Self::Int32),
+            6 => Ok(Self::Float32),
+            7 => Ok(Self::Bool),
+            8 => Ok(Self::String),
+            9 => Ok(Self::Array),
+            10 => Ok(Self::Uint64),
+            11 => Ok(Self::Int64),
+            12 => Ok(Self::Float64),
+            _ => Err(FractureError::GgufParse(format!(
+                "unknown metadata type: {v}"
+            ))),
+        }
+    }
+}
+
+/// GGUF tensor data types.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy)]
+enum GgufDType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    // 4 is unused
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Iq2Xxs = 15,
+    Iq2Xs = 16,
+    Iq3Xxs = 17,
+    Iq1S = 18,
+    Iq4Nl = 19,
+    Iq3S = 20,
+    Iq2S = 21,
+    Iq4Xs = 22,
+    I8 = 23,
+    I16 = 24,
+    I32 = 25,
+    I64 = 26,
+    F64 = 27,
+    Iq1M = 28,
+    Bf16 = 30,
+}
+
+impl GgufDType {
+    fn from_u32(v: u32) -> Result<Self> {
+        match v {
+            0 => Ok(Self::F32),
+            1 => Ok(Self::F16),
+            2 => Ok(Self::Q4_0),
+            3 => Ok(Self::Q4_1),
+            6 => Ok(Self::Q5_0),
+            7 => Ok(Self::Q5_1),
+            8 => Ok(Self::Q8_0),
+            9 => Ok(Self::Q8_1),
+            10 => Ok(Self::Q2K),
+            11 => Ok(Self::Q3K),
+            12 => Ok(Self::Q4K),
+            13 => Ok(Self::Q5K),
+            14 => Ok(Self::Q6K),
+            15 => Ok(Self::Iq2Xxs),
+            16 => Ok(Self::Iq2Xs),
+            17 => Ok(Self::Iq3Xxs),
+            18 => Ok(Self::Iq1S),
+            19 => Ok(Self::Iq4Nl),
+            20 => Ok(Self::Iq3S),
+            21 => Ok(Self::Iq2S),
+            22 => Ok(Self::Iq4Xs),
+            23 => Ok(Self::I8),
+            24 => Ok(Self::I16),
+            25 => Ok(Self::I32),
+            26 => Ok(Self::I64),
+            27 => Ok(Self::F64),
+            28 => Ok(Self::Iq1M),
+            30 => Ok(Self::Bf16),
+            _ => Err(FractureError::GgufParse(format!(
+                "unknown tensor dtype: {v}"
+            ))),
+        }
+    }
+
+    fn to_fracture_dtype(self) -> Result<DType> {
+        match self {
+            Self::F32 => Ok(DType::FP32),
+            Self::F16 => Ok(DType::FP16),
+            Self::Bf16 => Ok(DType::BF16),
+            Self::I8 => Ok(DType::INT8),
+            other => Err(FractureError::UnsupportedDType(format!(
+                "GGUF dtype {:?} not yet supported",
+                other
+            ))),
+        }
+    }
+}
+
+/// A typed metadata value from a GGUF file.
+#[derive(Debug, Clone)]
+pub enum MetadataValue {
+    Uint8(u8),
+    Int8(i8),
+    Uint16(u16),
+    Int16(i16),
+    Uint32(u32),
+    Int32(i32),
+    Float32(f32),
+    Bool(bool),
+    String(String),
+    Array(Vec<MetadataValue>),
+    Uint64(u64),
+    Int64(i64),
+    Float64(f64),
+}
+
+impl MetadataValue {
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            Self::Uint32(v) => Some(*v),
+            Self::Uint64(v) => Some(*v as u32),
+            Self::Int32(v) => Some(*v as u32),
+            Self::Uint16(v) => Some(*v as u32),
+            Self::Uint8(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Uint64(v) => Some(*v),
+            Self::Uint32(v) => Some(*v as u64),
+            Self::Int64(v) => Some(*v as u64),
+            Self::Int32(v) => Some(*v as u64),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float64(v) => Some(*v),
+            Self::Float32(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
 
 /// Parsed GGUF tensor descriptor.
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
     pub shape: Vec<usize>,
-    pub dtype: fracture_core::DType,
+    pub dtype: DType,
     pub offset: u64,
+    pub(crate) gguf_dtype: u32,
+}
+
+/// Result of parsing a GGUF file.
+pub struct GgufFile {
+    // Debug is manually implemented below because Mmap doesn't derive Debug.
+    pub config: ModelConfig,
+    pub metadata: HashMap<String, MetadataValue>,
+    pub tensors: Vec<TensorInfo>,
+    pub mmap: Mmap,
+    pub tensor_data_offset: usize,
+}
+
+impl std::fmt::Debug for GgufFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgufFile")
+            .field("config", &self.config)
+            .field("metadata_keys", &self.metadata.keys().collect::<Vec<_>>())
+            .field("tensors", &self.tensors.len())
+            .field("tensor_data_offset", &self.tensor_data_offset)
+            .field("mmap_len", &self.mmap.len())
+            .finish()
+    }
 }
 
 /// Parses GGUF v3 binary files.
 pub struct GgufParser;
 
 impl GgufParser {
-    /// Parse a GGUF file, returning model config and tensor descriptors.
-    pub fn parse(_path: &std::path::Path) -> Result<(ModelConfig, Vec<TensorInfo>)> {
-        // TODO: Implement GGUF header, metadata, and tensor info parsing
-        Err(FractureError::GgufParse("not yet implemented".into()))
+    /// Parse a GGUF file, returning model config, tensor descriptors, and memory-mapped data.
+    pub fn parse(path: &Path) -> Result<GgufFile> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mut cursor = Cursor::new(mmap.as_ref());
+
+        // Header
+        let magic = cursor.read_u32::<LittleEndian>()?;
+        if magic != GGUF_MAGIC {
+            return Err(FractureError::GgufParse(format!(
+                "invalid magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
+            )));
+        }
+
+        let version = cursor.read_u32::<LittleEndian>()?;
+        if version != GGUF_VERSION {
+            return Err(FractureError::GgufParse(format!(
+                "unsupported GGUF version: {version} (only v3 supported)"
+            )));
+        }
+
+        let tensor_count = cursor.read_u64::<LittleEndian>()? as usize;
+        let metadata_kv_count = cursor.read_u64::<LittleEndian>()? as usize;
+
+        tracing::info!(
+            "GGUF v{version}: {tensor_count} tensors, {metadata_kv_count} metadata entries"
+        );
+
+        // Metadata
+        let mut metadata = HashMap::with_capacity(metadata_kv_count);
+        for _ in 0..metadata_kv_count {
+            let key = read_gguf_string(&mut cursor)?;
+            let value = read_metadata_value(&mut cursor)?;
+            metadata.insert(key, value);
+        }
+
+        // Tensor info table
+        let mut tensors = Vec::with_capacity(tensor_count);
+        for _ in 0..tensor_count {
+            let name = read_gguf_string(&mut cursor)?;
+            let ndims = cursor.read_u32::<LittleEndian>()? as usize;
+            let mut shape = Vec::with_capacity(ndims);
+            for _ in 0..ndims {
+                shape.push(cursor.read_u64::<LittleEndian>()? as usize);
+            }
+            let dtype_code = cursor.read_u32::<LittleEndian>()?;
+            let gguf_dtype = GgufDType::from_u32(dtype_code)?;
+            let dtype = gguf_dtype.to_fracture_dtype()?;
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            tensors.push(TensorInfo {
+                name,
+                shape,
+                dtype,
+                offset,
+                gguf_dtype: dtype_code,
+            });
+        }
+
+        // Tensor data starts after the header, aligned to GGUF_DEFAULT_ALIGNMENT (32 bytes for v3)
+        let current_pos = cursor.position() as usize;
+        let alignment = get_alignment(&metadata);
+        let tensor_data_offset = align_offset(current_pos, alignment);
+
+        tracing::info!(
+            "tensor data starts at offset 0x{tensor_data_offset:X} (alignment={alignment})"
+        );
+
+        let config = extract_model_config(&metadata)?;
+
+        Ok(GgufFile {
+            config,
+            metadata,
+            tensors,
+            mmap,
+            tensor_data_offset,
+        })
+    }
+}
+
+/// Read a GGUF string: u64 length prefix followed by UTF-8 bytes (no null terminator).
+fn read_gguf_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
+    let len = cursor.read_u64::<LittleEndian>()? as usize;
+    let mut buf = vec![0u8; len];
+    cursor.read_exact(&mut buf)?;
+    String::from_utf8(buf)
+        .map_err(|e| FractureError::GgufParse(format!("invalid UTF-8 in string: {e}")))
+}
+
+fn read_metadata_value(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue> {
+    let type_code = cursor.read_u32::<LittleEndian>()?;
+    let typ = GgufMetadataType::from_u32(type_code)?;
+    read_typed_value(cursor, typ)
+}
+
+fn read_typed_value(cursor: &mut Cursor<&[u8]>, typ: GgufMetadataType) -> Result<MetadataValue> {
+    match typ {
+        GgufMetadataType::Uint8 => Ok(MetadataValue::Uint8(cursor.read_u8()?)),
+        GgufMetadataType::Int8 => Ok(MetadataValue::Int8(cursor.read_i8()?)),
+        GgufMetadataType::Uint16 => Ok(MetadataValue::Uint16(cursor.read_u16::<LittleEndian>()?)),
+        GgufMetadataType::Int16 => Ok(MetadataValue::Int16(cursor.read_i16::<LittleEndian>()?)),
+        GgufMetadataType::Uint32 => Ok(MetadataValue::Uint32(cursor.read_u32::<LittleEndian>()?)),
+        GgufMetadataType::Int32 => Ok(MetadataValue::Int32(cursor.read_i32::<LittleEndian>()?)),
+        GgufMetadataType::Float32 => {
+            Ok(MetadataValue::Float32(cursor.read_f32::<LittleEndian>()?))
+        }
+        GgufMetadataType::Bool => Ok(MetadataValue::Bool(cursor.read_u8()? != 0)),
+        GgufMetadataType::String => Ok(MetadataValue::String(read_gguf_string(cursor)?)),
+        GgufMetadataType::Uint64 => Ok(MetadataValue::Uint64(cursor.read_u64::<LittleEndian>()?)),
+        GgufMetadataType::Int64 => Ok(MetadataValue::Int64(cursor.read_i64::<LittleEndian>()?)),
+        GgufMetadataType::Float64 => {
+            Ok(MetadataValue::Float64(cursor.read_f64::<LittleEndian>()?))
+        }
+        GgufMetadataType::Array => {
+            let elem_type_code = cursor.read_u32::<LittleEndian>()?;
+            let elem_type = GgufMetadataType::from_u32(elem_type_code)?;
+            let len = cursor.read_u64::<LittleEndian>()? as usize;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(read_typed_value(cursor, elem_type)?);
+            }
+            Ok(MetadataValue::Array(values))
+        }
+    }
+}
+
+fn get_alignment(metadata: &HashMap<String, MetadataValue>) -> usize {
+    metadata
+        .get("general.alignment")
+        .and_then(|v| v.as_u32())
+        .map(|v| v as usize)
+        .unwrap_or(32)
+}
+
+fn align_offset(offset: usize, alignment: usize) -> usize {
+    (offset + alignment - 1) & !(alignment - 1)
+}
+
+/// Extract ModelConfig from GGUF metadata using standard llama.cpp key names.
+fn extract_model_config(metadata: &HashMap<String, MetadataValue>) -> Result<ModelConfig> {
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+
+    let get_u32 = |key: &str| -> Result<usize> {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_u32())
+            .map(|v| v as usize)
+            .ok_or_else(|| FractureError::GgufParse(format!("missing metadata key: {key}")))
+    };
+
+    let get_f64 = |key: &str, default: f64| -> f64 {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default)
+    };
+
+    let hidden_size = get_u32(&format!("{arch}.embedding_length"))?;
+    let num_layers = get_u32(&format!("{arch}.block_count"))?;
+    let num_q_heads = get_u32(&format!("{arch}.attention.head_count"))?;
+    let num_kv_heads = get_u32(&format!("{arch}.attention.head_count_kv"))?;
+    let intermediate_size = get_u32(&format!("{arch}.feed_forward_length"))?;
+
+    let vocab_size = metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| match v {
+            MetadataValue::Array(arr) => Some(arr.len()),
+            _ => None,
+        })
+        .or_else(|| {
+            metadata
+                .get(&format!("{arch}.vocab_size"))
+                .and_then(|v| v.as_u32())
+                .map(|v| v as usize)
+        })
+        .ok_or_else(|| FractureError::GgufParse("cannot determine vocab_size".into()))?;
+
+    let head_dim = hidden_size / num_q_heads;
+    let rope_theta = get_f64(&format!("{arch}.rope.freq_base"), 500000.0);
+    let rms_norm_eps = get_f64(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
+
+    let context_length = metadata
+        .get(&format!("{arch}.context_length"))
+        .and_then(|v| v.as_u32())
+        .map(|v| v as usize)
+        .unwrap_or(8192);
+
+    let config = ModelConfig {
+        hidden_size,
+        num_layers,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+        rope_theta,
+        rms_norm_eps,
+        max_seq_len: context_length,
+    };
+
+    config.validate()?;
+
+    tracing::info!(
+        "model config: {}L, d={}, {}Qh/{}KVh, ffn={}, vocab={}, ctx={}",
+        config.num_layers,
+        config.hidden_size,
+        config.num_q_heads,
+        config.num_kv_heads,
+        config.intermediate_size,
+        config.vocab_size,
+        config.max_seq_len,
+    );
+
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::WriteBytesExt;
+    use std::io::Write;
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.write_u64::<LittleEndian>(s.len() as u64).unwrap();
+        buf.write_all(s.as_bytes()).unwrap();
+    }
+
+    fn write_metadata_kv_u32(buf: &mut Vec<u8>, key: &str, val: u32) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(GgufMetadataType::Uint32 as u32)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(val).unwrap();
+    }
+
+    fn write_metadata_kv_f32(buf: &mut Vec<u8>, key: &str, val: f32) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(GgufMetadataType::Float32 as u32)
+            .unwrap();
+        buf.write_f32::<LittleEndian>(val).unwrap();
+    }
+
+    fn write_metadata_kv_string(buf: &mut Vec<u8>, key: &str, val: &str) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(GgufMetadataType::String as u32)
+            .unwrap();
+        write_gguf_string(buf, val);
+    }
+
+    fn write_metadata_kv_string_array(buf: &mut Vec<u8>, key: &str, vals: &[&str]) {
+        write_gguf_string(buf, key);
+        buf.write_u32::<LittleEndian>(GgufMetadataType::Array as u32)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(GgufMetadataType::String as u32)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(vals.len() as u64).unwrap();
+        for s in vals {
+            write_gguf_string(buf, s);
+        }
+    }
+
+    /// Build a minimal valid GGUF v3 file in memory with one FP16 tensor.
+    fn build_test_gguf() -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Header
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(8).unwrap(); // metadata_kv_count
+
+        // Metadata
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        // vocab via token array (4 dummy tokens)
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+
+        // Tensor info: one tensor [4, 64] FP16
+        write_gguf_string(&mut buf, "token_embd.weight");
+        buf.write_u32::<LittleEndian>(2).unwrap(); // ndims
+        buf.write_u64::<LittleEndian>(4).unwrap(); // dim 0
+        buf.write_u64::<LittleEndian>(64).unwrap(); // dim 1
+        buf.write_u32::<LittleEndian>(1).unwrap(); // dtype = FP16
+        buf.write_u64::<LittleEndian>(0).unwrap(); // offset (from tensor data start)
+
+        // Pad to 32-byte alignment
+        let alignment = 32;
+        let current = buf.len();
+        let aligned = align_offset(current, alignment);
+        buf.resize(aligned, 0);
+
+        // Tensor data: 4 * 64 * 2 bytes = 512 bytes of zeros
+        buf.extend(vec![0u8; 4 * 64 * 2]);
+
+        buf
+    }
+
+    #[test]
+    fn test_invalid_magic() {
+        let mut data = build_test_gguf();
+        // Corrupt magic
+        data[0] = 0x00;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.gguf");
+        std::fs::write(&path, &data).unwrap();
+        let err = GgufParser::parse(&path).unwrap_err();
+        assert!(err.to_string().contains("invalid magic"));
+    }
+
+    #[test]
+    fn test_unsupported_version() {
+        let mut data = build_test_gguf();
+        // Set version to 2
+        data[4] = 2;
+        data[5] = 0;
+        data[6] = 0;
+        data[7] = 0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.gguf");
+        std::fs::write(&path, &data).unwrap();
+        let err = GgufParser::parse(&path).unwrap_err();
+        assert!(err.to_string().contains("unsupported GGUF version"));
+    }
+
+    #[test]
+    fn test_parse_valid_gguf() {
+        let data = build_test_gguf();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.gguf");
+        std::fs::write(&path, &data).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+
+        // Config
+        assert_eq!(gguf.config.hidden_size, 64);
+        assert_eq!(gguf.config.num_layers, 2);
+        assert_eq!(gguf.config.num_q_heads, 4);
+        assert_eq!(gguf.config.num_kv_heads, 2);
+        assert_eq!(gguf.config.head_dim, 16); // 64 / 4
+        assert_eq!(gguf.config.intermediate_size, 128);
+        assert_eq!(gguf.config.vocab_size, 4);
+
+        // Tensors
+        assert_eq!(gguf.tensors.len(), 1);
+        assert_eq!(gguf.tensors[0].name, "token_embd.weight");
+        assert_eq!(gguf.tensors[0].shape, vec![4, 64]);
+        assert_eq!(gguf.tensors[0].dtype, DType::FP16);
+    }
+
+    #[test]
+    fn test_tensor_data_accessible() {
+        let data = build_test_gguf();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.gguf");
+        std::fs::write(&path, &data).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+        let t = &gguf.tensors[0];
+        let start = gguf.tensor_data_offset + t.offset as usize;
+        let size = t.shape.iter().product::<usize>() * t.dtype.size_bytes();
+        assert!(start + size <= gguf.mmap.len());
+    }
+
+    #[test]
+    fn test_align_offset() {
+        assert_eq!(align_offset(0, 32), 0);
+        assert_eq!(align_offset(1, 32), 32);
+        assert_eq!(align_offset(31, 32), 32);
+        assert_eq!(align_offset(32, 32), 32);
+        assert_eq!(align_offset(33, 32), 64);
     }
 }

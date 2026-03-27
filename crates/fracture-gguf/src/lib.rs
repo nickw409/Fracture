@@ -1,5 +1,5 @@
 mod parser;
 mod weight_store;
 
-pub use parser::GgufParser;
-pub use weight_store::WeightStore;
+pub use parser::{GgufFile, GgufParser, MetadataValue, TensorInfo};
+pub use weight_store::{LayerWeights, WeightStore};
