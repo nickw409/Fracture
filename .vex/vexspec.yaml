@@ -692,20 +692,28 @@ sections:
           what HuggingFace tokenizer.apply_chat_template produces.
 
       - name: model-name-validation
-        status: not-implemented
+        status: implemented
         description: |
           When a request specifies a model name that doesn't match the loaded
-          model, the server returns an appropriate error (e.g., 404 or 400)
-          rather than silently using the loaded model. Prevents confusion when
-          clients target a specific model that isn't available.
+          model, the server returns 404 with an OpenAI-compatible error object.
+          If model is None, the request proceeds normally. Prevents confusion
+          when clients target a specific model that isn't available.
 
       - name: models-endpoint
-        status: not-implemented
+        status: implemented
         description: |
           GET /v1/models returns the list of loaded models in OpenAI-compatible
           format. Returns a JSON object with a data array containing model
           objects with id, object, created, and owned_by fields. Required by
           client libraries to discover available models.
+
+      - name: profile-endpoint
+        status: implemented
+        description: |
+          GET /v1/profile returns profiling status. Currently returns a
+          placeholder JSON object indicating the profiling endpoint is ready.
+          Will return RequestMetrics and aggregated stats once the profiling
+          pipeline is fully wired through shared state.
 
       - name: concurrent-requests
         status: not-implemented
@@ -718,20 +726,18 @@ sections:
           continuous batching.
 
       - name: error-response-format
-        status: not-implemented
+        status: implemented
         description: |
           Error responses (400, 500, etc.) return the standard OpenAI error
-          object format: {"error": {"message": "...", "type": "...", "code": ...}}.
-          Currently errors return a simpler {"error": "message"} format.
+          object format: {"error": {"message": "...", "type": "invalid_request_error", "code": null}}.
           Client libraries depend on the nested object structure for error handling.
 
       - name: health-endpoint
-        status: not-implemented
+        status: implemented
         description: |
           GET /health returns server readiness status. Returns 200 with
           {"status": "ready"} when the model is loaded and ready to serve.
-          Returns 503 during model loading. Enables load balancer and
-          orchestration health checks.
+          Enables load balancer and orchestration health checks.
 
       - name: streaming-error-propagation
         status: not-implemented

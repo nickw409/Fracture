@@ -318,6 +318,7 @@ def load_model(model_path: str) -> tuple[LlamaForCausalLM, Any]:
         model_path,
         dtype=torch.float16,
         device_map="cuda",
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
     elapsed = time.time() - t0
