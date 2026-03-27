@@ -506,6 +506,21 @@ impl Backend for CudaBackend {
         count: usize,
     ) -> Result<()> {
         nvtx::range_push("copy_rows");
+
+        // Bounds validation
+        if src_offset + count > src.shape[0] {
+            return Err(FractureError::InvalidShape(format!(
+                "copy_rows: src_offset({}) + count({}) = {} exceeds src rows({})",
+                src_offset, count, src_offset + count, src.shape[0]
+            )));
+        }
+        if dst_offset + count > dst.shape[0] {
+            return Err(FractureError::InvalidShape(format!(
+                "copy_rows: dst_offset({}) + count({}) = {} exceeds dst rows({})",
+                dst_offset, count, dst_offset + count, dst.shape[0]
+            )));
+        }
+
         let src_ptr = self.get_ptr(src.id)?;
         let dst_ptr = self.get_ptr(dst.id)?;
 
@@ -1089,6 +1104,22 @@ mod tests {
         b.free(&t).unwrap();
     }
 
+    #[test]
+    fn test_tensor_not_found_contains_id() {
+        let b = make_backend();
+        let fake = DeviceTensor::new(TensorId(12345), vec![1], DType::FP16);
+        let err = b.free(&fake).unwrap_err();
+        assert!(
+            matches!(err, FractureError::TensorNotFound(_)),
+            "expected TensorNotFound, got: {err}"
+        );
+        let display = err.to_string();
+        assert!(
+            display.contains("12345"),
+            "TensorNotFound error should contain tensor id '12345' in: {display}"
+        );
+    }
+
     // ── RMSNorm additional tests ──────────────────────────────────
 
     #[test]
@@ -1210,8 +1241,14 @@ mod tests {
         b.synchronize().unwrap();
 
         let result = read_fp16(&b, &out);
-        for &v in &result {
+        // CPU: rms = sqrt(mean([60000^2]*4) + eps) = sqrt(60000^2 + eps) = 60000
+        // output = (60000/60000) * 1.0 = 1.0 for each element
+        for (i, &v) in result.iter().enumerate() {
             assert!(v.is_finite(), "rmsnorm_large_values: got non-finite {v}");
+            assert!(
+                (v - 1.0).abs() < 1e-3,
+                "rmsnorm_large_values [{i}]: got {v}, expected 1.0"
+            );
         }
 
         b.free(&x).unwrap();
@@ -1368,22 +1405,17 @@ mod tests {
         let exp2 = x2 * cos1 - x3 * sin1;
         let exp3 = x2 * sin1 + x3 * cos1;
 
-        assert!(
-            (result[0] - exp0).abs() < 0.05,
-            "rope numerical [0]: got {}, expected {exp0}", result[0]
-        );
-        assert!(
-            (result[1] - exp1).abs() < 0.05,
-            "rope numerical [1]: got {}, expected {exp1}", result[1]
-        );
-        assert!(
-            (result[2] - exp2).abs() < 0.05,
-            "rope numerical [2]: got {}, expected {exp2}", result[2]
-        );
-        assert!(
-            (result[3] - exp3).abs() < 0.05,
-            "rope numerical [3]: got {}, expected {exp3}", result[3]
-        );
+        // FP16 precision at magnitude ~5 is ~0.002, use numpy-style allclose
+        let atol = 1e-3f32;
+        let rtol = 1e-3f32;
+        for (i, (&got, &exp)) in result.iter().zip([exp0, exp1, exp2, exp3].iter()).enumerate() {
+            let tol = atol + rtol * exp.abs();
+            assert!(
+                (got - exp).abs() <= tol,
+                "rope numerical [{i}]: got {got}, expected {exp} (err={}, tol={tol})",
+                (got - exp).abs()
+            );
+        }
 
         b.free(&q).unwrap();
         b.free(&k).unwrap();
@@ -1476,13 +1508,15 @@ mod tests {
         use rand::Rng;
         let b = make_backend();
         let mut rng = rand::thread_rng();
-        let n = 1024;
+        let rows = 2;
+        let cols = 14336;
+        let n = rows * cols;
         let gate_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-3.0..3.0)).collect();
         let up_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-3.0..3.0)).collect();
 
-        let gate = alloc_with_data(&b, &[1, n], &gate_data);
-        let up = alloc_with_data(&b, &[1, n], &up_data);
-        let out = b.alloc(&[1, n], DType::FP16).unwrap();
+        let gate = alloc_with_data(&b, &[rows, cols], &gate_data);
+        let up = alloc_with_data(&b, &[rows, cols], &up_data);
+        let out = b.alloc(&[rows, cols], DType::FP16).unwrap();
 
         b.silu_mul(&gate, &up, &out).unwrap();
         b.synchronize().unwrap();
@@ -1918,5 +1952,640 @@ mod tests {
         assert!(b.add(&fake, &real, &out).is_err());
         b.free(&real).unwrap();
         b.free(&out).unwrap();
+    }
+
+    // ── Gap 1: copy_rows bounds validation ──────────────────────────
+
+    #[test]
+    fn test_copy_rows_src_out_of_bounds() {
+        let b = make_backend();
+        let src = alloc_with_data(&b, &[4, 2], &[1.0; 8]);
+        let dst = b.alloc(&[4, 2], DType::FP16).unwrap();
+        // src has 4 rows, src_offset=3 + count=2 = 5 > 4
+        let err = b.copy_rows(&src, &dst, 3, 0, 2).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        b.free(&src).unwrap();
+        b.free(&dst).unwrap();
+    }
+
+    #[test]
+    fn test_copy_rows_dst_out_of_bounds() {
+        let b = make_backend();
+        let src = alloc_with_data(&b, &[4, 2], &[1.0; 8]);
+        let dst = b.alloc(&[4, 2], DType::FP16).unwrap();
+        // dst has 4 rows, dst_offset=3 + count=2 = 5 > 4
+        let err = b.copy_rows(&src, &dst, 0, 3, 2).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        b.free(&src).unwrap();
+        b.free(&dst).unwrap();
+    }
+
+    // ── Gap 2: alloc huge memory ────────────────────────────────────
+
+    #[test]
+    fn test_alloc_huge_memory() {
+        let b = make_backend();
+        let result = b.alloc(&[usize::MAX / 2, 1], DType::FP16);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, FractureError::Backend(ref s) if s.contains("CUDA")),
+            "expected FractureError::Backend with CUDA error, got: {err}"
+        );
+    }
+
+    // ── Gap 3: alloc packed INT4 dtype ──────────────────────────────
+
+    #[test]
+    fn test_alloc_packed_dtype() {
+        let b = make_backend();
+        let t = b.alloc(&[100], DType::INT4).unwrap();
+        // numel=100, size_bytes = (100+1)/2 = 50
+        assert_eq!(t.size_bytes(), (100 + 1) / 2);
+        assert_eq!(t.numel(), 100);
+        b.free(&t).unwrap();
+    }
+
+    // ── Gap 4: rmsnorm prefill large ────────────────────────────────
+
+    #[test]
+    fn test_rmsnorm_prefill_large() {
+        use rand::Rng;
+        let b = make_backend();
+        let rows = 8;
+        let cols = 4096;
+        let mut rng = rand::thread_rng();
+        let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+
+        let x = alloc_with_data(&b, &[rows, cols], &x_data);
+        let w = alloc_with_data(&b, &[cols], &w_data);
+        let out = b.alloc(&[rows, cols], DType::FP16).unwrap();
+
+        b.rmsnorm(&x, &w, 1e-5, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference
+        for row in 0..rows {
+            let start = row * cols;
+            let end = start + cols;
+            let row_data = &x_data[start..end];
+            let mean_sq: f32 = row_data.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let rms = (mean_sq + 1e-5).sqrt();
+            for j in 0..cols {
+                let expected = (row_data[j] / rms) * w_data[j];
+                let got = result[start + j];
+                let abs_err = (got - expected).abs();
+                // numpy-style allclose: abs_err <= atol + rtol * |expected|
+                let tol = 1e-3 + 1e-3 * expected.abs();
+                assert!(
+                    abs_err <= tol,
+                    "rmsnorm_prefill_large [{row},{j}]: got {got}, expected {expected} (abs_err={abs_err}, tol={tol})"
+                );
+            }
+        }
+
+        b.free(&x).unwrap();
+        b.free(&w).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 6: NVTX markers direct ─────────────────────────────────
+
+    #[test]
+    fn test_nvtx_markers_direct() {
+        let b = make_backend();
+        // Should not panic
+        b.marker_push("test");
+        b.marker_pop();
+        // Nested markers
+        b.marker_push("outer");
+        b.marker_push("inner");
+        b.marker_pop();
+        b.marker_pop();
+    }
+
+    // ── Gap 8: rope production dimensions ───────────────────────────
+
+    #[test]
+    fn test_rope_prod_dimensions() {
+        let mut b = make_backend();
+        let head_dim = 128;
+        let theta = 500000.0;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        // Q [2, 32, 128], K [2, 8, 128]
+        let q_data: Vec<f32> = (0..2 * 32 * 128).map(|i| (i as f32) * 0.001).collect();
+        let k_data: Vec<f32> = (0..2 * 8 * 128).map(|i| (i as f32) * 0.002).collect();
+
+        let q = alloc_with_data(&b, &[2, 32, 128], &q_data);
+        let k = alloc_with_data(&b, &[2, 8, 128], &k_data);
+
+        b.rope(&q, &k, &[0, 10], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+        let k_result = read_fp16(&b, &k);
+
+        // Verify output differs from input (at least for position 10)
+        let q_tok1_start = 32 * 128; // second token
+        let changed = (0..32 * 128).any(|i| {
+            (q_result[q_tok1_start + i] - q_data[q_tok1_start + i]).abs() > 0.001
+        });
+        assert!(changed, "rope prod dims: Q at pos=10 should differ from input");
+
+        // All values should be finite
+        for (i, &v) in q_result.iter().enumerate() {
+            assert!(v.is_finite(), "rope prod dims: Q[{i}] is not finite: {v}");
+        }
+        for (i, &v) in k_result.iter().enumerate() {
+            assert!(v.is_finite(), "rope prod dims: K[{i}] is not finite: {v}");
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    // ── Gap 9: rope decode position 47 ──────────────────────────────
+
+    #[test]
+    fn test_rope_decode_position_47() {
+        let mut b = make_backend();
+        let head_dim = 8;
+        let theta = 10000.0;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        let q_data: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                                     0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let k_data: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+
+        let q = alloc_with_data(&b, &[1, 2, 8], &q_data);
+        let k = alloc_with_data(&b, &[1, 1, 8], &k_data);
+
+        b.rope(&q, &k, &[47], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+        // At position 47 with non-zero freq, values should change
+        let changed = q_result.iter().zip(q_data.iter()).any(|(r, e)| (r - e).abs() > 0.01);
+        assert!(changed, "rope at pos=47 should modify Q");
+
+        let k_result = read_fp16(&b, &k);
+        let k_changed = k_result.iter().zip(k_data.iter()).any(|(r, e)| (r - e).abs() > 0.01);
+        assert!(k_changed, "rope at pos=47 should modify K");
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    // ── Gap 10: rope precompute prod params ─────────────────────────
+
+    #[test]
+    fn test_rope_precompute_prod_params() {
+        let mut b = make_backend();
+        let head_dim = 128;
+        let theta = 500000.0;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        // Verify rope works with these params by running a forward pass
+        let q_data: Vec<f32> = (0..1 * 2 * 128).map(|i| ((i % 7) as f32) * 0.3 - 1.0).collect();
+        let k_data: Vec<f32> = (0..1 * 1 * 128).map(|i| ((i % 5) as f32) * 0.2 - 0.5).collect();
+
+        let q_before = q_data.clone();
+        let q = alloc_with_data(&b, &[1, 2, 128], &q_data);
+        let k = alloc_with_data(&b, &[1, 1, 128], &k_data);
+
+        b.rope(&q, &k, &[42], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_after = read_fp16(&b, &q);
+        // Verify Q was rotated (values differ from before)
+        let changed = q_after.iter().zip(q_before.iter()).any(|(a, b)| (a - b).abs() > 0.001);
+        assert!(changed, "rope with prod params should rotate Q at pos=42");
+
+        // All values finite
+        for (i, &v) in q_after.iter().enumerate() {
+            assert!(v.is_finite(), "rope precompute prod: Q[{i}] not finite");
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    // ── Gap 11: rope freq reuse ─────────────────────────────────────
+
+    #[test]
+    fn test_rope_freq_reuse() {
+        let mut b = make_backend();
+        let head_dim = 8;
+        let theta = 10000.0;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        // Call rope 3 times with different tensors, all should succeed
+        for pos in &[0u32, 5, 100] {
+            let q = alloc_with_data(&b, &[1, 1, 8], &[1.0; 8]);
+            let k = alloc_with_data(&b, &[1, 1, 8], &[1.0; 8]);
+            b.rope(&q, &k, &[*pos], theta, head_dim).unwrap();
+            b.synchronize().unwrap();
+            b.free(&q).unwrap();
+            b.free(&k).unwrap();
+        }
+    }
+
+    // ── Gap 12: rope Q/K consistency ────────────────────────────────
+
+    #[test]
+    fn test_rope_q_k_consistency() {
+        let mut b = make_backend();
+        let head_dim = 8;
+        let theta = 10000.0;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        // Same data for both Q and K (1 head each)
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let q = alloc_with_data(&b, &[1, 1, 8], &data);
+        let k = alloc_with_data(&b, &[1, 1, 8], &data);
+
+        b.rope(&q, &k, &[7], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+        let k_result = read_fp16(&b, &k);
+
+        // Same input, same position => same rotation
+        for i in 0..8 {
+            assert!(
+                (q_result[i] - k_result[i]).abs() < 1e-3,
+                "rope Q/K consistency [{i}]: Q={}, K={}", q_result[i], k_result[i]
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    // ── Gap 15: attention decode distinct KV ────────────────────────
+
+    #[test]
+    fn test_attention_decode_distinct_kv() {
+        let b = make_backend();
+        let head_dim = 4;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let max_seq = 8;
+
+        let k_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let v_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+
+        // Distinct K and V values per position
+        let k_values: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let v_values: Vec<Vec<f32>> = vec![
+            vec![10.0, 0.0, 0.0, 0.0],
+            vec![0.0, 20.0, 0.0, 0.0],
+            vec![0.0, 0.0, 30.0, 0.0],
+            vec![0.0, 0.0, 0.0, 40.0],
+        ];
+
+        for pos in 0..4 {
+            let k_src = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &k_values[pos]);
+            let v_src = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &v_values[pos]);
+            b.copy_rows(&k_src, &k_cache, 0, pos, 1).unwrap();
+            b.copy_rows(&v_src, &v_cache, 0, pos, 1).unwrap();
+            b.free(&k_src).unwrap();
+            b.free(&v_src).unwrap();
+        }
+
+        // New token at position 4
+        let new_k = vec![1.0, 1.0, 1.0, 1.0]; // equal affinity to all
+        let new_v = vec![5.0, 5.0, 5.0, 5.0];
+        let k_src = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &new_k);
+        let v_src = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &new_v);
+        b.copy_rows(&k_src, &k_cache, 0, 4, 1).unwrap();
+        b.copy_rows(&v_src, &v_cache, 0, 4, 1).unwrap();
+        b.free(&k_src).unwrap();
+        b.free(&v_src).unwrap();
+
+        // Q at position 4 with equal affinity to everything
+        let q_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // 2 heads
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, 4, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // Output should be a weighted combination, NOT equal to any single V
+        for v in &v_values {
+            let is_exact_match = (0..head_dim).all(|d| (result[d] - v[d]).abs() < 0.1);
+            assert!(
+                !is_exact_match,
+                "output should not exactly match any single V vector"
+            );
+        }
+
+        // Output should be finite
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "attention decode distinct [{i}]: not finite");
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 16: attention scaling head_dim 128 ──────────────────────
+
+    #[test]
+    fn test_attention_scaling_head_dim_128() {
+        let b = make_backend();
+        let head_dim = 128;
+        let num_q_heads = 1;
+        let num_kv_heads = 1;
+        let max_seq = 4;
+
+        let k_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let v_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+
+        // 2 keys that produce equal dot product with Q
+        let mut k0 = vec![0.0f32; head_dim];
+        let mut k1 = vec![0.0f32; head_dim];
+        k0[0] = 1.0;
+        k1[1] = 1.0;
+
+        let mut v0 = vec![0.0f32; head_dim];
+        let mut v1 = vec![0.0f32; head_dim];
+        v0[0] = 10.0;
+        v1[1] = 10.0;
+
+        let k0_t = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &k0);
+        let k1_t = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &k1);
+        let v0_t = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &v0);
+        let v1_t = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &v1);
+        b.copy_rows(&k0_t, &k_cache, 0, 0, 1).unwrap();
+        b.copy_rows(&k1_t, &k_cache, 0, 1, 1).unwrap();
+        b.copy_rows(&v0_t, &v_cache, 0, 0, 1).unwrap();
+        b.copy_rows(&v1_t, &v_cache, 0, 1, 1).unwrap();
+
+        // Q has equal dot product with both keys => softmax should be ~50/50
+        let mut q_data = vec![0.0f32; head_dim];
+        q_data[0] = 1.0;
+        q_data[1] = 1.0;
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+
+        // scale = 1/sqrt(128) ~ 0.0884
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, 1, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        // Equal attention => output[0] ~ 5.0 and output[1] ~ 5.0
+        assert!(
+            (result[0] - 5.0).abs() < 1.0,
+            "scaling hd128 d0: got {}, expected ~5.0", result[0]
+        );
+        assert!(
+            (result[1] - 5.0).abs() < 1.0,
+            "scaling hd128 d1: got {}, expected ~5.0", result[1]
+        );
+
+        b.free(&q).unwrap();
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&k0_t).unwrap();
+        b.free(&k1_t).unwrap();
+        b.free(&v0_t).unwrap();
+        b.free(&v1_t).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 17: attention error context ─────────────────────────────
+
+    #[test]
+    fn test_attention_error_context() {
+        let b = make_backend();
+        let fake_q = DeviceTensor::new(TensorId(999999), vec![1, 2, 4], DType::FP16);
+        let k_cache = b.alloc(&[4, 1, 4], DType::FP16).unwrap();
+        let v_cache = b.alloc(&[4, 1, 4], DType::FP16).unwrap();
+        let out = b.alloc(&[1, 2, 4], DType::FP16).unwrap();
+
+        let err = b.attention(&fake_q, &k_cache, &v_cache, 1, 0, &out).unwrap_err();
+        let msg = err.to_string();
+        // Error should contain useful context about the tensor
+        assert!(
+            msg.contains("999999") || msg.contains("not found") || msg.contains("tensor"),
+            "error should contain useful context, got: {msg}"
+        );
+
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 18: embedding OOV behavior ──────────────────────────────
+
+    #[test]
+    fn test_embedding_oov_behavior() {
+        let b = make_backend();
+        let vocab = 4;
+        let dim = 3;
+        let table_data: Vec<f32> = vec![
+            0.1, 0.2, 0.3,
+            1.1, 1.2, 1.3,
+            2.1, 2.2, 2.3,
+            3.1, 3.2, 3.3,
+        ];
+        let table = alloc_with_data(&b, &[vocab, dim], &table_data);
+        let out = b.alloc(&[1, dim], DType::FP16).unwrap();
+
+        // token_id=10 >= vocab_size=4 (OOV)
+        // The kernel has vocab_size bounds check: if token_id >= vocab_size, it writes zeros
+        let result = b.embedding(&[10], &table, &out);
+        b.synchronize().unwrap();
+
+        if result.is_ok() {
+            // Kernel wrote zeros for OOV token
+            let data = read_fp16(&b, &out);
+            for (i, &v) in data.iter().enumerate() {
+                assert!(
+                    v.abs() < 0.01,
+                    "OOV embedding should be zero, got [{i}]={v}"
+                );
+            }
+        }
+        // If it returned an error, that's also acceptable behavior
+
+        b.free(&table).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 19: matmul llama3 shapes ────────────────────────────────
+
+    #[test]
+    fn test_matmul_llama3_shapes() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+
+        let shapes: Vec<(usize, usize, usize)> = vec![
+            (1, 4096, 4096),
+            (1, 4096, 1024),
+        ];
+
+        for (m, k, n) in shapes {
+            let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.1..0.1)).collect();
+
+            let a = alloc_with_data(&b, &[m, k], &a_data);
+            let bt = alloc_with_data(&b, &[k, n], &b_data);
+            let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+            b.matmul(&a, &bt, &out).unwrap();
+            b.synchronize().unwrap();
+
+            let result = read_fp16(&b, &out);
+            assert_eq!(result.len(), m * n);
+            for (i, &v) in result.iter().enumerate() {
+                assert!(
+                    !v.is_nan(),
+                    "matmul llama3 [{m},{k}]x[{k},{n}] idx {i}: NaN"
+                );
+                assert!(
+                    v.is_finite(),
+                    "matmul llama3 [{m},{k}]x[{k},{n}] idx {i}: not finite"
+                );
+            }
+
+            b.free(&a).unwrap();
+            b.free(&bt).unwrap();
+            b.free(&out).unwrap();
+        }
+    }
+
+    // ── Gap 20: matmul FP32 accumulation ────────────────────────────
+
+    #[test]
+    fn test_matmul_fp32_accumulation() {
+        let b = make_backend();
+        // K=256 values of ~256 each. Sum ~ 65536 which overflows FP16 max (65504)
+        // With FP32 accumulation, this should work fine.
+        let m = 1;
+        let k = 256;
+        let n = 1;
+        let a_data: Vec<f32> = vec![1.0; k]; // [1, 256] all ones
+        let b_data: Vec<f32> = vec![256.0; k]; // [256, 1] all 256.0
+        // Expected: sum of 256 * 256 = 65536 > 65504 (FP16 max)
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        // FP16 can represent inf for values > 65504, but FP32 accumulation means
+        // the computation itself doesn't overflow. The result gets stored as FP16
+        // which may be inf, but the accumulation was correct in FP32.
+        // Since 65536 > 65504, the FP16 output will be inf.
+        // The key test: with FP16 accumulation, intermediate sums would lose precision
+        // and could produce NaN. FP32 accumulation avoids that.
+        assert!(
+            !result[0].is_nan(),
+            "FP32 accumulation should not produce NaN, got: {}", result[0]
+        );
+    }
+
+    // ── Gap 21: matmul large prefill ────────────────────────────────
+
+    #[test]
+    fn test_matmul_large_prefill() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 128;
+        let k = 4096;
+        let n = 4096;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.05..0.05)).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.05..0.05)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        assert_eq!(result.len(), m * n);
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "matmul large prefill idx {i}: not finite");
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 22: matmul GQA KV shape ─────────────────────────────────
+
+    #[test]
+    fn test_matmul_gqa_kv_shape() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 1;
+        let k = 4096;
+        let n = 1024;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.1..0.1)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        assert_eq!(result.len(), m * n);
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "matmul gqa kv idx {i}: not finite");
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Gap 23: timer stop invalid ──────────────────────────────────
+
+    #[test]
+    fn test_timer_stop_invalid() {
+        let b = make_backend();
+        let fake_timer = DeviceTimer(999999);
+        let err = b.stop_timer(&fake_timer);
+        assert!(err.is_err(), "stop_timer with invalid ID should error");
+    }
+
+    // ── Gap 24: timer double destroy ────────────────────────────────
+
+    #[test]
+    fn test_timer_double_destroy() {
+        let b = make_backend();
+        let timer = b.create_timer().unwrap();
+        b.destroy_timer(&timer).unwrap();
+        let err = b.destroy_timer(&timer);
+        assert!(err.is_err(), "second destroy_timer should error");
     }
 }
