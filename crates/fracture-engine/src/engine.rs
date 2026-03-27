@@ -352,20 +352,7 @@ impl<B: Backend> Engine<B> {
 
 #[cfg(test)]
 mod tests {
-    /// Verify that prefill and decode produce consistent logits for the same
-    /// sequence. This requires a loaded model and GPU backend to run the actual
-    /// forward pass, so the test is ignored by default.
-    #[test]
-    #[ignore]
-    fn test_prefill_decode_consistency() {
-        // Requires a loaded model + GPU backend.
-        // To run: cargo nextest run -p fracture-engine -- --ignored
-        //
-        // Test plan:
-        // 1. Load a small model (e.g., TinyLlama) with CUDA backend
-        // 2. Run prefill on [tok0, tok1, tok2] → get logits_a
-        // 3. Run prefill on [tok0, tok1] then decode [tok2] → get logits_b
-        // 4. Assert logits_a ≈ logits_b within FP16 tolerance
-        todo!("requires loaded model + GPU backend")
-    }
+    // prefill-decode-consistency is tested in bins/fracture-server-cuda/tests/gpu_integration.rs
+    // via test_gpu_prefill_decode_consistency, which runs on the actual CudaBackend with a
+    // tiny model built directly on the GPU.
 }

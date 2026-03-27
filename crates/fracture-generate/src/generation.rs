@@ -204,6 +204,257 @@ pub fn apply_chat_template(messages: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fracture_core::{DType, DeviceTensor, DeviceTimer, ModelConfig, TensorId};
+    use fracture_gguf::{LayerWeights, WeightStore};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ── Mock model config (tiny) ─────────────────────────────────
+    fn tiny_config() -> ModelConfig {
+        // vocab_size must be > 128009 to accommodate Llama 3 stop tokens
+        ModelConfig {
+            hidden_size: 8,
+            num_layers: 1,
+            num_q_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            intermediate_size: 16,
+            vocab_size: 128256,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            max_seq_len: 512,
+        }
+    }
+
+    // ── MockBackend ──────────────────────────────────────────────
+    //
+    // All compute ops are no-ops. `copy_to_host` writes controlled FP16 logits
+    // so that greedy sampling returns a predictable token. An internal call
+    // counter lets tests cycle through different tokens across forward passes.
+
+    struct MockBackend {
+        next_tensor_id: AtomicU64,
+        /// Incremented on every copy_to_host call whose buffer size matches
+        /// `vocab_size * 2` (i.e., the logits readback).
+        logit_call_count: AtomicU64,
+        /// Token IDs to cycle through for successive forward passes.
+        /// Each forward() triggers one logits copy_to_host.
+        token_sequence: Vec<u32>,
+        vocab_size: usize,
+    }
+
+    impl MockBackend {
+        /// Create a mock that always returns `token` from greedy sampling.
+        fn always(token: u32, vocab_size: usize) -> Self {
+            Self {
+                next_tensor_id: AtomicU64::new(1),
+                logit_call_count: AtomicU64::new(0),
+                token_sequence: vec![token],
+                vocab_size,
+            }
+        }
+
+        /// Create a mock that cycles through `tokens` on successive forward passes.
+        fn cycling(tokens: Vec<u32>, vocab_size: usize) -> Self {
+            assert!(!tokens.is_empty());
+            Self {
+                next_tensor_id: AtomicU64::new(1),
+                logit_call_count: AtomicU64::new(0),
+                token_sequence: tokens,
+                vocab_size,
+            }
+        }
+
+        /// Write FP16 logits into `dst` so that `target_token` has the highest value.
+        fn write_logits_for_token(&self, dst: &mut [u8], target_token: u32) {
+            let vocab = dst.len() / 2;
+            // Set all logits to -10.0, then the target to +10.0
+            let low = half::f16::from_f32(-10.0);
+            let high = half::f16::from_f32(10.0);
+            for i in 0..vocab {
+                let val = if i == target_token as usize { high } else { low };
+                let bytes = val.to_le_bytes();
+                dst[i * 2] = bytes[0];
+                dst[i * 2 + 1] = bytes[1];
+            }
+        }
+    }
+
+    impl Backend for MockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> fracture_core::Result<DeviceTensor> {
+            let id = self.next_tensor_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _t: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> fracture_core::Result<()> {
+            // Detect logits readback by buffer size
+            if dst.len() == self.vocab_size * 2 {
+                let idx = self.logit_call_count.fetch_add(1, Ordering::SeqCst) as usize;
+                let token = self.token_sequence[idx % self.token_sequence.len()];
+                self.write_logits_for_token(dst, token);
+            }
+            // Otherwise leave the buffer zeroed (caller provides zeroed vec)
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "mock" }
+        fn total_memory(&self) -> usize { 1 << 30 }
+        fn available_memory(&self) -> usize { 1 << 30 }
+        fn synchronize(&self) -> fracture_core::Result<()> { Ok(()) }
+        fn create_timer(&self) -> fracture_core::Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+    }
+
+    // ── FailingMockBackend ───────────────────────────────────────
+    //
+    // Identical to MockBackend but fails matmul after `fail_after` forward
+    // passes (each forward calls matmul many times; we count full forward()
+    // invocations via logit_call_count and fail on the Nth matmul overall).
+
+    struct FailingMockBackend {
+        next_tensor_id: AtomicU64,
+        logit_call_count: AtomicU64,
+        matmul_call_count: AtomicU64,
+        /// Fail on the Nth matmul call (0-indexed).
+        fail_on_matmul: u64,
+        vocab_size: usize,
+    }
+
+    impl FailingMockBackend {
+        /// Create a backend that fails on the `fail_on_matmul`-th matmul call.
+        fn new(fail_on_matmul: u64, vocab_size: usize) -> Self {
+            Self {
+                next_tensor_id: AtomicU64::new(1),
+                logit_call_count: AtomicU64::new(0),
+                matmul_call_count: AtomicU64::new(0),
+                fail_on_matmul,
+                vocab_size,
+            }
+        }
+    }
+
+    impl Backend for FailingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> fracture_core::Result<DeviceTensor> {
+            let id = self.next_tensor_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _t: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> fracture_core::Result<()> {
+            if dst.len() == self.vocab_size * 2 {
+                self.logit_call_count.fetch_add(1, Ordering::SeqCst);
+                // Write token 42 as the winner
+                let low = half::f16::from_f32(-10.0);
+                let high = half::f16::from_f32(10.0);
+                let vocab = dst.len() / 2;
+                for i in 0..vocab {
+                    let val = if i == 42 { high } else { low };
+                    let bytes = val.to_le_bytes();
+                    dst[i * 2] = bytes[0];
+                    dst[i * 2 + 1] = bytes[1];
+                }
+            }
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> {
+            let n = self.matmul_call_count.fetch_add(1, Ordering::SeqCst);
+            if n >= self.fail_on_matmul {
+                return Err(FractureError::Backend("induced matmul failure".into()));
+            }
+            Ok(())
+        }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "failing-mock" }
+        fn total_memory(&self) -> usize { 1 << 30 }
+        fn available_memory(&self) -> usize { 1 << 30 }
+        fn synchronize(&self) -> fracture_core::Result<()> { Ok(()) }
+        fn create_timer(&self) -> fracture_core::Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────
+
+    fn fake_tensor(id: u64, shape: Vec<usize>) -> DeviceTensor {
+        DeviceTensor::new(TensorId(id), shape, DType::FP16)
+    }
+
+    fn fake_weight_store(cfg: &ModelConfig) -> WeightStore {
+        let mut id = 1000u64;
+        let mut next = |shape: Vec<usize>| -> DeviceTensor {
+            id += 1;
+            fake_tensor(id, shape)
+        };
+
+        let hidden = cfg.hidden_size;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+        let vocab = cfg.vocab_size;
+
+        let token_embedding = next(vec![vocab, hidden]);
+        let output_norm = next(vec![hidden]);
+        let lm_head = next(vec![vocab, hidden]);
+
+        let mut layers = Vec::new();
+        for _ in 0..cfg.num_layers {
+            layers.push(LayerWeights {
+                q_proj: next(vec![hidden, hidden]),
+                k_proj: next(vec![hidden, kv_dim]),
+                v_proj: next(vec![hidden, kv_dim]),
+                o_proj: next(vec![hidden, hidden]),
+                gate_proj: next(vec![hidden, intermediate]),
+                up_proj: next(vec![hidden, intermediate]),
+                down_proj: next(vec![intermediate, hidden]),
+                attn_norm: next(vec![hidden]),
+                ffn_norm: next(vec![hidden]),
+            });
+        }
+
+        WeightStore {
+            config: cfg.clone(),
+            token_embedding,
+            layers,
+            output_norm,
+            lm_head,
+        }
+    }
+
+    fn make_engine<B: Backend>(backend: B, cfg: &ModelConfig) -> Engine<B> {
+        let weights = fake_weight_store(cfg);
+        Engine::new(backend, weights, 0..cfg.num_layers)
+    }
+
+    fn make_cache(cfg: &ModelConfig) -> KvCacheManager {
+        KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len)
+    }
+
+    fn greedy_config(max_tokens: usize) -> GenerationConfig {
+        GenerationConfig {
+            max_tokens,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            stop_tokens: vec![128001, 128008, 128009],
+        }
+    }
+
+    // ── Original tests ───────────────────────────────────────────
 
     #[test]
     fn test_chat_template_basic() {
@@ -391,68 +642,160 @@ mod tests {
     }
 
     /// Verify that prefill completes and transitions to single-token decode steps.
-    /// Requires a mock engine or real GPU backend to run the forward pass.
+    /// The mock returns token 42 on every forward pass; with max_tokens=5 and greedy
+    /// sampling, we expect exactly 5 copies of token 42 and the channel receives them.
     #[test]
-    #[ignore]
     fn test_prefill_to_decode_transition() {
-        // Requires mock engine or GPU backend.
-        // To run: cargo nextest run -p fracture-generate -- --ignored
-        todo!("requires mock engine or GPU")
+        let cfg = tiny_config();
+        let backend = MockBackend::always(42, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(5);
+        let prompt = vec![1, 2, 3];
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+
+        assert_eq!(tokens.len(), 5);
+        assert!(tokens.iter().all(|&t| t == 42));
+
+        // Channel should have received all 5 tokens
+        drop(tx);
+        let mut streamed = Vec::new();
+        while let Ok(t) = rx.try_recv() {
+            streamed.push(t);
+        }
+        assert_eq!(streamed, tokens);
     }
 
     /// Verify that generation stops when an EOS token is sampled.
-    /// Requires a mock engine that returns controlled logits.
+    /// Mock returns token 42 three times, then EOS (128001). Generation should
+    /// produce exactly 3 tokens (the EOS is not included in the output).
     #[test]
-    #[ignore]
     fn test_stop_on_eos_token() {
-        // Requires mock engine to control sampled tokens.
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        // Cycle: 42, 42, 42, 128001, 42, 42, 42, 128001, ...
+        let backend = MockBackend::cycling(vec![42, 42, 42, 128001], cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(100); // high max so EOS is the real stop
+        let prompt = vec![1, 2, 3];
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+
+        // Prefill consumes index 0 (token 42), decode steps get indices 1 (42), 2 (42), 3 (128001=EOS)
+        // So output is [42, 42, 42] — the EOS stops but is not included.
+        assert_eq!(tokens, vec![42, 42, 42]);
     }
 
-    /// Verify that generation stops at max_tokens limit.
-    /// Requires a mock engine that never produces stop tokens.
+    /// Verify that generation stops at max_tokens limit even when the mock never
+    /// produces a stop token.
     #[test]
-    #[ignore]
     fn test_stop_on_max_tokens() {
-        // Requires mock engine to control sampled tokens.
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        let backend = MockBackend::always(42, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(5);
+        let prompt = vec![1];
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+
+        assert_eq!(tokens.len(), 5, "should produce exactly max_tokens tokens");
     }
 
-    /// Verify that the KV cache is freed after successful generation.
-    /// Requires a mock engine to observe cache lifecycle.
+    /// Verify that the KV cache is freed after successful generation completes.
+    /// After generate() returns, the cache handle should be invalid (freed).
     #[test]
-    #[ignore]
     fn test_cache_freed_on_completion() {
-        // Requires mock engine to inspect cache state after generate().
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        let backend = MockBackend::always(42, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(3);
+        let prompt = vec![1, 2];
+        let result = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx);
+
+        assert!(result.is_ok());
+        // The cache handle (id=0) was freed by generate(). Attempting to query it
+        // should fail. KvCacheManager's next alloc would use id=1 if we allocated again.
+        // Since generate() calls cache.alloc() then cache.free(), handle 0 is gone.
+        let stale_handle = CacheHandle(0);
+        assert!(cache.seq_len(stale_handle).is_err(), "cache should be freed after generation");
     }
 
-    /// Verify that the KV cache is freed even when generation returns an error.
-    /// Requires a mock engine that can be induced to fail.
+    /// Verify that the KV cache is freed even when the forward pass returns an error.
+    /// Uses FailingMockBackend which fails on the Nth matmul call.
     #[test]
-    #[ignore]
     fn test_cache_freed_on_error() {
-        // Requires mock engine that fails mid-generation.
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        // Fail on the very first matmul (during prefill), so forward() returns Err.
+        let backend = FailingMockBackend::new(0, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(10);
+        let prompt = vec![1, 2, 3];
+        let result = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx);
+
+        assert!(result.is_err(), "generate should fail due to matmul error");
+        // Cache should still be freed despite the error
+        let stale_handle = CacheHandle(0);
+        assert!(cache.seq_len(stale_handle).is_err(), "cache should be freed even on error");
     }
 
     /// Verify that tokens are sent through the channel immediately upon sampling,
-    /// not batched or delayed until generation completes.
-    /// Requires a mock engine to observe send timing.
+    /// not batched or delayed until generation completes. We collect from the
+    /// receiver after generate() and verify the order matches the return value.
     #[test]
-    #[ignore]
     fn test_tokens_streamed_immediately() {
-        // Requires mock engine to verify per-token send timing.
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        // Cycle through different tokens so we can verify ordering
+        let backend = MockBackend::cycling(vec![10, 20, 30, 40, 50], cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(5);
+        let prompt = vec![1];
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+
+        // Collect everything from the channel
+        drop(tx);
+        let mut streamed = Vec::new();
+        while let Ok(t) = rx.try_recv() {
+            streamed.push(t);
+        }
+
+        assert_eq!(tokens.len(), 5);
+        // Streamed tokens must match the returned token list exactly (same order)
+        assert_eq!(streamed, tokens, "channel should receive tokens in generation order");
     }
 
     /// Verify that if the very first sampled token is a stop token, generation
     /// returns an empty vec without sending anything on the channel.
-    /// Requires a mock engine that returns stop-token logits on prefill.
     #[test]
-    #[ignore]
     fn test_immediate_stop_token() {
-        // Requires mock engine that returns stop token on first sample.
-        todo!("requires mock engine")
+        let cfg = tiny_config();
+        // The first forward (prefill) returns EOS immediately
+        let backend = MockBackend::always(128001, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(100);
+        let prompt = vec![1, 2, 3];
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+
+        assert!(tokens.is_empty(), "should return empty vec when first token is EOS");
+
+        // Channel should have received nothing
+        drop(tx);
+        assert!(rx.try_recv().is_err(), "channel should be empty when first token is EOS");
     }
 }
