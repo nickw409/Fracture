@@ -316,7 +316,7 @@ def load_model(model_path: str) -> tuple[LlamaForCausalLM, Any]:
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="cuda",
         trust_remote_code=True,
     )
