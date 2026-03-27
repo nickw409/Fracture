@@ -1,0 +1,23 @@
+[package]
+name = "fracture-server-cuda"
+description = "Fracture inference server with CUDA backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fracture-server-cuda"
+path = "src/main.rs"
+
+[dependencies]
+fracture-core = { workspace = true }
+fracture-engine = { workspace = true }
+fracture-generate = { workspace = true }
+fracture-server = { workspace = true }
+fracture-gguf = { workspace = true }
+fracture-cuda = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

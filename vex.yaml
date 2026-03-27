@@ -1,0 +1,3 @@
+provider: claude-cli
+model: opus
+max_concurrency: 4

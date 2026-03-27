@@ -1,0 +1,14 @@
+[package]
+name = "fracture-gguf"
+description = "GGUF file parser and weight loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fracture-core = { workspace = true }
+byteorder = { workspace = true }
+memmap2 = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }

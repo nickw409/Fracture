@@ -1,0 +1,15 @@
+[package]
+name = "fracture-cuda"
+description = "CUDA backend implementing the Backend trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fracture-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }

@@ -1,0 +1,16 @@
+[package]
+name = "fracture-generate"
+description = "Sampling, tokenization, and generation loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fracture-core = { workspace = true }
+fracture-engine = { workspace = true }
+tokenizers = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+half = { workspace = true }

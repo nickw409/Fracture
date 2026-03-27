@@ -1,0 +1,30 @@
+/target
+*.o
+*.so
+*.dylib
+*.ptx
+*.cubin
+
+# Model files (large)
+*.gguf
+*.safetensors
+*.bin
+
+# Reference test data (generated)
+tests/reference/*.npy
+tests/reference/*.pt
+
+# Vex output (keep .vex/vexspec.yaml tracked)
+.vex/report.json
+.vex/validation.json
+.vex/drift.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

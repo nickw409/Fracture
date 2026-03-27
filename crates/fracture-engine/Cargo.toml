@@ -1,0 +1,12 @@
+[package]
+name = "fracture-engine"
+description = "Backend-agnostic transformer forward pass engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fracture-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
