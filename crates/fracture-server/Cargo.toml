@@ -21,3 +21,6 @@ thiserror = { workspace = true }
 async-stream = { workspace = true }
 futures-core = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }

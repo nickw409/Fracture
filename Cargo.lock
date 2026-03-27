@@ -444,6 +444,7 @@ dependencies = [
  "fracture-engine",
  "fracture-generate",
  "futures-core",
+ "http-body-util",
  "rand",
  "serde",
  "serde_json",

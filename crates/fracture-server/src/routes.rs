@@ -15,6 +15,10 @@ use tokenizers::Tokenizer;
 
 use crate::api::*;
 
+/// Hardcoded model name for Phase 1 (single-model serving).
+/// When AppState carries the loaded model name, this should be replaced.
+const LOADED_MODEL_NAME: &str = "llama-3-8b";
+
 /// Shared application state passed to all handlers.
 pub struct AppState<B: Backend> {
     pub engine: Arc<Engine<B>>,
@@ -27,14 +31,43 @@ pub fn create_router<B: Backend + 'static>(state: Arc<AppState<B>>) -> Router {
     Router::new()
         .route("/v1/completions", post(completions_handler::<B>))
         .route("/v1/chat/completions", post(chat_completions_handler::<B>))
+        .route("/v1/models", get(models_handler))
         .route("/v1/profile", get(profile_handler))
+        .route("/health", get(health_handler))
         .with_state(state)
+}
+
+async fn models_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": LOADED_MODEL_NAME,
+                "object": "model",
+                "created": unix_timestamp(),
+                "owned_by": "fracture"
+            }]
+        })),
+    )
+}
+
+async fn health_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ready"})),
+    )
 }
 
 async fn completions_handler<B: Backend + 'static>(
     State(state): State<Arc<AppState<B>>>,
     Json(req): Json<CompletionRequest>,
 ) -> impl IntoResponse {
+    // Validate model name
+    if let Err(resp) = validate_model_name(req.model.as_deref()) {
+        return resp;
+    }
+
     // Validate request
     if let Err(resp) = validate_completion_request(&req) {
         return resp;
@@ -45,7 +78,7 @@ async fn completions_handler<B: Backend + 'static>(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                Json(error_body(&format!("tokenization failed: {e}"))),
             )
                 .into_response()
         }
@@ -100,7 +133,7 @@ async fn completions_handler<B: Backend + 'static>(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("generation failed: {e}")})),
+            Json(error_body(&format!("generation failed: {e}"))),
         )
             .into_response(),
     }
@@ -110,6 +143,11 @@ async fn chat_completions_handler<B: Backend + 'static>(
     State(state): State<Arc<AppState<B>>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
+    // Validate model name
+    if let Err(resp) = validate_model_name(req.model.as_deref()) {
+        return resp;
+    }
+
     if let Err(resp) = validate_chat_request(&req) {
         return resp;
     }
@@ -127,7 +165,7 @@ async fn chat_completions_handler<B: Backend + 'static>(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                Json(error_body(&format!("tokenization failed: {e}"))),
             )
                 .into_response()
         }
@@ -185,7 +223,7 @@ async fn chat_completions_handler<B: Backend + 'static>(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("generation failed: {e}")})),
+            Json(error_body(&format!("generation failed: {e}"))),
         )
             .into_response(),
     }
@@ -203,7 +241,21 @@ fn handle_streaming<B: Backend + 'static>(
     let config_gen = config.clone();
     let tokenizer_for_stream = state.tokenizer.clone();
 
-    // Run generation in a blocking task since the engine is synchronous
+    // Run generation in a blocking task since the engine is synchronous.
+    //
+    // Known limitation: streaming-error-propagation
+    // Generation errors from GenerationLoop::generate are currently silently dropped
+    // (`let _ = ...`). When generation fails mid-stream (e.g., GPU OOM during decode),
+    // the SSE stream simply ends without notifying the client of the error. This should
+    // be changed to emit an SSE error event with the failure details so clients can
+    // distinguish a generation failure from normal stream completion.
+    //
+    // Known limitation: stream-cancellation
+    // Client disconnect detection is not yet implemented. When a client disconnects
+    // during SSE streaming, the generation loop continues running to completion,
+    // wasting GPU compute and leaking KV cache memory. This requires a
+    // CancellationToken or similar mechanism to be threaded into GenerationLoop
+    // so that the decode loop can exit early on client disconnect.
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.cache.lock().unwrap();
         let _ = GenerationLoop::generate(
@@ -252,13 +304,41 @@ async fn profile_handler() -> impl IntoResponse {
     )
 }
 
+/// Build an OpenAI-compatible error response body.
+fn error_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": null
+        }
+    })
+}
+
+pub(crate) fn validate_model_name(
+    model: Option<&str>,
+) -> std::result::Result<(), axum::response::Response> {
+    if let Some(name) = model {
+        if name != LOADED_MODEL_NAME {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(error_body(&format!(
+                    "The model `{name}` does not exist"
+                ))),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_completion_request(
     req: &CompletionRequest,
 ) -> std::result::Result<(), axum::response::Response> {
     if req.prompt.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "prompt must not be empty"})),
+            Json(error_body("prompt must not be empty")),
         )
             .into_response());
     }
@@ -271,7 +351,7 @@ pub(crate) fn validate_chat_request(
     if req.messages.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "messages must not be empty"})),
+            Json(error_body("messages must not be empty")),
         )
             .into_response());
     }
@@ -287,21 +367,21 @@ pub(crate) fn validate_sampling_params(
     if temperature < 0.0 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "temperature must be >= 0"})),
+            Json(error_body("temperature must be >= 0")),
         )
             .into_response());
     }
     if top_p < 0.0 || top_p > 1.0 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "top_p must be in [0, 1]"})),
+            Json(error_body("top_p must be in [0, 1]")),
         )
             .into_response());
     }
     if max_tokens == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "max_tokens must be > 0"})),
+            Json(error_body("max_tokens must be > 0")),
         )
             .into_response());
     }
@@ -329,6 +409,7 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
     use crate::api::{ChatMessage, ChatCompletionRequest, CompletionRequest};
+    use http_body_util::BodyExt;
 
     fn valid_completion_request() -> CompletionRequest {
         CompletionRequest {
@@ -355,6 +436,26 @@ mod tests {
             top_k: 0,
             stream: false,
         }
+    }
+
+    /// Helper: extract the error response JSON from a validation Err.
+    /// Parses the response body and returns the parsed JSON value.
+    async fn extract_error_json(resp: axum::response::Response) -> serde_json::Value {
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body_bytes).unwrap()
+    }
+
+    /// Helper: assert that an error response uses the OpenAI nested format:
+    /// {"error": {"message": "...", "type": "invalid_request_error", "code": null}}
+    fn assert_openai_error_format(json: &serde_json::Value) {
+        let error_obj = json.get("error").expect("response must have 'error' key");
+        assert!(error_obj.is_object(), "error value must be an object, not a string");
+        assert!(error_obj.get("message").is_some(), "error object must have 'message'");
+        assert_eq!(
+            error_obj.get("type").and_then(|v| v.as_str()),
+            Some("invalid_request_error")
+        );
+        assert!(error_obj.get("code").is_some(), "error object must have 'code'");
     }
 
     #[test]
@@ -432,5 +533,155 @@ mod tests {
     #[test]
     fn test_max_tokens_one_is_valid() {
         assert!(validate_sampling_params(1.0, 1.0, 0, 1).is_ok());
+    }
+
+    // --- Gap #6: /v1/models endpoint ---
+
+    #[tokio::test]
+    async fn test_models_endpoint_exists() {
+        // Call the models_handler directly and verify response JSON.
+        let resp = models_handler().await.into_response();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(json["object"], "list");
+        let data = json["data"].as_array().expect("data must be an array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "llama-3-8b");
+        assert_eq!(data[0]["object"], "model");
+        assert!(data[0]["created"].as_u64().is_some());
+        assert_eq!(data[0]["owned_by"], "fracture");
+    }
+
+    // --- Gap #7: /health endpoint ---
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let resp = health_handler().await.into_response();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json, serde_json::json!({"status": "ready"}));
+    }
+
+    // --- Gap #8: model name mismatch ---
+
+    #[test]
+    fn test_model_name_mismatch() {
+        let result = validate_model_name(Some("wrong-model"));
+        assert!(result.is_err(), "mismatched model name should be rejected");
+    }
+
+    // --- Gap #9: model name None passes ---
+
+    #[test]
+    fn test_model_name_none_passes() {
+        assert!(validate_model_name(None).is_ok());
+    }
+
+    #[test]
+    fn test_model_name_correct_passes() {
+        assert!(validate_model_name(Some("llama-3-8b")).is_ok());
+    }
+
+    // --- Gap #10: error response format ---
+
+    #[tokio::test]
+    async fn test_error_response_format() {
+        // Verify that validation errors use the OpenAI nested error format.
+
+        // Empty prompt error
+        let mut req = valid_completion_request();
+        req.prompt = "".to_string();
+        let err_resp = validate_completion_request(&req).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+
+        // Empty messages error
+        let mut chat_req = valid_chat_request();
+        chat_req.messages = vec![];
+        let err_resp = validate_chat_request(&chat_req).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+
+        // Negative temperature error
+        let err_resp = validate_sampling_params(-1.0, 1.0, 0, 256).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+
+        // top_p out of range error
+        let err_resp = validate_sampling_params(1.0, 1.5, 0, 256).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+
+        // max_tokens=0 error
+        let err_resp = validate_sampling_params(1.0, 1.0, 0, 0).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+
+        // Model name mismatch error
+        let err_resp = validate_model_name(Some("nonexistent")).unwrap_err();
+        let json = extract_error_json(err_resp).await;
+        assert_openai_error_format(&json);
+    }
+
+    // --- Gap #11: streaming not exercised (known limitation) ---
+
+    /// Streaming requires a running engine with a GPU and loaded model weights.
+    /// This cannot be tested in unit tests because the Engine requires a concrete
+    /// Backend implementation with actual device memory. Streaming correctness
+    /// (SSE event format, token-by-token delivery, [DONE] sentinel) must be
+    /// validated in integration tests with a fully initialized server.
+    #[test]
+    #[ignore]
+    fn test_streaming_not_exercised_note() {
+        // Intentionally empty — this test documents a known gap.
+        // Streaming tests require integration test infrastructure with:
+        // - A concrete Backend implementation (e.g., CUDA)
+        // - Loaded model weights
+        // - A running tokio runtime with the full server stack
+    }
+
+    // --- Gap #12: concurrent requests not exercised (known limitation) ---
+
+    /// Concurrent request handling requires a running engine and multiple
+    /// simultaneous HTTP connections. The current Phase 1 architecture uses a
+    /// shared Mutex<KvCacheManager> which serializes all generation requests.
+    /// True concurrent request testing requires:
+    /// - Multiple tokio tasks issuing requests in parallel
+    /// - A concrete Backend with actual GPU resources
+    /// - Verification that one request completing/failing doesn't corrupt another
+    /// This is deferred to integration testing (and eventually Phase 4 continuous batching).
+    #[test]
+    #[ignore]
+    fn test_concurrent_requests_not_exercised_note() {
+        // Intentionally empty — this test documents a known gap.
+        // Concurrent request testing requires integration test infrastructure.
+    }
+
+    // --- Gap #15: chat template applied correctly ---
+
+    #[test]
+    fn test_chat_template_called_correctly() {
+        // Verify apply_chat_template produces expected output for server-relevant messages.
+        let messages = vec![
+            ("system".to_string(), "You are a helpful assistant.".to_string()),
+            ("user".to_string(), "What is Rust?".to_string()),
+        ];
+        let result = apply_chat_template(&messages);
+
+        // Verify structure: begin_of_text, then each message wrapped in header tags,
+        // then trailing assistant header.
+        assert!(result.starts_with("<|begin_of_text|>"));
+        assert!(result.contains("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>"));
+        assert!(result.contains("<|start_header_id|>user<|end_header_id|>\n\nWhat is Rust?<|eot_id|>"));
+        assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+        // Single user message (common case for server)
+        let messages = vec![("user".to_string(), "Hello".to_string())];
+        let result = apply_chat_template(&messages);
+        assert_eq!(
+            result,
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
     }
 }
