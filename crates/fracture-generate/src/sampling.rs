@@ -81,3 +81,126 @@ impl Sampler {
         Ok(indices[*filtered.last().unwrap()] as u32)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_logits() -> Vec<f32> {
+        // indices: 0=1.0, 1=3.0, 2=2.0, 3=0.5, 4=0.1
+        vec![1.0, 3.0, 2.0, 0.5, 0.1]
+    }
+
+    #[test]
+    fn test_greedy_temp_zero() {
+        let logits = simple_logits();
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        for _ in 0..20 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert_eq!(token, 1); // index 1 has max logit 3.0
+        }
+    }
+
+    #[test]
+    fn test_greedy_top_k_one() {
+        let logits = simple_logits();
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+        };
+        for _ in 0..20 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert_eq!(token, 1);
+        }
+    }
+
+    #[test]
+    fn test_temperature_scaling_flattens_distribution() {
+        // With high temperature, softmax should produce more uniform probs
+        let logits = vec![10.0, 0.0];
+
+        // Low temperature (near greedy) - diff should be large
+        let low_temp: Vec<f32> = logits.iter().map(|&l| l / 0.1).collect();
+        let max_low = low_temp.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps_low: Vec<f32> = low_temp.iter().map(|l| (l - max_low).exp()).collect();
+        let sum_low: f32 = exps_low.iter().sum();
+        let probs_low: Vec<f32> = exps_low.iter().map(|e| e / sum_low).collect();
+
+        // High temperature - diff should be small (more uniform)
+        let high_temp: Vec<f32> = logits.iter().map(|&l| l / 100.0).collect();
+        let max_high = high_temp.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps_high: Vec<f32> = high_temp.iter().map(|l| (l - max_high).exp()).collect();
+        let sum_high: f32 = exps_high.iter().sum();
+        let probs_high: Vec<f32> = exps_high.iter().map(|e| e / sum_high).collect();
+
+        let diff_low = (probs_low[0] - probs_low[1]).abs();
+        let diff_high = (probs_high[0] - probs_high[1]).abs();
+        assert!(diff_high < diff_low, "high temp should flatten: diff_high={diff_high} < diff_low={diff_low}");
+    }
+
+    #[test]
+    fn test_top_k_filtering() {
+        let logits = simple_logits(); // argmax at 1 (3.0), second at 2 (2.0)
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+        };
+        for _ in 0..100 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert!(token == 1 || token == 2, "token {token} not in top-2");
+        }
+    }
+
+    #[test]
+    fn test_top_p_very_small_is_greedy() {
+        let logits = simple_logits();
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.01,
+        };
+        for _ in 0..50 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert_eq!(token, 1, "very small top_p should select argmax");
+        }
+    }
+
+    #[test]
+    fn test_softmax_max_subtraction_no_overflow() {
+        // Large logit values that would overflow exp() without the max-subtraction trick
+        let logits = vec![1000.0, 999.0, 998.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let token = Sampler::sample(&logits, &params).unwrap();
+        assert!(token <= 2, "should produce a valid token index");
+    }
+
+    #[test]
+    fn test_combined_top_k_top_p() {
+        // top_k=3 keeps indices 1,2,0 (logits 3.0, 2.0, 1.0)
+        // top_p=0.5 further filters to only highest-prob tokens
+        let logits = simple_logits();
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 0.5,
+        };
+        let valid_tokens: Vec<u32> = vec![0, 1, 2]; // the top-3 by logit value
+        for _ in 0..100 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert!(
+                valid_tokens.contains(&token),
+                "token {token} not in valid set {valid_tokens:?}"
+            );
+        }
+    }
+}
