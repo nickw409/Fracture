@@ -29,6 +29,14 @@ fn timed_op<B: Backend>(
 ///
 /// Generic over `B: Backend` — contains no CUDA or Metal imports.
 /// Dispatches all GPU operations through Backend trait methods.
+///
+/// # Layer Range
+///
+/// The `layer_range` field controls which transformer layers this engine instance
+/// processes. In Phase 1, this is always `0..num_layers` and `forward()` accepts
+/// token IDs and returns logits for the full model. In Phase 2, partial layer ranges
+/// will accept/return intermediate activation tensors for pipeline-parallel inference
+/// across multiple nodes.
 pub struct Engine<B: Backend> {
     backend: B,
     weights: WeightStore,
@@ -66,6 +74,12 @@ impl<B: Backend> Engine<B> {
     /// `ForwardProfile`. When `None`, no timers are created and there is zero overhead.
     /// NVTX markers (marker_push/marker_pop) are always emitted regardless of profiling
     /// state — they are no-ops unless the backend overrides them.
+    ///
+    /// # Error Propagation
+    ///
+    /// All Backend trait calls use `?` for error propagation. Errors carry context
+    /// from the Backend implementation (e.g., CUDA error codes, allocation failures).
+    /// No panics — every fallible path returns `Result<T, FractureError>`.
     pub fn forward(
         &self,
         token_ids: &[u32],
@@ -328,5 +342,30 @@ impl<B: Backend> Engine<B> {
         }
 
         Ok(logits)
+    }
+}
+
+// Profiling dispatch is tested implicitly: the timed_op function's zero-overhead path
+// (profile=None) is exercised by all generation tests, which call forward() without a
+// ForwardProfile. The profiling-active path (profile=Some) requires a real GPU backend
+// to return meaningful timer values.
+
+#[cfg(test)]
+mod tests {
+    /// Verify that prefill and decode produce consistent logits for the same
+    /// sequence. This requires a loaded model and GPU backend to run the actual
+    /// forward pass, so the test is ignored by default.
+    #[test]
+    #[ignore]
+    fn test_prefill_decode_consistency() {
+        // Requires a loaded model + GPU backend.
+        // To run: cargo nextest run -p fracture-engine -- --ignored
+        //
+        // Test plan:
+        // 1. Load a small model (e.g., TinyLlama) with CUDA backend
+        // 2. Run prefill on [tok0, tok1, tok2] → get logits_a
+        // 3. Run prefill on [tok0, tok1] then decode [tok2] → get logits_b
+        // 4. Assert logits_a ≈ logits_b within FP16 tolerance
+        todo!("requires loaded model + GPU backend")
     }
 }

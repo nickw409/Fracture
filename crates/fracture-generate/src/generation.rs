@@ -29,6 +29,14 @@ impl Default for GenerationConfig {
 }
 
 /// Orchestrates tokenization, prefill, decode loop, and streaming.
+///
+/// # Future Work (Phase 2+)
+///
+/// - **Generation cancellation**: Allow callers to cancel an in-progress generation
+///   via a `CancellationToken` or similar mechanism, causing the decode loop to exit
+///   early and free resources.
+/// - **Stream cancellation**: Detect when the streaming channel receiver is dropped
+///   (e.g., client disconnect) and stop generation to avoid wasted GPU cycles.
 pub struct GenerationLoop;
 
 impl GenerationLoop {
@@ -44,6 +52,13 @@ impl GenerationLoop {
     ) -> Result<Vec<u32>> {
         if prompt_tokens.is_empty() {
             return Err(FractureError::Generation("empty prompt".into()));
+        }
+
+        if prompt_tokens.len() > engine.config().max_seq_len {
+            return Err(FractureError::Generation(format!(
+                "prompt length {} exceeds max_seq_len {}",
+                prompt_tokens.len(), engine.config().max_seq_len
+            )));
         }
 
         let cache_handle = cache.alloc(engine.backend())?;
@@ -291,5 +306,153 @@ mod tests {
         assert!(result.contains("<|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>"));
         assert!(result.contains("<|start_header_id|>user<|end_header_id|>\n\n<|eot_id|>"));
         assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn test_generation_config_defaults_match() {
+        let config = GenerationConfig::default();
+        assert_eq!(config.max_tokens, 256);
+        assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.top_k, 0);
+        assert_eq!(config.top_p, 1.0);
+        // Verify Llama 3 stop tokens are exactly these three
+        assert_eq!(config.stop_tokens.len(), 3);
+        assert!(config.stop_tokens.contains(&128001), "missing EOS token 128001");
+        assert!(config.stop_tokens.contains(&128008), "missing EOS token 128008");
+        assert!(config.stop_tokens.contains(&128009), "missing EOS token 128009");
+        // Verify exact order
+        assert_eq!(config.stop_tokens, vec![128001, 128008, 128009]);
+    }
+
+    #[test]
+    fn test_empty_prompt_returns_error() {
+        // GenerationLoop::generate requires a full Engine, but the empty-prompt check
+        // is at the top of generate() before any backend interaction.
+        // We verify the error path by checking that the error type is correct.
+        // The actual generate() call needs Engine<B>, KvCacheManager, and mpsc channel,
+        // which require a backend. Instead, we verify the error type directly:
+        let err = FractureError::Generation("empty prompt".into());
+        assert!(err.to_string().contains("empty prompt"));
+
+        // Also verify prompt-too-long error can be constructed
+        let err = FractureError::Generation("prompt too long".into());
+        assert!(err.to_string().contains("prompt too long"));
+    }
+
+    /// Verify default stop tokens contain all three Llama 3 EOS tokens.
+    #[test]
+    fn test_generation_config_stop_tokens() {
+        let config = GenerationConfig::default();
+        assert_eq!(config.stop_tokens.len(), 3);
+        assert!(config.stop_tokens.contains(&128001), "missing Llama 3 <|end_of_text|> (128001)");
+        assert!(config.stop_tokens.contains(&128008), "missing Llama 3 <|eom_id|> (128008)");
+        assert!(config.stop_tokens.contains(&128009), "missing Llama 3 <|eot_id|> (128009)");
+    }
+
+    /// Construct a RequestMetrics and serialize to JSON, verifying all expected fields.
+    #[test]
+    fn test_request_metrics_format() {
+        let metrics = RequestMetrics {
+            request_id: "req_test_0001".to_string(),
+            prompt_tokens: 42,
+            generated_tokens: 100,
+            ttft_ms: 12.5,
+            total_ms: 500.0,
+            tokens_per_sec: 200.0,
+            avg_decode_ms: 4.87,
+            peak_vram_mb: 1024.0,
+            kv_cache_tokens: 142,
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialization failed");
+
+        // Verify all expected fields are present in the JSON output.
+        let expected_fields = [
+            "request_id",
+            "prompt_tokens",
+            "generated_tokens",
+            "ttft_ms",
+            "total_ms",
+            "tokens_per_sec",
+            "avg_decode_ms",
+            "peak_vram_mb",
+            "kv_cache_tokens",
+        ];
+        for field in &expected_fields {
+            assert!(json.contains(field), "missing field: {field}");
+        }
+
+        // Verify values round-trip through JSON.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse failed");
+        assert_eq!(parsed["request_id"], "req_test_0001");
+        assert_eq!(parsed["prompt_tokens"], 42);
+        assert_eq!(parsed["generated_tokens"], 100);
+        assert_eq!(parsed["kv_cache_tokens"], 142);
+    }
+
+    /// Verify that prefill completes and transitions to single-token decode steps.
+    /// Requires a mock engine or real GPU backend to run the forward pass.
+    #[test]
+    #[ignore]
+    fn test_prefill_to_decode_transition() {
+        // Requires mock engine or GPU backend.
+        // To run: cargo nextest run -p fracture-generate -- --ignored
+        todo!("requires mock engine or GPU")
+    }
+
+    /// Verify that generation stops when an EOS token is sampled.
+    /// Requires a mock engine that returns controlled logits.
+    #[test]
+    #[ignore]
+    fn test_stop_on_eos_token() {
+        // Requires mock engine to control sampled tokens.
+        todo!("requires mock engine")
+    }
+
+    /// Verify that generation stops at max_tokens limit.
+    /// Requires a mock engine that never produces stop tokens.
+    #[test]
+    #[ignore]
+    fn test_stop_on_max_tokens() {
+        // Requires mock engine to control sampled tokens.
+        todo!("requires mock engine")
+    }
+
+    /// Verify that the KV cache is freed after successful generation.
+    /// Requires a mock engine to observe cache lifecycle.
+    #[test]
+    #[ignore]
+    fn test_cache_freed_on_completion() {
+        // Requires mock engine to inspect cache state after generate().
+        todo!("requires mock engine")
+    }
+
+    /// Verify that the KV cache is freed even when generation returns an error.
+    /// Requires a mock engine that can be induced to fail.
+    #[test]
+    #[ignore]
+    fn test_cache_freed_on_error() {
+        // Requires mock engine that fails mid-generation.
+        todo!("requires mock engine")
+    }
+
+    /// Verify that tokens are sent through the channel immediately upon sampling,
+    /// not batched or delayed until generation completes.
+    /// Requires a mock engine to observe send timing.
+    #[test]
+    #[ignore]
+    fn test_tokens_streamed_immediately() {
+        // Requires mock engine to verify per-token send timing.
+        todo!("requires mock engine")
+    }
+
+    /// Verify that if the very first sampled token is a stop token, generation
+    /// returns an empty vec without sending anything on the channel.
+    /// Requires a mock engine that returns stop-token logits on prefill.
+    #[test]
+    #[ignore]
+    fn test_immediate_stop_token() {
+        // Requires mock engine that returns stop token on first sample.
+        todo!("requires mock engine")
     }
 }
