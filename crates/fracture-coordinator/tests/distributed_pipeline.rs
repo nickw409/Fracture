@@ -754,3 +754,185 @@ async fn test_worker_unknown_message_returns_error() {
 
     conn.send_empty(MessageType::Shutdown, 0).await.unwrap();
 }
+
+// ── Heartbeat module tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_send_heartbeats_and_check_timeout() {
+    use fracture_coordinator::heartbeat;
+
+    // Spawn a mock worker that responds to heartbeats
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        // Respond to one heartbeat
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::Heartbeat);
+        let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+        let ack = HeartbeatAckPayload {
+            timestamp_echo: hb.timestamp_ns,
+            nonce_echo: hb.nonce,
+            gpu_memory_used: 0,
+            active_sequences: 0,
+        };
+        conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("hb-test"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "hb-test".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    };
+    registry.assign("hb-test", assignment).unwrap();
+
+    // send_heartbeats with generous timeout — should return no timed-out workers
+    let timed_out = heartbeat::send_heartbeats(
+        &mut registry,
+        std::time::Duration::from_secs(60),
+    ).await;
+    assert!(timed_out.is_empty(), "no workers should be timed out");
+}
+
+#[tokio::test]
+async fn test_send_heartbeats_detects_timeout() {
+    use fracture_coordinator::heartbeat;
+
+    // Worker that does NOT respond (just accepts connection and hangs)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        // Read the heartbeat but don't respond
+        let _ = conn.recv().await;
+        // Keep connection alive
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("slow"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "slow".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    };
+    registry.assign("slow", assignment).unwrap();
+
+    // Manually set the last heartbeat to the past so it times out
+    // We do this by calling send_heartbeats with zero timeout
+    let timed_out = heartbeat::send_heartbeats(
+        &mut registry,
+        std::time::Duration::ZERO,
+    ).await;
+    assert_eq!(timed_out, vec!["slow"]);
+}
+
+#[tokio::test]
+async fn test_mark_dead_workers_transitions_status() {
+    use fracture_coordinator::heartbeat;
+    use fracture_coordinator::registry::WorkerStatus;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _worker = tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("doomed"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "doomed".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    };
+    registry.assign("doomed", assignment).unwrap();
+
+    assert_eq!(registry.get("doomed").unwrap().status, WorkerStatus::Ready);
+
+    heartbeat::mark_dead_workers(&mut registry, &["doomed".to_string()]);
+
+    assert_eq!(registry.get("doomed").unwrap().status, WorkerStatus::Dead);
+    assert_eq!(registry.active_count(), 0);
+    assert!(registry.pipeline_order().is_empty());
+}
+
+#[test]
+fn test_heartbeat_constants() {
+    use fracture_coordinator::heartbeat::{DEFAULT_INTERVAL, DEFAULT_MAX_MISSED};
+
+    assert_eq!(DEFAULT_INTERVAL, std::time::Duration::from_secs(5));
+    assert_eq!(DEFAULT_MAX_MISSED, 3);
+    // 3 missed × 5s = 15s failure detection, matching the arch doc
+    assert_eq!(
+        DEFAULT_INTERVAL * DEFAULT_MAX_MISSED as u32,
+        std::time::Duration::from_secs(15)
+    );
+}
+
+// ── Pipeline unexpected message type test ────────────────────────────────
+
+/// Spawn a worker that sends a Heartbeat instead of ForwardResult after Forward.
+async fn spawn_unexpected_response_worker(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    // Send Heartbeat instead of ForwardResult (wrong!)
+                    let hb = HeartbeatPayload { timestamp_ns: 0, nonce: 0 };
+                    conn.send(MessageType::Heartbeat, header.seq_id, &hb).await.unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_pipeline_unexpected_message_type_is_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_unexpected_response_worker(listener).await;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("bad"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "bad".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    };
+    registry.assign("bad", assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+
+    let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("expected ForwardResult") || err_msg.contains("Heartbeat"),
+        "error should mention unexpected message type: {err_msg}"
+    );
+}

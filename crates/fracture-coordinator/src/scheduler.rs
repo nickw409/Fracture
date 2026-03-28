@@ -1188,4 +1188,88 @@ mod tests {
             assert!(a.cache_memory_gb > 0.0, "cache_memory_gb should be positive");
         }
     }
+
+    #[test]
+    fn test_auto_iterative_multi_node_pruning() {
+        // 2 fast nodes + 2 very slow nodes. Both slow nodes should be pruned
+        // since the fast nodes have enough memory for the full model.
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("fast1", 30.0, 0.5),
+                worker("fast2", 30.0, 0.5),
+                worker("turtle1", 22.0, 10.0),
+                worker("turtle2", 22.0, 15.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        assert_eq!(result.assignments.len(), 2, "both slow nodes should be pruned");
+        assert_eq!(result.excluded_nodes.len(), 2);
+        let excluded_ids: Vec<&str> = result.excluded_nodes.iter().map(|e| e.node_id.as_str()).collect();
+        assert!(excluded_ids.contains(&"turtle1"), "turtle1 should be excluded");
+        assert!(excluded_ids.contains(&"turtle2"), "turtle2 should be excluded");
+    }
+
+    #[test]
+    fn test_auto_bottleneck_node_correct() {
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("fast", 30.0, 0.5),
+                worker("slow", 22.0, 1.5),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        // The slower node should be the bottleneck
+        // (even with fewer layers, it takes longer per layer)
+        let slow_assignment = result.assignments.iter().find(|a| a.node_id == "slow").unwrap();
+        let fast_assignment = result.assignments.iter().find(|a| a.node_id == "fast").unwrap();
+
+        // bottleneck is whichever has higher expected_decode_ms
+        if slow_assignment.expected_decode_ms >= fast_assignment.expected_decode_ms {
+            assert_eq!(result.bottleneck_node, "slow");
+        } else {
+            assert_eq!(result.bottleneck_node, "fast");
+        }
+    }
+
+    #[test]
+    fn test_auto_redistribution_assigns_all_layers() {
+        // 3 workers with different speeds; rounding may not sum to 32
+        // Redistribution must ensure exactly 32 layers assigned.
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("a", 30.0, 0.7),
+                worker("b", 22.0, 1.3),
+                worker("c", 25.0, 1.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        let total: usize = result.assignments.iter().map(|a| a.layer_range.len()).sum();
+        assert_eq!(total, 32, "redistribution must produce exactly 32 layers");
+
+        // Verify contiguous
+        let mut start = 0;
+        for a in &result.assignments {
+            assert_eq!(a.layer_range.start, start);
+            start = a.layer_range.end;
+        }
+        assert_eq!(start, 32);
+    }
 }

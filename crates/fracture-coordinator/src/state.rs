@@ -299,4 +299,26 @@ mod tests {
         let seq = mgr.get(id).unwrap();
         assert_eq!(seq.cache_allocated_on, vec!["node-a", "node-b"]);
     }
+
+    #[test]
+    fn test_cache_allocated_on_drives_cleanup() {
+        // Simulates the coordinator pattern: create sequence with node IDs,
+        // complete it, then use cache_allocated_on to determine which workers
+        // need CacheFree messages.
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 50, vec!["worker-a".into(), "worker-b".into(), "worker-c".into()]);
+        mgr.begin_decoding(id).unwrap();
+        mgr.record_token(id, 1).unwrap();
+        mgr.complete(id).unwrap();
+
+        // The coordinator reads cache_allocated_on to know where to send CacheFree
+        let seq = mgr.get(id).unwrap();
+        let nodes_to_free: Vec<String> = seq.cache_allocated_on.clone();
+        assert_eq!(nodes_to_free, vec!["worker-a", "worker-b", "worker-c"]);
+
+        // After freeing, remove the sequence
+        let removed = mgr.remove(id).unwrap();
+        assert_eq!(removed.cache_allocated_on.len(), 3);
+        assert!(mgr.get(id).is_err());
+    }
 }
