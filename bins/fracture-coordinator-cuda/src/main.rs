@@ -24,7 +24,7 @@ use fracture_protocol::{
 };
 use fracture_server::api::*;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokenizers::Tokenizer;
@@ -48,6 +48,9 @@ struct CoordinatorConfig {
     max_seq_len: usize,
     scheduling_mode: String,
     tokenizer_path: Option<String>,
+    /// Timeout in seconds for waiting for all workers to register.
+    /// 0 = no timeout (wait indefinitely).
+    acceptance_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -96,6 +99,12 @@ async fn main() -> Result<()> {
             .iter()
             .position(|a| a == "--tokenizer")
             .and_then(|i| args.get(i + 1).cloned()),
+        acceptance_timeout_secs: args
+            .iter()
+            .position(|a| a == "--acceptance-timeout")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(120), // default 2 minutes
     };
 
     tracing::info!("Fracture coordinator");
@@ -117,13 +126,49 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&config.listen_address).await?;
     let mut registry = PeerRegistry::new();
 
+    let timeout_duration = if config.acceptance_timeout_secs > 0 {
+        Some(Duration::from_secs(config.acceptance_timeout_secs))
+    } else {
+        None
+    };
     tracing::info!(
-        "waiting for {} workers to register...",
-        config.expected_workers
+        "waiting for {} workers to register (timeout: {})...",
+        config.expected_workers,
+        timeout_duration.map_or("none".to_string(), |d| format!("{}s", d.as_secs()))
     );
 
+    let accept_start = std::time::Instant::now();
+
     while registry.active_count() < config.expected_workers {
-        let (stream, addr) = listener.accept().await?;
+        if let Some(timeout) = timeout_duration {
+            let elapsed = accept_start.elapsed();
+            if elapsed >= timeout {
+                anyhow::bail!(
+                    "timed out waiting for workers: got {}/{} after {}s",
+                    registry.active_count(),
+                    config.expected_workers,
+                    elapsed.as_secs()
+                );
+            }
+        }
+
+        let accept_future = listener.accept();
+        let (stream, addr) = if let Some(timeout) = timeout_duration {
+            let remaining = timeout.saturating_sub(accept_start.elapsed());
+            match tokio::time::timeout(remaining, accept_future).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    anyhow::bail!(
+                        "timed out waiting for workers: got {}/{} after {}s",
+                        registry.active_count(),
+                        config.expected_workers,
+                        config.acceptance_timeout_secs
+                    );
+                }
+            }
+        } else {
+            accept_future.await?
+        };
         tracing::info!("worker connected from {addr}");
         let mut conn = FramedConnection::new(stream);
 
@@ -229,7 +274,7 @@ async fn main() -> Result<()> {
     }
 
     // Build distributed pipeline
-    let pipeline = DistributedPipeline::new(&schedule_result.assignments)?;
+    let pipeline = DistributedPipeline::new(&schedule_result.assignments, model_config.hidden_size)?;
     tracing::info!(
         "distributed pipeline ready with {} stages",
         pipeline.pipeline_order().len()

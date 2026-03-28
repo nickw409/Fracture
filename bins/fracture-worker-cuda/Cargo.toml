@@ -15,6 +15,7 @@ fracture-engine = { workspace = true }
 fracture-gguf = { workspace = true }
 fracture-cuda = { workspace = true }
 fracture-protocol = { workspace = true }
+fracture-coordinator = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

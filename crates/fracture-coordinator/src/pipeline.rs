@@ -20,11 +20,13 @@ use fracture_protocol::{frame::MessageType, messages::*, FramedConnection};
 pub struct DistributedPipeline {
     /// Node IDs in pipeline order (head first, tail last).
     pipeline_order: Vec<String>,
+    /// Model hidden size for activation shape validation.
+    hidden_size: usize,
 }
 
 impl DistributedPipeline {
     /// Create a new distributed pipeline from scheduler assignments.
-    pub fn new(assignments: &[LayerAssignment]) -> Result<Self> {
+    pub fn new(assignments: &[LayerAssignment], hidden_size: usize) -> Result<Self> {
         if assignments.is_empty() {
             return Err(FractureError::Pipeline(
                 "no assignments for distributed pipeline".into(),
@@ -45,7 +47,10 @@ impl DistributedPipeline {
 
         let pipeline_order = assignments.iter().map(|a| a.node_id.clone()).collect();
 
-        Ok(Self { pipeline_order })
+        Ok(Self {
+            pipeline_order,
+            hidden_size,
+        })
     }
 
     /// Send CacheAlloc to all workers for a new sequence.
@@ -163,6 +168,15 @@ impl DistributedPipeline {
                             node_id
                         )));
                     }
+                    // Validate activation shape: last dimension must be hidden_size
+                    if let Some(&last_dim) = tensor_header.shape.last() {
+                        if last_dim as usize != self.hidden_size {
+                            return Err(FractureError::Pipeline(format!(
+                                "worker '{}' returned activation with last dim {}, expected hidden_size {}",
+                                node_id, last_dim, self.hidden_size
+                            )));
+                        }
+                    }
                     // Pass activations as input to the next worker
                     current_input = ForwardInputWire::Activations {
                         tensor_header,
@@ -205,7 +219,7 @@ mod tests {
             assignment("head", 0, 16, NodeRole::Head),
             assignment("tail", 16, 32, NodeRole::Tail),
         ];
-        let pipeline = DistributedPipeline::new(&assignments).unwrap();
+        let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
         assert_eq!(pipeline.pipeline_order(), &["head", "tail"]);
     }
 
@@ -216,13 +230,13 @@ mod tests {
             assignment("b", 10, 20, NodeRole::Middle),
             assignment("c", 20, 32, NodeRole::Tail),
         ];
-        let pipeline = DistributedPipeline::new(&assignments).unwrap();
+        let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
         assert_eq!(pipeline.pipeline_order(), &["a", "b", "c"]);
     }
 
     #[test]
     fn test_pipeline_empty() {
-        assert!(DistributedPipeline::new(&[]).is_err());
+        assert!(DistributedPipeline::new(&[], 4096).is_err());
     }
 
     #[test]
@@ -231,6 +245,6 @@ mod tests {
             assignment("a", 0, 10, NodeRole::Head),
             assignment("b", 15, 32, NodeRole::Tail), // gap at 10..15
         ];
-        assert!(DistributedPipeline::new(&assignments).is_err());
+        assert!(DistributedPipeline::new(&assignments, 4096).is_err());
     }
 }

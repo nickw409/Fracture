@@ -49,6 +49,12 @@ impl Drop for ProcessGuard {
 }
 
 fn spawn_pipeline(coord_port: u16, http_port: u16) -> ProcessGuard {
+    let (guard, _) = spawn_pipeline_timed(coord_port, http_port);
+    guard
+}
+
+fn spawn_pipeline_timed(coord_port: u16, http_port: u16) -> (ProcessGuard, Duration) {
+    let setup_start = Instant::now();
     let bin_c = coord_bin();
     let bin_w = worker_bin();
     let model = model_path();
@@ -84,10 +90,9 @@ fn spawn_pipeline(coord_port: u16, http_port: u16) -> ProcessGuard {
     let guard = ProcessGuard { coordinator, worker };
 
     // Wait for HTTP readiness
-    let start = Instant::now();
     let client = reqwest::blocking::Client::new();
     loop {
-        if start.elapsed() > Duration::from_secs(60) {
+        if setup_start.elapsed() > Duration::from_secs(60) {
             panic!("HTTP server not ready within 60 seconds");
         }
         if let Ok(resp) = client
@@ -101,7 +106,8 @@ fn spawn_pipeline(coord_port: u16, http_port: u16) -> ProcessGuard {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    guard
+    let setup_duration = setup_start.elapsed();
+    (guard, setup_duration)
 }
 
 fn send_completion(http_port: u16, prompt: &str, max_tokens: usize, temperature: f32) -> serde_json::Value {
@@ -191,4 +197,26 @@ fn test_e2e_worker_lifecycle() {
     let resp = send_completion(8092, "Hello", 5, 0.0);
     let tokens = resp["usage"]["completion_tokens"].as_u64().unwrap();
     assert!(tokens > 0, "should generate tokens after full lifecycle setup");
+}
+
+/// Benchmark: measures pipeline setup latency (calibration + registration +
+/// scheduling + weight loading). Asserts < 30 seconds per the Phase 3 arch doc.
+///
+/// This is a benchmark, not a correctness test. Run separately:
+///   cargo nextest run -p fracture-coordinator-cuda --run-ignored all -E 'test(bench)'
+#[test]
+#[ignore = "benchmark: requires GPU, release binaries, and GGUF model"]
+fn bench_pipeline_setup_latency() {
+    let (_guard, setup_duration) = spawn_pipeline_timed(9412, 8093);
+
+    eprintln!(
+        "pipeline setup latency: {:.1}s (threshold: 30s)",
+        setup_duration.as_secs_f64()
+    );
+
+    assert!(
+        setup_duration < Duration::from_secs(30),
+        "pipeline setup took {:.1}s, exceeds 30s threshold",
+        setup_duration.as_secs_f64()
+    );
 }

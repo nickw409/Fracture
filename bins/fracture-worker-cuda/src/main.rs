@@ -89,6 +89,18 @@ async fn main() -> Result<()> {
         "calibration: decode={decode_ms:.2} ms/layer, prefill(128)={prefill_ms:.2} ms/layer"
     );
 
+    // Validate calibration results are plausible before sending to coordinator
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+    let cal_check = WorkerCapabilities {
+        node_id: node_id.clone(),
+        gpu_model: String::new(),
+        gpu_memory_available: 0,
+        compute_capability: (0, 0),
+        decode_ms_per_layer: decode_ms,
+        prefill_ms_per_layer_128: prefill_ms,
+    };
+    cal_check.validate_calibration()?;
+
     // Precompute RoPE frequencies for inference
     backend.precompute_rope_freqs(config.head_dim, config.rope_theta)?;
 

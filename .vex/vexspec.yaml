@@ -1255,13 +1255,13 @@ sections:
           The coordinator is the single source of truth for cache state.
 
       - name: activation-shape-validation
-        status: not-implemented
+        status: implemented
         description: |
           When an intermediate worker returns activation tensors, the
-          coordinator validates the shape matches [N, hidden_size] before
-          forwarding to the next worker. A shape mismatch from a
-          misconfigured layer range produces a clear error rather than
-          sending corrupt data to the next worker.
+          coordinator validates the last dimension matches hidden_size
+          before forwarding to the next worker. A shape mismatch (e.g.,
+          worker returns [1, 8192] but model expects hidden_size=4096)
+          produces a clear error identifying the worker and dimensions.
 
       - name: pipeline-error-propagation
         status: implemented
@@ -1291,12 +1291,14 @@ sections:
           to reclaim GPU memory before loading assigned weights.
 
       - name: worker-calibration-plausibility
-        status: not-tested
+        status: implemented
         description: |
           Validates that calibration benchmark results are plausible:
-          decode_ms_per_layer and prefill_ms_per_layer are not zero, not
-          negative, and not absurdly large (e.g. > 1000 ms). Implausible
-          values indicate a broken benchmark or misconfigured GPU.
+          decode_ms_per_layer and prefill_ms_per_layer must be > 0 and
+          <= 500 ms. Validated both in the worker (after calibration,
+          before sending Register) and in the scheduler (before computing
+          layer assignments). Implausible values produce a clear error
+          identifying the worker and the offending metric.
 
       - name: worker-registration-handshake
         status: implemented
@@ -1335,12 +1337,13 @@ sections:
           expected number of workers have registered before proceeding.
 
       - name: coordinator-acceptance-timeout
-        status: not-implemented
+        status: implemented
         description: |
           When fewer workers connect than expected within a configurable
-          timeout, the coordinator exits with an error rather than waiting
-          indefinitely. Prevents the coordinator from hanging when workers
-          fail to start or cannot reach the coordinator's listen address.
+          timeout (--acceptance-timeout, default 120s, 0=no timeout), the
+          coordinator exits with an error reporting how many workers
+          registered vs expected. Prevents the coordinator from hanging
+          when workers fail to start or cannot reach the listen address.
 
       - name: coordinator-scheduling
         status: implemented
@@ -1449,6 +1452,8 @@ sections:
         status: implemented
         description: |
           Worker registration, calibration benchmark, layer assignment, and
-          pipeline setup complete in under 30 seconds. Observed: calibration
-          ~0.4s (5090), ~2s (3090 WSL), registration handshake <1ms,
-          weight loading ~1.5s. Total well under 30s threshold.
+          pipeline setup complete in under 30 seconds. Validated by
+          bench_pipeline_setup_latency (#[ignore] benchmark test) which
+          measures the full setup and asserts < 30s. Observed ~2.6s on
+          RTX 5090. Run with: cargo nextest run -p fracture-coordinator-cuda
+          --run-ignored all -E 'test(bench)'

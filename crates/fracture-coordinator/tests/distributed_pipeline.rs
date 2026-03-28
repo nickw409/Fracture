@@ -156,7 +156,7 @@ async fn setup_two_node_pipeline() -> (DistributedPipeline, PeerRegistry) {
         .unwrap();
 
     let pipeline =
-        DistributedPipeline::new(&[head_assignment, tail_assignment]).unwrap();
+        DistributedPipeline::new(&[head_assignment, tail_assignment], 4096).unwrap();
 
     (pipeline, registry)
 }
@@ -393,7 +393,7 @@ async fn test_three_node_pipeline() {
         registry.assign(&a.node_id, a.clone()).unwrap();
     }
 
-    let pipeline = DistributedPipeline::new(&assignments).unwrap();
+    let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
     let seq_id = 99;
 
     pipeline
@@ -540,7 +540,7 @@ async fn test_worker_error_propagates() {
     };
     registry.assign("err-worker", assignment.clone()).unwrap();
 
-    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
     pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1, 2], &[0, 1], true).await;
@@ -576,7 +576,7 @@ async fn test_non_tail_returning_logits_is_error() {
     ];
     for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
 
-    let pipeline = DistributedPipeline::new(&assignments).unwrap();
+    let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
     pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
@@ -601,7 +601,7 @@ async fn test_tail_returning_activations_is_error() {
     let assignment = LayerAssignment { node_id: "tail".into(), layer_range: 0..32, role: NodeRole::Tail, expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0 };
     registry.assign("tail", assignment.clone()).unwrap();
 
-    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
     pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
@@ -925,7 +925,7 @@ async fn test_pipeline_unexpected_message_type_is_error() {
     };
     registry.assign("bad", assignment.clone()).unwrap();
 
-    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
     pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
@@ -934,5 +934,84 @@ async fn test_pipeline_unexpected_message_type_is_error() {
     assert!(
         err_msg.contains("expected ForwardResult") || err_msg.contains("Heartbeat"),
         "error should mention unexpected message type: {err_msg}"
+    );
+}
+
+// ── Activation shape validation test ────────────────────────────────────
+
+/// Spawn a worker that returns activations with wrong hidden_size.
+async fn spawn_wrong_shape_worker(
+    listener: TcpListener,
+    wrong_hidden_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    let data_len = wrong_hidden_size * 2;
+                    let result = ForwardResultPayload {
+                        output: ForwardOutputWire::Activations {
+                            tensor_header: TensorWireHeader {
+                                ndim: 2,
+                                shape: vec![1, wrong_hidden_size as u32],
+                                dtype: 0,
+                                compression: 0,
+                                data_len: data_len as u32,
+                            },
+                            tensor_data: vec![0u8; data_len],
+                        },
+                    };
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_activation_shape_mismatch_detected() {
+    // Head worker returns activations with hidden_size=8192, but pipeline expects 4096
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let _h = spawn_wrong_shape_worker(head_listener, 8192).await;
+    let _t = spawn_mock_worker(tail_listener, true, 4096, 128256).await;
+
+    let head_conn = FramedConnection::new(tokio::net::TcpStream::connect(head_addr).await.unwrap());
+    let tail_conn = FramedConnection::new(tokio::net::TcpStream::connect(tail_addr).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("head"), head_conn).unwrap();
+    registry.register(make_caps("tail"), tail_conn).unwrap();
+
+    let assignments = vec![
+        LayerAssignment { node_id: "head".into(), layer_range: 0..16, role: NodeRole::Head, expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0 },
+        LayerAssignment { node_id: "tail".into(), layer_range: 16..32, role: NodeRole::Tail, expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0 },
+    ];
+    for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
+
+    let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+
+    let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("hidden_size") || err_msg.contains("8192"),
+        "error should mention shape mismatch: {err_msg}"
     );
 }

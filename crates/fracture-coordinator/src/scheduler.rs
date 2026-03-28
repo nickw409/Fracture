@@ -39,6 +39,42 @@ pub struct WorkerCapabilities {
     pub prefill_ms_per_layer_128: f32,
 }
 
+/// Maximum plausible ms/layer for calibration. Anything above this
+/// indicates a broken benchmark or severely misconfigured GPU.
+const MAX_PLAUSIBLE_MS_PER_LAYER: f32 = 500.0;
+
+impl WorkerCapabilities {
+    /// Validate that calibration results are plausible.
+    /// Returns an error if values are zero, negative, or absurdly large.
+    pub fn validate_calibration(&self) -> Result<()> {
+        if self.decode_ms_per_layer <= 0.0 {
+            return Err(FractureError::Pipeline(format!(
+                "worker '{}': implausible decode_ms_per_layer={} (must be > 0)",
+                self.node_id, self.decode_ms_per_layer
+            )));
+        }
+        if self.prefill_ms_per_layer_128 <= 0.0 {
+            return Err(FractureError::Pipeline(format!(
+                "worker '{}': implausible prefill_ms_per_layer_128={} (must be > 0)",
+                self.node_id, self.prefill_ms_per_layer_128
+            )));
+        }
+        if self.decode_ms_per_layer > MAX_PLAUSIBLE_MS_PER_LAYER {
+            return Err(FractureError::Pipeline(format!(
+                "worker '{}': decode_ms_per_layer={:.1} exceeds maximum plausible value ({:.0}ms)",
+                self.node_id, self.decode_ms_per_layer, MAX_PLAUSIBLE_MS_PER_LAYER
+            )));
+        }
+        if self.prefill_ms_per_layer_128 > MAX_PLAUSIBLE_MS_PER_LAYER {
+            return Err(FractureError::Pipeline(format!(
+                "worker '{}': prefill_ms_per_layer_128={:.1} exceeds maximum plausible value ({:.0}ms)",
+                self.node_id, self.prefill_ms_per_layer_128, MAX_PLAUSIBLE_MS_PER_LAYER
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Scheduling mode.
 #[derive(Debug, Clone)]
 pub enum SchedulingMode {
@@ -172,6 +208,11 @@ pub fn schedule(input: &SchedulerInput) -> Result<SchedulerResult> {
         return Err(FractureError::Pipeline(
             "no workers available for scheduling".into(),
         ));
+    }
+
+    // Validate calibration plausibility for all candidates
+    for c in &candidates {
+        c.validate_calibration()?;
     }
 
     match &input.mode {
@@ -1271,5 +1312,50 @@ mod tests {
             start = a.layer_range.end;
         }
         assert_eq!(start, 32);
+    }
+
+    #[test]
+    fn test_calibration_plausibility_valid() {
+        let w = worker("ok", 22.0, 1.0);
+        assert!(w.validate_calibration().is_ok());
+    }
+
+    #[test]
+    fn test_calibration_plausibility_zero_decode() {
+        let mut w = worker("bad", 22.0, 0.0);
+        w.decode_ms_per_layer = 0.0;
+        assert!(w.validate_calibration().is_err());
+        assert!(w.validate_calibration().unwrap_err().to_string().contains("decode"));
+    }
+
+    #[test]
+    fn test_calibration_plausibility_negative_prefill() {
+        let mut w = worker("bad", 22.0, 1.0);
+        w.prefill_ms_per_layer_128 = -1.0;
+        assert!(w.validate_calibration().is_err());
+        assert!(w.validate_calibration().unwrap_err().to_string().contains("prefill"));
+    }
+
+    #[test]
+    fn test_calibration_plausibility_absurdly_large() {
+        let mut w = worker("bad", 22.0, 1.0);
+        w.decode_ms_per_layer = 999.0;
+        assert!(w.validate_calibration().is_err());
+        assert!(w.validate_calibration().unwrap_err().to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn test_scheduler_rejects_implausible_calibration() {
+        let mut w = worker("bad", 22.0, 0.0);
+        w.decode_ms_per_layer = 0.0;
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![w],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
     }
 }
