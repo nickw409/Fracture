@@ -8,6 +8,14 @@ pub struct PipelineCoordinator {
     nodes: Vec<Box<dyn ComputeNode>>,
 }
 
+impl std::fmt::Debug for PipelineCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineCoordinator")
+            .field("num_nodes", &self.nodes.len())
+            .finish()
+    }
+}
+
 impl PipelineCoordinator {
     /// Create a new coordinator with validated node ordering.
     ///
@@ -139,5 +147,129 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(err.to_string().contains("at least one node"));
+    }
+
+    // Mock node for error path testing
+    use crate::node::NodeConfig;
+    use fracture_core::{DeviceTensor, DType, TensorId};
+
+    struct MockNode {
+        config: NodeConfig,
+        returns_logits: bool,
+    }
+
+    impl MockNode {
+        fn new(start: usize, end: usize, total: usize, returns_logits: bool) -> Self {
+            Self {
+                config: NodeConfig::new(start..end, total).unwrap(),
+                returns_logits,
+            }
+        }
+    }
+
+    impl ComputeNode for MockNode {
+        fn forward(
+            &self,
+            _input: NodeInput,
+            _cache: &mut KvCacheManager,
+            _cache_handle: CacheHandle,
+            _profile: Option<&mut fracture_core::ForwardProfile>,
+        ) -> Result<NodeOutput> {
+            if self.returns_logits {
+                Ok(NodeOutput::Logits(vec![0.0; 10]))
+            } else {
+                Ok(NodeOutput::Activations(DeviceTensor::new(
+                    TensorId(999),
+                    vec![1, 64],
+                    DType::FP16,
+                )))
+            }
+        }
+
+        fn config(&self) -> &NodeConfig {
+            &self.config
+        }
+    }
+
+    #[test]
+    fn test_pipeline_cache_count_mismatch() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 4, 4, true)),
+        ];
+        let pipeline = PipelineCoordinator::new(nodes).unwrap();
+
+        // 0 caches for 1 node
+        let result = pipeline.forward(&[1], &[0], &mut [], &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected 1"));
+    }
+
+    #[test]
+    fn test_pipeline_non_last_returns_logits() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 2, 4, true)), // returns logits (wrong!)
+            Box::new(MockNode::new(2, 4, 4, true)),
+        ];
+        let pipeline = PipelineCoordinator::new(nodes).unwrap();
+
+        let mut cache1 = KvCacheManager::new(2, 8, 128, 128);
+        let mut cache2 = KvCacheManager::new(2, 8, 128, 128);
+        let h1 = CacheHandle(1);
+        let h2 = CacheHandle(2);
+
+        let result = pipeline.forward(
+            &[1], &[0],
+            &mut [&mut cache1, &mut cache2],
+            &[h1, h2],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not the last node"));
+    }
+
+    #[test]
+    fn test_pipeline_last_returns_activations() {
+        // Single node that returns activations instead of logits
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 4, 4, false)), // returns activations (wrong!)
+        ];
+        let pipeline = PipelineCoordinator::new(nodes).unwrap();
+
+        let mut cache = KvCacheManager::new(4, 8, 128, 128);
+        let h = CacheHandle(1);
+
+        let result = pipeline.forward(&[1], &[0], &mut [&mut cache], &[h]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Activations instead of Logits"));
+    }
+
+    #[test]
+    fn test_pipeline_overlap_rejected() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 3, 4, false)),
+            Box::new(MockNode::new(2, 4, 4, true)), // overlaps at layer 2
+        ];
+        let result = PipelineCoordinator::new(nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("gap or overlap"));
+    }
+
+    #[test]
+    fn test_pipeline_non_head_first_rejected() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(1, 4, 4, true)), // doesn't start at 0
+        ];
+        let result = PipelineCoordinator::new(nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("head"));
+    }
+
+    #[test]
+    fn test_pipeline_non_tail_last_rejected() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 2, 4, true)), // doesn't end at total_layers
+        ];
+        let result = PipelineCoordinator::new(nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("tail"));
     }
 }

@@ -47,13 +47,13 @@ impl WorkerCapabilities {
     /// Validate that calibration results are plausible.
     /// Returns an error if values are zero, negative, or absurdly large.
     pub fn validate_calibration(&self) -> Result<()> {
-        if self.decode_ms_per_layer <= 0.0 {
+        if self.decode_ms_per_layer.is_nan() || self.decode_ms_per_layer <= 0.0 {
             return Err(FractureError::Pipeline(format!(
                 "worker '{}': implausible decode_ms_per_layer={} (must be > 0)",
                 self.node_id, self.decode_ms_per_layer
             )));
         }
-        if self.prefill_ms_per_layer_128 <= 0.0 {
+        if self.prefill_ms_per_layer_128.is_nan() || self.prefill_ms_per_layer_128 <= 0.0 {
             return Err(FractureError::Pipeline(format!(
                 "worker '{}': implausible prefill_ms_per_layer_128={} (must be > 0)",
                 self.node_id, self.prefill_ms_per_layer_128
@@ -1357,5 +1357,59 @@ mod tests {
             hop_latency_ms: 2.0,
         };
         assert!(schedule(&input).is_err());
+    }
+
+    #[test]
+    fn test_scheduler_nan_decode_ms_rejected() {
+        let mut w = worker("nan", 22.0, 1.0);
+        w.decode_ms_per_layer = f32::NAN;
+        // NaN fails the <= 0.0 check (NaN comparisons are false)
+        // and also fails the > MAX check, so it should be caught
+        assert!(w.validate_calibration().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_inf_decode_ms_rejected() {
+        let mut w = worker("inf", 22.0, 1.0);
+        w.decode_ms_per_layer = f32::INFINITY;
+        assert!(w.validate_calibration().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_negative_decode_ms_rejected() {
+        let mut w = worker("neg", 22.0, 1.0);
+        w.decode_ms_per_layer = -0.5;
+        assert!(w.validate_calibration().is_err());
+    }
+
+    #[test]
+    fn test_scheduler_zero_max_seq_len() {
+        // Zero max_seq_len means no KV cache needed — should still work
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("a", 22.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 0,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+        assert_eq!(result.assignments[0].layer_range, 0..32);
+    }
+
+    #[test]
+    fn test_scheduler_very_large_hop_latency_prunes_to_single_node() {
+        // If hop latency is extremely high, adding a second node is never worth it
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("a", 30.0, 1.0), worker("b", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 1000.0, // 1 second per hop!
+        };
+        let result = schedule(&input).unwrap();
+        // Should prune to 1 node since the hop latency makes 2 nodes worse
+        assert_eq!(result.assignments.len(), 1);
     }
 }

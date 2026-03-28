@@ -1015,3 +1015,85 @@ async fn test_activation_shape_mismatch_detected() {
         "error should mention shape mismatch: {err_msg}"
     );
 }
+
+// ── Distributed pipeline error path tests ───────────────────────────────
+
+#[tokio::test]
+async fn test_alloc_cache_unknown_worker_is_error() {
+    // Pipeline references "missing" which isn't in the registry
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_mock_worker(listener, true, 4096, 128256).await;
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("present"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "present".into(), layer_range: 0..16, role: NodeRole::Head,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    registry.assign("present", assignment.clone()).unwrap();
+
+    // Create pipeline with a second node that doesn't exist in registry
+    let missing_assignment = LayerAssignment {
+        node_id: "missing".into(), layer_range: 16..32, role: NodeRole::Tail,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    let pipeline = DistributedPipeline::new(&[assignment, missing_assignment], 4096).unwrap();
+
+    let result = pipeline.alloc_cache(&mut registry, 1, 4096).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("missing"));
+}
+
+#[tokio::test]
+async fn test_free_cache_unknown_worker_is_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_mock_worker(listener, true, 4096, 128256).await;
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("present"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "present".into(), layer_range: 0..16, role: NodeRole::Head,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    registry.assign("present", assignment.clone()).unwrap();
+
+    let missing_assignment = LayerAssignment {
+        node_id: "ghost".into(), layer_range: 16..32, role: NodeRole::Tail,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    let pipeline = DistributedPipeline::new(&[assignment, missing_assignment], 4096).unwrap();
+
+    let result = pipeline.free_cache(&mut registry, 1).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("ghost"));
+}
+
+#[tokio::test]
+async fn test_forward_unknown_worker_is_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_mock_worker(listener, true, 4096, 128256).await;
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("exists"), conn).unwrap();
+    let assignment = LayerAssignment {
+        node_id: "exists".into(), layer_range: 0..16, role: NodeRole::Head,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    registry.assign("exists", assignment.clone()).unwrap();
+
+    let missing = LayerAssignment {
+        node_id: "vanished".into(), layer_range: 16..32, role: NodeRole::Tail,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    };
+    let pipeline = DistributedPipeline::new(&[assignment, missing], 4096).unwrap();
+
+    // Forward will succeed on first node but fail looking up second
+    let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
+    assert!(result.is_err(), "should fail when worker is missing from registry");
+}
