@@ -8,6 +8,8 @@ members = [
     "crates/fracture-gguf",
     "backends/fracture-cuda",
     "bins/fracture-server-cuda",
+    "tests/validation",
+    "tests/model-validation",
 ]
 
 [workspace.package]
@@ -23,6 +25,7 @@ fracture-generate = { path = "crates/fracture-generate" }
 fracture-server = { path = "crates/fracture-server" }
 fracture-gguf = { path = "crates/fracture-gguf" }
 fracture-cuda = { path = "backends/fracture-cuda" }
+fracture-validation = { path = "tests/validation" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

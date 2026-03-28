@@ -6,3 +6,7 @@
 # Note: cudart is statically linked (libcudart_static.a) to work around a WSL2
 # segfault with the dynamic libcudart.so. See README.md for details.
 LD_LIBRARY_PATH = { value = "/usr/local/cuda/lib64:/usr/lib/wsl/lib", force = false }
+
+# Model path for Tier 2/3 validation tests (kernel + end-to-end).
+# Tests skip gracefully if the file doesn't exist.
+FRACTURE_MODEL_PATH = { value = "models/llama-3.1-8b-instruct-f16.gguf", relative = true }

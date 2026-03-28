@@ -33,7 +33,8 @@ fn main() {
                 "--use_fast_math",
                 "-Xcompiler",
                 "-fPIC",
-                "-gencode=arch=compute_86,code=sm_86", // RTX 3090 (Ampere)
+                "-gencode=arch=compute_86,code=sm_86",       // RTX 3090 (Ampere)
+                "-gencode=arch=compute_90,code=compute_90", // PTX for Hopper+ (JIT for Blackwell/5090)
             ])
             .status()
             .expect("failed to run nvcc — is the CUDA toolkit installed?");

@@ -9,12 +9,13 @@
 // positions: [num_tokens] u32
 // freq_table: [head_dim/2] FP32 — pre-computed inverse frequencies
 //
-// For each (token, head, dimension pair d):
+// Uses the split-half convention (matching PyTorch/HuggingFace):
+// For each (token, head, dimension d in 0..head_dim/2):
 //   angle = positions[token] * freq_table[d]
 //   cos_val = cos(angle), sin_val = sin(angle)
-//   x0 = tensor[..., 2*d],   x1 = tensor[..., 2*d+1]
-//   tensor[..., 2*d]   = x0 * cos_val - x1 * sin_val
-//   tensor[..., 2*d+1] = x0 * sin_val + x1 * cos_val
+//   x0 = tensor[..., d],             x1 = tensor[..., d + head_dim/2]
+//   tensor[..., d]              = x0 * cos_val - x1 * sin_val
+//   tensor[..., d + head_dim/2] = x0 * sin_val + x1 * cos_val
 
 __global__ void rope_kernel(
     half* __restrict__ tensor,
@@ -38,12 +39,13 @@ __global__ void rope_kernel(
     float cos_val = cosf(angle);
     float sin_val = sinf(angle);
 
-    int base = token * num_heads * head_dim + head * head_dim + 2 * d;
-    float x0 = __half2float(tensor[base]);
-    float x1 = __half2float(tensor[base + 1]);
+    // Split-half: pair (d, d + half_dim) within each head
+    int base = token * num_heads * head_dim + head * head_dim;
+    float x0 = __half2float(tensor[base + d]);
+    float x1 = __half2float(tensor[base + d + half_dim]);
 
-    tensor[base]     = __float2half(x0 * cos_val - x1 * sin_val);
-    tensor[base + 1] = __float2half(x0 * sin_val + x1 * cos_val);
+    tensor[base + d]            = __float2half(x0 * cos_val - x1 * sin_val);
+    tensor[base + d + half_dim] = __float2half(x0 * sin_val + x1 * cos_val);
 }
 
 extern "C" cudaError_t launch_rope(

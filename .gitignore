@@ -6,7 +6,8 @@
 *.cubin
 
 # Model files (large)
-*.gguf
+models/*
+!models/README.md
 *.safetensors
 
 # Reference test data (generated, large binary tensors)

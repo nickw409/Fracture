@@ -344,6 +344,22 @@ fn test_gpu_prefill_decode_consistency() {
 fn test_gpu_cache_freed_after_generation() {
     let (engine, mut cache, _cfg) = setup_engine_and_cache().expect("setup failed");
 
+    // Warm up: run a short generation so PTX JIT compilation (if using forward-
+    // compatible PTX instead of native SASS) allocates its kernel cache before
+    // we take the memory snapshot.
+    {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let warmup_config = GenerationConfig {
+            max_tokens: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            stop_tokens: vec![],
+        };
+        let _ = GenerationLoop::generate(&engine, &[1], &warmup_config, &mut cache, &tx)
+            .expect("warmup generation failed");
+    }
+
     // Snapshot memory before generation
     engine.backend().synchronize().expect("sync failed");
     let mem_before = engine.backend().available_memory();

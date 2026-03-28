@@ -436,6 +436,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fracture-model-validation"
+version = "0.1.0"
+dependencies = [
+ "fracture-core",
+ "fracture-cuda",
+ "fracture-engine",
+ "fracture-generate",
+ "fracture-gguf",
+ "fracture-validation",
+ "half",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fracture-server"
 version = "0.1.0"
 dependencies = [
@@ -444,7 +460,9 @@ dependencies = [
  "fracture-core",
  "fracture-engine",
  "fracture-generate",
+ "fracture-gguf",
  "futures-core",
+ "half",
  "http-body-util",
  "rand",
  "serde",
@@ -475,6 +493,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fracture-validation"
+version = "0.1.0"
+dependencies = [
+ "half",
 ]
 
 [[package]]

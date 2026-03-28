@@ -246,7 +246,11 @@ class ActivationCapture:
         num_q_heads = config.num_attention_heads
         device = self.model.device
 
-        rotary_emb = self.model.model.layers[0].self_attn.rotary_emb
+        # transformers >=5.x moved rotary_emb to model level; older versions keep it on self_attn
+        if hasattr(self.model.model, "rotary_emb"):
+            rotary_emb = self.model.model.rotary_emb
+        else:
+            rotary_emb = self.model.model.layers[0].self_attn.rotary_emb
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
