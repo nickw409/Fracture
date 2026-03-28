@@ -893,27 +893,16 @@ sections:
           error with the actual vs maximum lengths.
 
   # ============================================================
-  # HTTP SERVER
+  # HTTP SERVER — ENDPOINTS
   # ============================================================
-  - name: HTTP Server
+  - name: HTTP Server Endpoints
     path: crates/fracture-server/src
     status: implemented
     description: |
-      OpenAI-compatible HTTP API for completions and chat. Tokenization
-      handled at this layer via the tokenizers crate. Generation runs in
-      a blocking task to avoid holding the async runtime.
+      OpenAI-compatible HTTP route handlers for completions, chat,
+      model listing, profiling, and health checks.
     shared: [error-handling]
     behaviors:
-      - name: tokenizer-loading
-        status: implemented
-        description: |
-          Loads a HuggingFace tokenizer.json file for BPE tokenization and
-          detokenization. Searches for tokenizer.json in the same directory
-          as the model GGUF file, or accepts an explicit --tokenizer CLI
-          path. Fails with a clear error if no tokenizer is found. The
-          tokenizer file must be placed alongside the model — it is not
-          embedded in the GGUF format.
-
       - name: completions-endpoint
         status: implemented
         description: |
@@ -929,38 +918,56 @@ sections:
           objects. Applies Llama 3 chat template to convert messages to prompt.
           Returns response in chat completion format with message object.
 
-      - name: sse-streaming
+      - name: models-endpoint
         status: implemented
         description: |
-          When stream=true, returns text/event-stream content type. Sends
-          data: {json}\n\n for each token. Sends data: [DONE]\n\n at end.
-          Each SSE event contains a delta object with the new token content.
-          Generation runs in a spawn_blocking task, tokens streamed via
-          async_stream.
+          GET /v1/models returns the list of loaded models in OpenAI-compatible
+          format. Returns a JSON object with a data array containing model
+          objects with id, object, created, and owned_by fields. Required by
+          client libraries to discover available models.
 
-      - name: non-streaming
+      - name: profile-endpoint
         status: implemented
         description: |
-          When stream=false (default), waits for full generation to complete
-          and returns the complete response in a single JSON object.
-          Includes usage stats (prompt_tokens, completion_tokens, total_tokens).
+          GET /v1/profile returns profiling status. Currently returns a
+          placeholder JSON object indicating the profiling endpoint is ready.
+          Will return RequestMetrics and aggregated stats once the profiling
+          pipeline is fully wired through shared state.
 
-      - name: usage-stats-accuracy
+      - name: health-endpoint
         status: implemented
         description: |
-          Non-streaming responses include a usage object with prompt_tokens,
-          completion_tokens, and total_tokens that accurately reflect the
-          actual tokenized prompt length and number of generated tokens
-          (total = prompt + completion). Clients and billing systems depend
-          on these counts being exact.
+          GET /health returns server readiness status. Returns 200 with
+          {"status": "ready"} when the model is loaded and ready to serve.
+          Enables load balancer and orchestration health checks.
 
-      - name: streaming-usage-stats
-        status: not-implemented
+      - name: error-response-format
+        status: implemented
         description: |
-          When stream=true, the final SSE chunk before [DONE] includes a
-          usage object with prompt_tokens, completion_tokens, and total_tokens,
-          matching OpenAI API behavior. Streaming clients also need token
-          counts for billing and monitoring.
+          Error responses (400, 500, etc.) return the standard OpenAI error
+          object format: {"error": {"message": "...", "type": "invalid_request_error", "code": null}}.
+          Client libraries depend on the nested object structure for error handling.
+
+  # ============================================================
+  # HTTP SERVER — REQUEST PROCESSING
+  # ============================================================
+  - name: HTTP Server Request Processing
+    path: crates/fracture-server/src
+    status: implemented
+    description: |
+      Tokenization, request validation, chat template application,
+      model name checking, and usage stats for the HTTP API.
+    shared: [error-handling]
+    behaviors:
+      - name: tokenizer-loading
+        status: implemented
+        description: |
+          Loads a HuggingFace tokenizer.json file for BPE tokenization and
+          detokenization. Searches for tokenizer.json in the same directory
+          as the model GGUF file, or accepts an explicit --tokenizer CLI
+          path. Fails with a clear error if no tokenizer is found. The
+          tokenizer file must be placed alongside the model — it is not
+          embedded in the GGUF format.
 
       - name: request-validation
         status: implemented
@@ -985,21 +992,14 @@ sections:
           If model is None, the request proceeds normally. Prevents confusion
           when clients target a specific model that isn't available.
 
-      - name: models-endpoint
+      - name: usage-stats-accuracy
         status: implemented
         description: |
-          GET /v1/models returns the list of loaded models in OpenAI-compatible
-          format. Returns a JSON object with a data array containing model
-          objects with id, object, created, and owned_by fields. Required by
-          client libraries to discover available models.
-
-      - name: profile-endpoint
-        status: implemented
-        description: |
-          GET /v1/profile returns profiling status. Currently returns a
-          placeholder JSON object indicating the profiling endpoint is ready.
-          Will return RequestMetrics and aggregated stats once the profiling
-          pipeline is fully wired through shared state.
+          Non-streaming responses include a usage object with prompt_tokens,
+          completion_tokens, and total_tokens that accurately reflect the
+          actual tokenized prompt length and number of generated tokens
+          (total = prompt + completion). Clients and billing systems depend
+          on these counts being exact.
 
       - name: concurrent-requests
         status: not-implemented
@@ -1011,19 +1011,40 @@ sections:
           request processing. True concurrent serving requires Phase 4
           continuous batching.
 
-      - name: error-response-format
+  # ============================================================
+  # HTTP SERVER — STREAMING
+  # ============================================================
+  - name: HTTP Server Streaming
+    path: crates/fracture-server/src
+    status: implemented
+    description: |
+      Server-Sent Events streaming for token-by-token output,
+      non-streaming response mode, and streaming lifecycle management.
+    shared: [error-handling]
+    behaviors:
+      - name: sse-streaming
         status: implemented
         description: |
-          Error responses (400, 500, etc.) return the standard OpenAI error
-          object format: {"error": {"message": "...", "type": "invalid_request_error", "code": null}}.
-          Client libraries depend on the nested object structure for error handling.
+          When stream=true, returns text/event-stream content type. Sends
+          data: {json}\n\n for each token. Sends data: [DONE]\n\n at end.
+          Each SSE event contains a delta object with the new token content.
+          Generation runs in a spawn_blocking task, tokens streamed via
+          async_stream.
 
-      - name: health-endpoint
+      - name: non-streaming
         status: implemented
         description: |
-          GET /health returns server readiness status. Returns 200 with
-          {"status": "ready"} when the model is loaded and ready to serve.
-          Enables load balancer and orchestration health checks.
+          When stream=false (default), waits for full generation to complete
+          and returns the complete response in a single JSON object.
+          Includes usage stats (prompt_tokens, completion_tokens, total_tokens).
+
+      - name: streaming-usage-stats
+        status: not-implemented
+        description: |
+          When stream=true, the final SSE chunk before [DONE] includes a
+          usage object with prompt_tokens, completion_tokens, and total_tokens,
+          matching OpenAI API behavior. Streaming clients also need token
+          counts for billing and monitoring.
 
       - name: streaming-error-propagation
         status: not-implemented
