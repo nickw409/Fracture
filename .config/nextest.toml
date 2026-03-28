@@ -1,0 +1,8 @@
+[test-groups.model-validation]
+# Model validation tests each load the full 15GB Llama 3.1 8B model onto the GPU.
+# Running more than one in parallel causes OOM on most GPUs.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(fracture-model-validation)'
+test-group = 'model-validation'

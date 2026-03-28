@@ -1,0 +1,12 @@
+{
+  "model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+  "torch_version": "2.11.0+cu130",
+  "cuda_device": "NVIDIA GeForce RTX 5090",
+  "seed": 42,
+  "prompts": [
+    "The capital of France is",
+    "Write a Python function that sorts a list using merge sort"
+  ],
+  "generate_tokens": 50,
+  "timestamp": "2026-03-27T17:16:37-0700"
+}
