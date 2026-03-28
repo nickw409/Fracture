@@ -75,9 +75,12 @@ sections:
         status: implemented
         description: |
           DType::size_bytes returns correct byte sizes for each variant:
-          FP16=2, FP32=4, BF16=2, INT8=1. Used pervasively for buffer
-          size validation in copy_to_device, copy_to_host, and weight loading.
-          Incorrect sizes would cause silent memory corruption.
+          FP16=2, FP32=4, BF16=2, INT8=1, INT4=1 (packed: 2 elements per
+          byte). DeviceTensor::size_bytes handles INT4 specially: uses
+          (numel + 1) / 2 instead of numel * size_bytes to account for
+          packing. Used pervasively for buffer size validation in
+          copy_to_device, copy_to_host, and weight loading. Incorrect
+          sizes would cause silent memory corruption.
 
   # ============================================================
   # GGUF PARSER AND WEIGHT LOADING
@@ -599,33 +602,15 @@ sections:
           total_layers), and is_full (both) from the range and total layer
           count, preventing invariant violations from manual boolean fields.
 
-      - name: node-input-output-types
+      - name: local-node-forward
         status: implemented
         description: |
-          NodeInput enum: TokenIds (head node, carries ids + positions) or
-          Activations (middle/tail node, carries DeviceTensor + positions).
-          NodeOutput enum: Logits (tail node, host-side Vec<f32>) or
-          Activations (head/middle node, GPU DeviceTensor). Type mismatch
-          (e.g., TokenIds to non-head) returns a Pipeline error.
-
-      - name: compute-node-trait
-        status: implemented
-        description: |
-          ComputeNode trait with forward() and config() methods. Object-safe
-          so PipelineCoordinator can hold Box<dyn ComputeNode>. The concrete
-          ComputeNodeImpl<B: Backend> wraps Engine<B> and erases the backend
-          generic at the trait boundary.
-
-      - name: node-service-trait
-        status: implemented
-        description: |
-          NodeService trait with forward(ForwardRequest) -> Result<ForwardResponse>
-          and info() -> NodeInfo methods. ForwardRequest carries seq_id, NodeInput,
-          and is_prefill hint. ForwardResponse carries seq_id and NodeOutput.
-          NodeInfo reports node_id, layer_range, is_head/is_tail, and GPU memory
-          stats. LocalNodeService<B> provides an in-process implementation backed
-          by ComputeNodeImpl + KvCacheManager. This is the interface that Phase 3's
-          network transport wraps.
+          ComputeNodeImpl wraps Engine and delegates forward passes based
+          on node role: head nodes accept TokenIds and return Activations,
+          tail nodes accept input and return Logits, full nodes accept
+          TokenIds and return Logits. Type mismatches (TokenIds to non-head,
+          Activations to head) return Pipeline errors. Tested via pipeline
+          split equivalence tests that chain multiple ComputeNodeImpls.
 
   # ============================================================
   # NODE IPC (Phase 2)
@@ -1080,24 +1065,27 @@ sections:
           version, and payload size limits (256 MB max) on decode. CRC32C
           is computed over header + payload and verified on receive.
 
-      - name: message-types
+      - name: message-payload-roundtrip
         status: implemented
         description: |
-          10 message types: Register (0x01), RegisterAck (0x02), Forward
-          (0x03), ForwardResult (0x04), Heartbeat (0x05), HeartbeatAck
-          (0x06), CacheAlloc (0x07), CacheFree (0x08), Shutdown (0x09),
-          Error (0x0A). Each has a corresponding payload struct that
-          round-trips through bincode serialization.
+          Every message payload struct (RegisterPayload, RegisterAckPayload,
+          ForwardPayload, ForwardResultPayload, HeartbeatPayload,
+          HeartbeatAckPayload, CacheAllocPayload, ErrorPayload) survives
+          bincode serialize → deserialize with all fields preserved exactly.
+          ForwardPayload round-trips both TokenIds and Activations variants.
+          ForwardResultPayload round-trips both Logits and Activations
+          variants. Unknown MessageType byte values are rejected with a
+          Protocol error.
 
-      - name: tensor-wire-format
+      - name: tensor-header-roundtrip
         status: implemented
         description: |
-          Compact tensor serialization format: [2B ndim][4B×ndim shape]
-          [1B dtype][1B compression][4B data_len][raw data]. Supports all
-          DType variants (FP16, FP32, BF16, INT8, INT4). Compression field
-          is reserved (always 0=None in Phase 3). Header encode/decode is
-          independent of GPU — raw tensor data transfer is caller's
-          responsibility.
+          Encoding a TensorWireHeader (ndim, shape, dtype, compression,
+          data_len) and decoding it back produces identical values. Roundtrip
+          preserves all fields exactly for all DType variants (FP16, FP32,
+          BF16, INT8, INT4) and arbitrary shapes (1D, 2D, 3D). Unsupported
+          compression values (non-zero) are rejected on decode. Header bytes
+          use big-endian encoding verified by byte-level inspection tests.
 
       - name: framed-connection
         status: implemented
@@ -1202,6 +1190,16 @@ sections:
           workers to Dead status. Pipeline order only includes Ready
           workers with assignments.
 
+      - name: layer-assignment-storage
+        status: implemented
+        description: |
+          Stores layer range assignments for registered workers and
+          provides pipeline-ordered retrieval. assign() records a
+          worker's LayerAssignment and transitions it to Ready status.
+          pipeline_order() returns worker node IDs sorted by layer
+          range start, filtered to only Ready workers with assignments.
+          Dead workers are excluded from pipeline order.
+
   # ============================================================
   # SEQUENCE STATE (Phase 3)
   # ============================================================
@@ -1255,6 +1253,15 @@ sections:
           alloc_cache() sends CacheAlloc to all pipeline workers for a
           new sequence. free_cache() sends CacheFree to all workers.
           The coordinator is the single source of truth for cache state.
+
+      - name: activation-shape-validation
+        status: not-implemented
+        description: |
+          When an intermediate worker returns activation tensors, the
+          coordinator validates the shape matches [N, hidden_size] before
+          forwarding to the next worker. A shape mismatch from a
+          misconfigured layer range produces a clear error rather than
+          sending corrupt data to the next worker.
 
       - name: pipeline-error-propagation
         status: implemented
@@ -1327,6 +1334,14 @@ sections:
           records capabilities in the PeerRegistry, and waits until the
           expected number of workers have registered before proceeding.
 
+      - name: coordinator-acceptance-timeout
+        status: not-implemented
+        description: |
+          When fewer workers connect than expected within a configurable
+          timeout, the coordinator exits with an error rather than waiting
+          indefinitely. Prevents the coordinator from hanging when workers
+          fail to start or cannot reach the coordinator's listen address.
+
       - name: coordinator-scheduling
         status: implemented
         description: |
@@ -1344,6 +1359,22 @@ sections:
           JSON responses with usage stats. Validates prompt length against
           max_seq_len. Manages cache lifecycle (alloc before generation,
           free after, even on error).
+
+      - name: coordinator-chat-completions
+        status: not-implemented
+        description: |
+          POST /v1/chat/completions with messages array, applying Llama 3
+          chat template for prompt formatting. Currently only /v1/completions
+          is supported in the coordinator. Required for OpenAI API
+          compatibility with client libraries that default to chat endpoints.
+
+      - name: coordinator-streaming
+        status: not-implemented
+        description: |
+          When stream=true, the coordinator returns tokens via SSE as they
+          are generated through the distributed pipeline. Currently the
+          coordinator only supports non-streaming (waits for full generation
+          before returning). The single-node server supports streaming.
 
       - name: coordinator-shutdown
         status: implemented
