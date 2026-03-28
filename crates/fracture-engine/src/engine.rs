@@ -1,5 +1,6 @@
 use crate::kv_cache::{CacheHandle, KvCacheManager};
-use fracture_core::{Backend, DType, DeviceTensor, ForwardProfile, LayerProfile, Result};
+use crate::node::{NodeConfig, NodeInput, NodeOutput};
+use fracture_core::{Backend, DType, DeviceTensor, ForwardProfile, FractureError, LayerProfile, Result};
 use fracture_gguf::WeightStore;
 use std::ops::Range;
 
@@ -64,22 +65,10 @@ impl<B: Backend> Engine<B> {
         &self.weights
     }
 
-    /// Run the forward pass: token_ids → logits.
+    /// Run the forward pass: token_ids → logits (Phase 1 backward-compatible API).
     ///
-    /// In Phase 1, layer_range is always [0, num_layers) and this accepts token IDs
-    /// and returns logits [vocab_size] (last position only).
-    /// In Phase 2, a partial layer range accepts/returns activation tensors.
-    ///
-    /// When `profile` is `Some`, per-layer GPU timing is recorded into the provided
-    /// `ForwardProfile`. When `None`, no timers are created and there is zero overhead.
-    /// NVTX markers (marker_push/marker_pop) are always emitted regardless of profiling
-    /// state — they are no-ops unless the backend overrides them.
-    ///
-    /// # Error Propagation
-    ///
-    /// All Backend trait calls use `?` for error propagation. Errors carry context
-    /// from the Backend implementation (e.g., CUDA error codes, allocation failures).
-    /// No panics — every fallible path returns `Result<T, FractureError>`.
+    /// This is a thin wrapper around `forward_node()` with a full-model NodeConfig.
+    /// The layer_range, profiling, and error propagation semantics are unchanged.
     pub fn forward(
         &self,
         token_ids: &[u32],
@@ -88,14 +77,40 @@ impl<B: Backend> Engine<B> {
         cache_handle: CacheHandle,
         profile: Option<&mut ForwardProfile>,
     ) -> Result<Vec<f32>> {
-        if token_ids.is_empty() {
-            return Err(fracture_core::FractureError::InvalidShape(
-                "token_ids must not be empty".into(),
-            ));
+        let node_config = NodeConfig::new(
+            self.layer_range.clone(),
+            self.weights.config.num_layers,
+        )?;
+        let input = NodeInput::TokenIds {
+            ids: token_ids.to_vec(),
+            positions: positions.to_vec(),
+        };
+        match self.forward_node(input, &node_config, cache, cache_handle, profile)? {
+            NodeOutput::Logits(logits) => Ok(logits),
+            NodeOutput::Activations(_) => Err(FractureError::Pipeline(
+                "full forward expected Logits but got Activations".into(),
+            )),
         }
+    }
 
+    /// Phase 2 forward pass: accepts NodeInput, returns NodeOutput based on NodeConfig.
+    ///
+    /// - Head node (is_head): TokenIds → embedding → layers → Activations
+    /// - Middle node: Activations → layers → Activations
+    /// - Tail node (is_tail): input → layers → rmsnorm → lm_head → Logits
+    /// - Full node (is_head + is_tail): TokenIds → everything → Logits
+    ///
+    /// When `profile` is `Some`, per-layer GPU timing is recorded. When `None`,
+    /// no timers are created (zero overhead). NVTX markers are always emitted.
+    pub fn forward_node(
+        &self,
+        input: NodeInput,
+        node_config: &NodeConfig,
+        cache: &mut KvCacheManager,
+        cache_handle: CacheHandle,
+        profile: Option<&mut ForwardProfile>,
+    ) -> Result<NodeOutput> {
         let cfg = &self.weights.config;
-        let seq_len = token_ids.len();
         let hidden = cfg.hidden_size;
         let num_q_heads = cfg.num_q_heads;
         let num_kv_heads = cfg.num_kv_heads;
@@ -104,13 +119,42 @@ impl<B: Backend> Engine<B> {
 
         let profiling = profile.is_some();
 
-        // 1. Embedding lookup
-        let hidden_state = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
-        self.backend
-            .embedding(token_ids, &self.weights.token_embedding, &hidden_state)?;
+        // 1. Resolve input: embedding lookup (head) or use provided activations
+        let (hidden_state, positions, seq_len, owns_hidden) = match input {
+            NodeInput::TokenIds { ids, positions } => {
+                if !node_config.is_head() {
+                    return Err(FractureError::Pipeline(
+                        "non-head node received TokenIds input".into(),
+                    ));
+                }
+                if ids.is_empty() {
+                    return Err(FractureError::InvalidShape(
+                        "token_ids must not be empty".into(),
+                    ));
+                }
+                let seq_len = ids.len();
+                let hidden_state = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+                self.backend
+                    .embedding(&ids, &self.weights.token_embedding, &hidden_state)?;
+                (hidden_state, positions, seq_len, true)
+            }
+            NodeInput::Activations {
+                hidden_states,
+                positions,
+            } => {
+                if node_config.is_head() {
+                    return Err(FractureError::Pipeline(
+                        "head node received Activations input".into(),
+                    ));
+                }
+                let seq_len = positions.len();
+                // hidden_states is owned by the caller (previous node output);
+                // we do NOT free it — we work on it in-place via residual connections.
+                (hidden_states, positions, seq_len, false)
+            }
+        };
 
         // Pre-allocate reusable scratch tensors for the forward pass.
-        // These are reused across layers to avoid repeated alloc/free.
         let normed = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
         let q_flat = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
         let k_flat = self
@@ -136,11 +180,18 @@ impl<B: Backend> Engine<B> {
 
         let mut layer_profiles: Vec<LayerProfile> = Vec::new();
 
-        // 2. Transformer layers
-        for layer_idx in self.layer_range.clone() {
+        // 2. Transformer layers — iterate the node config's range, not the engine's.
+        // The engine's layer_range defines which weights are loaded (weight indexing base),
+        // but the node config controls which layers to actually execute.
+        // weight_idx: index into self.weights.layers (relative to engine's layer_range)
+        // cache_idx: index into the KV cache (relative to the node config's layer_range)
+        let exec_range = &node_config.layer_range;
+        for layer_idx in exec_range.clone() {
+            let weight_idx = layer_idx - self.layer_range.start;
+            let cache_idx = layer_idx - exec_range.start;
             self.backend.marker_push(&format!("layer_{}", layer_idx));
 
-            let w = &self.weights.layers[layer_idx];
+            let w = &self.weights.layers[weight_idx];
 
             // 2a. Pre-attention RMSNorm
             let rmsnorm_attn_ms = timed_op(&self.backend, profiling, || {
@@ -175,13 +226,14 @@ impl<B: Backend> Engine<B> {
             // 2d. Apply RoPE to Q and K
             let rope_ms = timed_op(&self.backend, profiling, || {
                 self.backend
-                    .rope(&q_mh, &k_mh, positions, cfg.rope_theta, head_dim)
+                    .rope(&q_mh, &k_mh, &positions, cfg.rope_theta, head_dim)
             })?;
 
             // 2e-2f. KV cache update + grouped-query attention
-            // Get cache refs before the timed closure to avoid borrow conflicts.
-            let k_cache = cache.k_cache(cache_handle, layer_idx)?;
-            let v_cache = cache.v_cache(cache_handle, layer_idx)?;
+            // cache_idx: cache is allocated for exec_range.len() layers,
+            // so exec_range.start maps to cache slot 0.
+            let k_cache = cache.k_cache(cache_handle, cache_idx)?;
+            let v_cache = cache.v_cache(cache_handle, cache_idx)?;
 
             let new_seq_len = start_pos + seq_len;
 
@@ -206,7 +258,7 @@ impl<B: Backend> Engine<B> {
                 )
             })?;
 
-            // 2g. Output projection (reshape attn_out back to [seq_len, hidden])
+            // 2g. Output projection
             let attn_out_flat = DeviceTensor::new(
                 attn_out_mh.id,
                 vec![seq_len, hidden],
@@ -276,39 +328,10 @@ impl<B: Backend> Engine<B> {
             self.backend.marker_pop();
 
             // Update cached seq_len after first layer processes it
-            // (only update once, not per layer)
-            if layer_idx == self.layer_range.start {
+            if layer_idx == exec_range.start {
                 cache.set_seq_len(cache_handle, new_seq_len)?;
             }
         }
-
-        // 3. Final RMSNorm
-        self.backend
-            .rmsnorm(&hidden_state, &self.weights.output_norm, cfg.rms_norm_eps, &normed)?;
-
-        // 4. LM head: [seq_len, hidden] @ [vocab_size, hidden]^T → [seq_len, vocab_size]
-        // We only need logits for the last token position.
-        // For efficiency, extract the last row and matmul just that.
-        let last_hidden = if seq_len > 1 {
-            let last = self.backend.alloc(&[1, hidden], DType::FP16)?;
-            self.backend
-                .copy_rows(&normed, &last, seq_len - 1, 0, 1)?;
-            last
-        } else {
-            // seq_len == 1 (decode), normed is already [1, hidden]
-            DeviceTensor::new(normed.id, vec![1, hidden], DType::FP16)
-        };
-
-        let logits_tensor = self
-            .backend
-            .alloc(&[1, cfg.vocab_size], DType::FP16)?;
-        self.backend
-            .matmul(&last_hidden, &self.weights.lm_head, &logits_tensor)?;
-
-        // Copy logits to host as FP32
-        let mut logits_fp16 = vec![0u8; cfg.vocab_size * 2]; // FP16 = 2 bytes each
-        self.backend.copy_to_host(&logits_tensor, &mut logits_fp16)?;
-        self.backend.synchronize()?;
 
         // Finalize profiling data.
         if let Some(profile) = profile {
@@ -319,35 +342,77 @@ impl<B: Backend> Engine<B> {
             profile.layer_profiles = layer_profiles;
         }
 
-        // Convert FP16 → FP32 on CPU
-        let logits: Vec<f32> = logits_fp16
-            .chunks_exact(2)
-            .map(|bytes| {
-                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
-                half::f16::from_bits(bits).to_f32()
-            })
-            .collect();
+        // 3. Output phase: tail produces logits, non-tail returns activations
+        if node_config.is_tail() {
+            // Final RMSNorm
+            self.backend
+                .rmsnorm(&hidden_state, &self.weights.output_norm, cfg.rms_norm_eps, &normed)?;
 
-        // Free scratch tensors (but not hidden_state — it aliases normed via reshape)
-        // We need to free only tensors we actually allocated, not reshapes
-        self.backend.free(&hidden_state)?;
-        self.backend.free(&normed)?;
-        self.backend.free(&q_flat)?;
-        self.backend.free(&k_flat)?;
-        self.backend.free(&v_flat)?;
-        self.backend.free(&attn_out_mh)?;
-        self.backend.free(&projected)?;
-        self.backend.free(&gate)?;
-        self.backend.free(&up)?;
-        self.backend.free(&ffn_mid)?;
-        self.backend.free(&ffn_out)?;
-        self.backend.free(&logits_tensor)?;
-        if seq_len > 1 {
-            // last_hidden was a separate allocation
-            self.backend.free(&last_hidden)?;
+            // LM head: extract last position, matmul to vocab
+            let last_hidden = if seq_len > 1 {
+                let last = self.backend.alloc(&[1, hidden], DType::FP16)?;
+                self.backend
+                    .copy_rows(&normed, &last, seq_len - 1, 0, 1)?;
+                last
+            } else {
+                DeviceTensor::new(normed.id, vec![1, hidden], DType::FP16)
+            };
+
+            let logits_tensor = self
+                .backend
+                .alloc(&[1, cfg.vocab_size], DType::FP16)?;
+            self.backend
+                .matmul(&last_hidden, &self.weights.lm_head, &logits_tensor)?;
+
+            // Copy logits to host as FP32
+            let mut logits_fp16 = vec![0u8; cfg.vocab_size * 2];
+            self.backend.copy_to_host(&logits_tensor, &mut logits_fp16)?;
+            self.backend.synchronize()?;
+
+            let logits: Vec<f32> = logits_fp16
+                .chunks_exact(2)
+                .map(|bytes| {
+                    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    half::f16::from_bits(bits).to_f32()
+                })
+                .collect();
+
+            // Free all scratch tensors + hidden_state (we're done with it)
+            if owns_hidden {
+                self.backend.free(&hidden_state)?;
+            }
+            self.backend.free(&normed)?;
+            self.backend.free(&q_flat)?;
+            self.backend.free(&k_flat)?;
+            self.backend.free(&v_flat)?;
+            self.backend.free(&attn_out_mh)?;
+            self.backend.free(&projected)?;
+            self.backend.free(&gate)?;
+            self.backend.free(&up)?;
+            self.backend.free(&ffn_mid)?;
+            self.backend.free(&ffn_out)?;
+            self.backend.free(&logits_tensor)?;
+            if seq_len > 1 {
+                self.backend.free(&last_hidden)?;
+            }
+
+            Ok(NodeOutput::Logits(logits))
+        } else {
+            // Non-tail: return hidden_state as activations for the next node.
+            // Do NOT free hidden_state — it is the output.
+            self.backend.free(&normed)?;
+            self.backend.free(&q_flat)?;
+            self.backend.free(&k_flat)?;
+            self.backend.free(&v_flat)?;
+            self.backend.free(&attn_out_mh)?;
+            self.backend.free(&projected)?;
+            self.backend.free(&gate)?;
+            self.backend.free(&up)?;
+            self.backend.free(&ffn_mid)?;
+            self.backend.free(&ffn_out)?;
+
+            Ok(NodeOutput::Activations(hidden_state))
         }
-
-        Ok(logits)
     }
 }
 
@@ -790,23 +855,97 @@ mod tests {
         }
     }
 
-    /// Verify partial layer range: Engine with layer_range 0..1 out of 2 layers
-    /// should still produce logits (since we have all the global tensors).
+    /// Verify partial layer range (head node): Engine with layer_range 0..1 out of 2 layers
+    /// returns Activations via forward_node() since it's not a tail node.
     #[test]
-    fn test_partial_layer_range() {
+    fn test_partial_layer_range_head_node() {
         let mut cfg = test_config();
-        cfg.num_layers = 2; // model has 2 layers
+        cfg.num_layers = 2;
         let backend = MockBackend::new();
         let weights = mock_weights(&cfg);
-        // Only process layer 0
         let engine = Engine::new(backend, weights, 0..1);
-        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        // Cache for 1 layer (this node's range)
+        let mut cache = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
         let handle = cache.alloc(engine.backend()).unwrap();
 
-        let result = engine.forward(&[1], &[0], &mut cache, handle, None);
-        assert!(result.is_ok(), "partial layer range should succeed: {:?}", result.err());
+        let node_config = NodeConfig::new(0..1, 2).unwrap();
+        assert!(node_config.is_head());
+        assert!(!node_config.is_tail());
 
-        let logits = result.unwrap();
-        assert_eq!(logits.len(), cfg.vocab_size, "should still produce vocab_size logits");
+        let input = NodeInput::TokenIds {
+            ids: vec![1],
+            positions: vec![0],
+        };
+        let result = engine.forward_node(input, &node_config, &mut cache, handle, None);
+        assert!(result.is_ok(), "head node forward should succeed: {:?}", result.err());
+
+        match result.unwrap() {
+            NodeOutput::Activations(tensor) => {
+                assert_eq!(tensor.shape, vec![1, cfg.hidden_size]);
+            }
+            NodeOutput::Logits(_) => panic!("head node should return Activations, not Logits"),
+        }
+    }
+
+    /// Verify non-zero-starting layer range (tail node): Engine with layer_range 1..2 out of 2 layers
+    /// uses local indexing for weights and KV cache and returns Logits.
+    #[test]
+    fn test_nonzero_layer_range_tail_node() {
+        let mut cfg = test_config();
+        cfg.num_layers = 2;
+        let backend = MockBackend::new();
+
+        // Build weights with only 1 layer (representing model layer 1)
+        let h = cfg.hidden_size;
+        let kv = cfg.num_kv_heads * cfg.head_dim;
+        let inter = cfg.intermediate_size;
+        let mut id = 1u64;
+        let mut t = |shape: Vec<usize>| -> DeviceTensor {
+            let t = mock_tensor(id, shape);
+            id += 1;
+            t
+        };
+        let layer = LayerWeights {
+            q_proj: t(vec![h, h]),
+            k_proj: t(vec![kv, h]),
+            v_proj: t(vec![kv, h]),
+            o_proj: t(vec![h, h]),
+            gate_proj: t(vec![inter, h]),
+            up_proj: t(vec![inter, h]),
+            down_proj: t(vec![h, inter]),
+            attn_norm: t(vec![h]),
+            ffn_norm: t(vec![h]),
+        };
+        let weights = WeightStore {
+            config: cfg.clone(),
+            token_embedding: t(vec![cfg.vocab_size, h]),
+            layers: vec![layer],
+            output_norm: t(vec![h]),
+            lm_head: t(vec![cfg.vocab_size, h]),
+        };
+
+        let engine = Engine::new(backend, weights, 1..2);
+        let mut cache = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let node_config = NodeConfig::new(1..2, 2).unwrap();
+        assert!(!node_config.is_head());
+        assert!(node_config.is_tail());
+
+        // Tail node receives activations from the head
+        let fake_hidden = engine.backend().alloc(&[1, cfg.hidden_size], DType::FP16).unwrap();
+        let input = NodeInput::Activations {
+            hidden_states: fake_hidden,
+            positions: vec![0],
+        };
+        let result = engine.forward_node(input, &node_config, &mut cache, handle, None);
+        assert!(result.is_ok(), "tail node forward should succeed: {:?}", result.err());
+
+        match result.unwrap() {
+            NodeOutput::Logits(logits) => {
+                assert_eq!(logits.len(), cfg.vocab_size);
+            }
+            NodeOutput::Activations(_) => panic!("tail node should return Logits, not Activations"),
+        }
     }
 }

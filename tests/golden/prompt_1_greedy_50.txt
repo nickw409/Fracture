@@ -1,0 +1,9 @@
+Write a Python function that sorts a list using merge sort algorithm. The function should take a list of integers as input and return the sorted list.
+
+```python
+def merge_sort(lst):
+    """
+    This function sorts a list of integers using the merge sort algorithm.
+
+    Args:
+        lst (list):
