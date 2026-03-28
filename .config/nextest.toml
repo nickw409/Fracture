@@ -17,3 +17,12 @@ test-group = 'model-validation'
 [[profile.default.overrides]]
 filter = 'test(test_gpu_cache_freed_after_generation) | test(/test_matmul_(prefill_correctness|llama3_ffn_shapes|large_prefill)/)'
 test-group = 'gpu-memory-sensitive'
+
+[test-groups.e2e-distributed]
+# E2E tests spawn coordinator + worker processes that each load the full model.
+# Must run one at a time to avoid GPU OOM and port conflicts.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/test_e2e_/)'
+test-group = 'e2e-distributed'
