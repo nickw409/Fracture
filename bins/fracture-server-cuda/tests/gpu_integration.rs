@@ -7,7 +7,7 @@
 
 use fracture_core::{Backend, DType, ModelConfig};
 use fracture_cuda::CudaBackend;
-use fracture_engine::{Engine, KvCacheManager};
+use fracture_engine::{CacheHandle, Engine, KvCacheManager, NodeConfig};
 use fracture_generate::{GenerationConfig, GenerationLoop};
 use fracture_gguf::{LayerWeights, WeightStore};
 use half::f16;
@@ -394,4 +394,198 @@ fn test_gpu_cache_freed_after_generation() {
         leaked < tolerance,
         "potential GPU memory leak: {leaked} bytes not reclaimed (before={mem_before}, after={mem_after})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Split equivalence tests
+//
+// These use forward_node() on a single engine (single backend, single tensor
+// registry) to manually chain head→tail, then compare against monolithic.
+// ---------------------------------------------------------------------------
+
+/// Helper: run a 2-node split forward on a single engine by calling forward_node()
+/// twice (head config, then tail config) and chaining the activation tensor.
+fn split_forward(
+    engine: &Engine<CudaBackend>,
+    token_ids: &[u32],
+    positions: &[u32],
+    head_config: &NodeConfig,
+    tail_config: &NodeConfig,
+    cache_head: &mut KvCacheManager,
+    handle_head: CacheHandle,
+    cache_tail: &mut KvCacheManager,
+    handle_tail: CacheHandle,
+) -> Vec<f32> {
+    use fracture_engine::{NodeInput, NodeOutput};
+
+    // Head: tokens → activations
+    let head_input = NodeInput::TokenIds {
+        ids: token_ids.to_vec(),
+        positions: positions.to_vec(),
+    };
+    let head_output = engine
+        .forward_node(head_input, head_config, cache_head, handle_head, None)
+        .expect("head forward failed");
+
+    let activation = match head_output {
+        NodeOutput::Activations(t) => t,
+        NodeOutput::Logits(_) => panic!("head should return Activations"),
+    };
+
+    // Tail: activations → logits
+    let tail_input = NodeInput::Activations {
+        hidden_states: activation,
+        positions: positions.to_vec(),
+    };
+    let tail_output = engine
+        .forward_node(tail_input, tail_config, cache_tail, handle_tail, None)
+        .expect("tail forward failed");
+
+    match tail_output {
+        NodeOutput::Logits(logits) => logits,
+        NodeOutput::Activations(_) => panic!("tail should return Logits"),
+    }
+}
+
+fn assert_logits_match(full: &[f32], split: &[f32], label: &str) {
+    assert_eq!(full.len(), split.len(), "{label}: length mismatch");
+    for (i, (a, b)) in full.iter().zip(split.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "{label}: logit mismatch at index {i}: full={a}, split={b} (diff={})",
+            (a - b).abs()
+        );
+    }
+}
+
+/// The critical Phase 2 test: 2-node split produces identical logits to monolithic.
+#[test]
+fn test_gpu_split_equivalence_2node() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+    let head_config = NodeConfig::new(0..1, cfg.num_layers).unwrap();
+    let tail_config = NodeConfig::new(1..2, cfg.num_layers).unwrap();
+
+    // Monolithic
+    let mut cache_full = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hf = cache_full.alloc(engine.backend()).expect("alloc");
+    let logits_full = engine
+        .forward(&[1, 2, 3], &[0, 1, 2], &mut cache_full, hf, None)
+        .expect("monolithic forward");
+
+    // Split
+    let mut cache_head = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let mut cache_tail = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hh = cache_head.alloc(engine.backend()).expect("alloc");
+    let ht = cache_tail.alloc(engine.backend()).expect("alloc");
+
+    let logits_split = split_forward(
+        &engine, &[1, 2, 3], &[0, 1, 2],
+        &head_config, &tail_config,
+        &mut cache_head, hh, &mut cache_tail, ht,
+    );
+
+    assert_logits_match(&logits_full, &logits_split, "prefill");
+}
+
+/// Split equivalence over prefill + 5 decode steps.
+#[test]
+fn test_gpu_split_equivalence_decode() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+    let head_config = NodeConfig::new(0..1, cfg.num_layers).unwrap();
+    let tail_config = NodeConfig::new(1..2, cfg.num_layers).unwrap();
+
+    // Monolithic: prefill + 5 decode
+    let mut cache_full = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hf = cache_full.alloc(engine.backend()).expect("alloc");
+    let logits_prefill_full = engine
+        .forward(&[1, 2, 3], &[0, 1, 2], &mut cache_full, hf, None)
+        .expect("prefill");
+    let mut full_decode = Vec::new();
+    for step in 0..5u32 {
+        full_decode.push(
+            engine.forward(&[42], &[3 + step], &mut cache_full, hf, None).expect("decode"),
+        );
+    }
+
+    // Split: prefill + 5 decode
+    let mut ch = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let mut ct = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hh = ch.alloc(engine.backend()).expect("alloc");
+    let ht = ct.alloc(engine.backend()).expect("alloc");
+
+    let logits_prefill_split = split_forward(
+        &engine, &[1, 2, 3], &[0, 1, 2],
+        &head_config, &tail_config, &mut ch, hh, &mut ct, ht,
+    );
+    assert_logits_match(&logits_prefill_full, &logits_prefill_split, "prefill");
+
+    for step in 0..5u32 {
+        let split = split_forward(
+            &engine, &[42], &[3 + step],
+            &head_config, &tail_config, &mut ch, hh, &mut ct, ht,
+        );
+        assert_logits_match(&full_decode[step as usize], &split, &format!("decode step {step}"));
+    }
+}
+
+/// Asymmetric split on a 4-layer model: [0,1) + [1,4).
+#[test]
+fn test_gpu_split_equivalence_asymmetric() {
+    let cfg = ModelConfig {
+        hidden_size: 64,
+        num_layers: 4,
+        num_q_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 16,
+        intermediate_size: 128,
+        vocab_size: 256,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        max_seq_len: 64,
+    };
+
+    let mut backend = CudaBackend::new(0).expect("backend");
+    backend.precompute_rope_freqs(cfg.head_dim, cfg.rope_theta).expect("rope");
+
+    let token_embedding = alloc_random_tensor(&backend, &[cfg.vocab_size, cfg.hidden_size]).unwrap();
+    let mut layers = Vec::new();
+    for _ in 0..cfg.num_layers {
+        layers.push(LayerWeights {
+            q_proj: alloc_random_tensor(&backend, &[cfg.hidden_size, cfg.hidden_size]).unwrap(),
+            k_proj: alloc_random_tensor(&backend, &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]).unwrap(),
+            v_proj: alloc_random_tensor(&backend, &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]).unwrap(),
+            o_proj: alloc_random_tensor(&backend, &[cfg.hidden_size, cfg.hidden_size]).unwrap(),
+            gate_proj: alloc_random_tensor(&backend, &[cfg.intermediate_size, cfg.hidden_size]).unwrap(),
+            up_proj: alloc_random_tensor(&backend, &[cfg.intermediate_size, cfg.hidden_size]).unwrap(),
+            down_proj: alloc_random_tensor(&backend, &[cfg.hidden_size, cfg.intermediate_size]).unwrap(),
+            attn_norm: alloc_random_tensor(&backend, &[cfg.hidden_size]).unwrap(),
+            ffn_norm: alloc_random_tensor(&backend, &[cfg.hidden_size]).unwrap(),
+        });
+    }
+    let output_norm = alloc_random_tensor(&backend, &[cfg.hidden_size]).unwrap();
+    let lm_head = alloc_random_tensor(&backend, &[cfg.vocab_size, cfg.hidden_size]).unwrap();
+
+    let weights = WeightStore { config: cfg.clone(), token_embedding, layers, output_norm, lm_head };
+    let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+
+    let head_config = NodeConfig::new(0..1, cfg.num_layers).unwrap();
+    let tail_config = NodeConfig::new(1..4, cfg.num_layers).unwrap();
+
+    // Monolithic
+    let mut cache_full = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hf = cache_full.alloc(engine.backend()).expect("alloc");
+    let logits_full = engine.forward(&[10, 20], &[0, 1], &mut cache_full, hf, None).expect("monolithic");
+
+    // Split: [0,1) + [1,4)
+    let mut ch = KvCacheManager::new(1, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let mut ct = KvCacheManager::new(3, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+    let hh = ch.alloc(engine.backend()).expect("alloc");
+    let ht = ct.alloc(engine.backend()).expect("alloc");
+
+    let logits_split = split_forward(
+        &engine, &[10, 20], &[0, 1],
+        &head_config, &tail_config, &mut ch, hh, &mut ct, ht,
+    );
+
+    assert_logits_match(&logits_full, &logits_split, "asymmetric split");
 }

@@ -3,6 +3,17 @@
 # Running more than one in parallel causes OOM on most GPUs.
 max-threads = 1
 
+[test-groups.gpu-memory-sensitive]
+# The cache-freed-after-generation test measures available_memory() and is
+# sensitive to other GPU-heavy tests running concurrently. Only this test
+# and the large matmul tests that could shift the memory baseline need
+# serialization.
+max-threads = 1
+
 [[profile.default.overrides]]
 filter = 'package(fracture-model-validation)'
 test-group = 'model-validation'
+
+[[profile.default.overrides]]
+filter = 'test(test_gpu_cache_freed_after_generation) | test(/test_matmul_(prefill_correctness|llama3_ffn_shapes|large_prefill)/)'
+test-group = 'gpu-memory-sensitive'

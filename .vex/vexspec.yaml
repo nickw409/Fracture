@@ -2,6 +2,8 @@ project: Fracture
 description: |
   Cross-platform GPU-accelerated LLM inference server in Rust with pluggable backends.
   Phase 1: single-node inference for Llama 3 8B via GGUF, served over OpenAI-compatible HTTP API.
+  Phase 2: node abstraction — engine operates on arbitrary layer ranges, accepts/returns activation
+  tensors, enabling pipeline-parallel inference across multiple nodes on one machine.
   CUDA backend initially; engine is backend-agnostic via the Backend trait to support Metal in Phase 5+.
   Testing validates correctness at every layer from individual GPU kernels through end-to-end generation.
 
@@ -127,7 +129,11 @@ sections:
           this is undone so the engine uses standard PyTorch weight ordering).
           Validates tensor byte sizes match expected shape x dtype size.
           Returns WeightStore with all tensors on GPU as FP16.
-          Errors on size mismatches or GPU allocation failures.
+          Supports optional layer_range parameter for selective loading —
+          when provided, only layers in the range are loaded (indexed from 0
+          in the resulting WeightStore). Global tensors (embedding, output_norm,
+          lm_head) are always loaded. Errors on size mismatches or GPU
+          allocation failures.
 
       - name: alignment-handling
         status: implemented
@@ -432,8 +438,10 @@ sections:
         status: implemented
         description: |
           Allocates KV cache for a new sequence. Pre-allocates buffers for
-          max_seq_len tokens across all 32 layers. Returns opaque CacheHandle.
-          Fails with error if GPU memory is insufficient.
+          max_seq_len tokens across num_layers layers (which may be less than
+          the full model when used by a pipeline node with a partial layer
+          range). Returns opaque CacheHandle. Fails with error if GPU memory
+          is insufficient.
 
       - name: cache-append-prefill
         status: implemented
@@ -522,7 +530,33 @@ sections:
           Accepts a layer_range parameter. When range is a subset (e.g. 0..16),
           accepts activation tensor as input and returns activation tensor
           (not logits). When range is 0..32, accepts token IDs and returns logits.
-          This is the Phase 2 hook for distributed inference.
+          Uses two distinct local indices: weight_idx (layer_idx - engine.layer_range.start)
+          for weight store access, and cache_idx (layer_idx - node_config.layer_range.start)
+          for KV cache access. This distinction allows a single full-model engine to
+          serve different node configs (head, tail) while each node's cache is sized
+          only for its own layer range.
+
+      - name: forward-node-dispatch
+        status: implemented
+        description: |
+          forward_node() dispatches based on NodeConfig role:
+          - Head node (is_head): TokenIds -> embedding -> layers -> Activations
+          - Middle node: Activations -> layers -> Activations
+          - Tail node (is_tail): input -> layers -> rmsnorm -> lm_head -> Logits
+          - Full node (is_head + is_tail): TokenIds -> everything -> Logits
+          The existing forward() method is a backward-compatible wrapper that
+          creates a full-range NodeConfig and delegates to forward_node().
+          Returns error if head node receives Activations or non-head receives TokenIds.
+
+      - name: activation-tensor-handoff
+        status: implemented
+        description: |
+          When a non-tail node completes its layer range, it returns the hidden
+          state as NodeOutput::Activations(DeviceTensor). The tensor stays on GPU
+          (no device-to-host copy) for in-process pipeline chaining. The next node
+          receives it as NodeInput::Activations and uses it as its initial hidden
+          state. Scratch tensors are freed; the output hidden state is NOT freed
+          (ownership transfers to the caller).
 
       - name: profiling-dispatch
         status: implemented
@@ -543,6 +577,194 @@ sections:
           the last position's logits. This validates that KV caching produces
           numerically identical results to recomputation. Tested by
           test_gpu_prefill_decode_consistency in GPU integration tests.
+
+  # ============================================================
+  # NODE ABSTRACTION (Phase 2)
+  # ============================================================
+  - name: Node Abstraction
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Phase 2 node abstraction layer. Defines NodeConfig, NodeInput/NodeOutput
+      enums, and the ComputeNode trait that wraps the Engine for pipeline-parallel
+      inference. Each node processes an arbitrary layer range and communicates
+      via activation tensors.
+    shared: [error-handling, backend-agnostic]
+    behaviors:
+      - name: node-config-validation
+        status: implemented
+        description: |
+          NodeConfig validates layer_range is non-empty and does not exceed
+          total_layers. Derives is_head (starts at 0), is_tail (ends at
+          total_layers), and is_full (both) from the range and total layer
+          count, preventing invariant violations from manual boolean fields.
+
+      - name: node-input-output-types
+        status: implemented
+        description: |
+          NodeInput enum: TokenIds (head node, carries ids + positions) or
+          Activations (middle/tail node, carries DeviceTensor + positions).
+          NodeOutput enum: Logits (tail node, host-side Vec<f32>) or
+          Activations (head/middle node, GPU DeviceTensor). Type mismatch
+          (e.g., TokenIds to non-head) returns a Pipeline error.
+
+      - name: compute-node-trait
+        status: implemented
+        description: |
+          ComputeNode trait with forward() and config() methods. Object-safe
+          so PipelineCoordinator can hold Box<dyn ComputeNode>. The concrete
+          ComputeNodeImpl<B: Backend> wraps Engine<B> and erases the backend
+          generic at the trait boundary.
+
+      - name: node-service-trait
+        status: implemented
+        description: |
+          NodeService trait with forward(ForwardRequest) -> Result<ForwardResponse>
+          and info() -> NodeInfo methods. ForwardRequest carries seq_id, NodeInput,
+          and is_prefill hint. ForwardResponse carries seq_id and NodeOutput.
+          NodeInfo reports node_id, layer_range, is_head/is_tail, and GPU memory
+          stats. LocalNodeService<B> provides an in-process implementation backed
+          by ComputeNodeImpl + KvCacheManager. This is the interface that Phase 3's
+          network transport wraps.
+
+  # ============================================================
+  # NODE IPC (Phase 2)
+  # ============================================================
+  - name: Node IPC
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Unix domain socket transport for single-machine multi-process pipeline
+      validation. Provides framed message protocol (length-prefixed bincode),
+      activation tensor serialization (GPU->CPU->bytes->CPU->GPU), and
+      IpcNodeServer/IpcNodeClient that implement the ComputeNode interface
+      over sockets. Phase 3 replaces this with TCP/QUIC networking.
+    shared: [error-handling, backend-agnostic]
+    behaviors:
+      - name: activation-tensor-serialization
+        status: implemented
+        description: |
+          Serializes DeviceTensor as: [4 bytes ndim][4 bytes x ndim shape]
+          [4 bytes dtype tag][N bytes raw data]. Data is copied GPU->host
+          for serialization and host->GPU for deserialization. Roundtrip
+          preserves shape, dtype, and data exactly. Tested with MemBackend
+          that stores tensor data in memory.
+
+      - name: framed-message-protocol
+        status: implemented
+        description: |
+          Messages are length-prefixed (u32 big-endian) bincode payloads.
+          IpcMessage enum carries ForwardRequest (seq_id, positions, token_ids
+          or serialized tensor), ForwardResponse (seq_id, logits or serialized
+          tensor), InfoRequest, and InfoResponse. Roundtrip serialization
+          preserves all fields exactly.
+
+      - name: ipc-node-server
+        status: implemented
+        description: |
+          IpcNodeServer wraps a ComputeNode and KvCacheManager, listens on
+          a Unix socket, and handles ForwardRequest/InfoRequest messages.
+          Manages KV cache per seq_id (allocates on first use). serve()
+          handles multiple connections; serve_one() handles a single
+          connection then returns. Serializes activation outputs and
+          logits back to the client.
+
+      - name: ipc-node-client
+        status: implemented
+        description: |
+          IpcNodeClient implements ComputeNode over a Unix socket connection.
+          Serializes NodeInput (token IDs or activation tensor) into an
+          IpcMessage, sends it to the server, deserializes the response
+          back into NodeOutput. Can be used as a node in PipelineCoordinator,
+          enabling cross-process pipeline splits.
+
+      - name: ipc-split-equivalence
+        status: implemented
+        description: |
+          A 2-node pipeline with the tail node served over a Unix socket
+          produces identical output to an in-process pipeline. Tested with
+          both prefill (3 tokens) and multi-step decode (prefill + 3 decode
+          steps). Validates that the GPU->CPU->socket->CPU->GPU activation
+          transfer path preserves numerical correctness.
+
+  # ============================================================
+  # PIPELINE COORDINATOR (Phase 2)
+  # ============================================================
+  - name: Pipeline Coordinator
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Orchestrates a pipeline of ComputeNodes, chaining activation tensors
+      from head through middle(s) to tail to produce logits from token IDs.
+      Each node has its own KvCacheManager sized for its layer range.
+    shared: [error-handling, backend-agnostic]
+    behaviors:
+      - name: pipeline-validation
+        status: implemented
+        description: |
+          PipelineCoordinator::new() validates: at least one node, first node
+          is head, last node is tail, layer ranges are contiguous (no gaps or
+          overlaps between adjacent nodes). Returns Pipeline error on violation.
+
+      - name: pipeline-forward
+        status: implemented
+        description: |
+          Chains forward passes through all nodes. Carries positions array
+          through unchanged (needed for RoPE at every node). Converts
+          NodeOutput::Activations from one node into NodeInput::Activations
+          for the next. Returns error if an intermediate node produces Logits
+          or the final node produces Activations.
+
+      - name: single-node-equivalence
+        status: implemented
+        description: |
+          A PipelineCoordinator with a single full-range node produces
+          byte-identical output to calling Engine::forward() directly.
+          Validates that the pipeline abstraction introduces no numerical
+          divergence.
+
+      - name: two-node-split
+        status: implemented
+        description: |
+          A 2-node pipeline (e.g. [0,2) + [2,4)) produces valid logits.
+          Each node has its own KvCacheManager with layer count matching
+          its range. Tested with both symmetric and asymmetric splits.
+
+      - name: three-node-split
+        status: implemented
+        description: |
+          A 3-node pipeline (e.g. [0,1) + [1,3) + [3,4)) produces valid
+          logits, validating middle-node activation pass-through.
+
+      - name: multi-step-decode-through-split
+        status: implemented
+        description: |
+          50 consecutive decode steps through a 2-node split pipeline
+          complete without error. Validates that KV cache state is
+          maintained correctly across multiple forward passes with
+          split nodes and that positions advance correctly.
+
+      - name: gpu-split-equivalence
+        status: implemented
+        description: |
+          The critical Phase 2 correctness property: a split pipeline produces
+          numerically identical logits to monolithic execution on real GPU
+          hardware. Tested with CUDA backend using random-weight models:
+          - 2-node symmetric split (prefill): [0,1) + [1,2) on 2-layer model
+          - 2-node split with decode: prefill + 5 decode steps match monolithic
+          - Asymmetric split: [0,1) + [1,4) on 4-layer model
+          Uses forward_node() on a single engine with different NodeConfigs,
+          sharing GPU tensor memory. Logits compared within FP16 tolerance (1e-4).
+
+      - name: pipeline-ipc
+        status: implemented
+        description: |
+          Unix domain socket IPC for multi-process pipeline communication.
+          Activation tensors serialized as [ndim][shape][dtype][raw data]
+          with GPU->CPU->socket->CPU->GPU copy path. IpcNodeClient implements
+          ComputeNode over a socket, so PipelineCoordinator transparently chains
+          in-process and cross-process nodes. Validated: IPC split matches
+          in-process split for prefill and multi-step decode.
 
   # ============================================================
   # SAMPLING

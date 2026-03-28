@@ -37,6 +37,9 @@ pub enum FractureError {
     #[error("server error: {0}")]
     Server(String),
 
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
+
     #[error("unsupported dtype: {0}")]
     UnsupportedDType(String),
 
@@ -87,6 +90,9 @@ mod tests {
 
         let err = FractureError::Server("bind failed".into());
         assert!(err.to_string().contains("bind failed"));
+
+        let err = FractureError::Pipeline("stage 2 failed".into());
+        assert!(err.to_string().contains("stage 2 failed"));
 
         let err = FractureError::UnsupportedDType("Q4_0".into());
         assert!(err.to_string().contains("Q4_0"));
