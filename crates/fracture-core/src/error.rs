@@ -40,6 +40,9 @@ pub enum FractureError {
     #[error("pipeline error: {0}")]
     Pipeline(String),
 
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
     #[error("unsupported dtype: {0}")]
     UnsupportedDType(String),
 
@@ -93,6 +96,9 @@ mod tests {
 
         let err = FractureError::Pipeline("stage 2 failed".into());
         assert!(err.to_string().contains("stage 2 failed"));
+
+        let err = FractureError::Protocol("CRC mismatch".into());
+        assert!(err.to_string().contains("CRC mismatch"));
 
         let err = FractureError::UnsupportedDType("Q4_0".into());
         assert!(err.to_string().contains("Q4_0"));

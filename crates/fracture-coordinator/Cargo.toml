@@ -1,0 +1,14 @@
+[package]
+name = "fracture-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fracture-core = { workspace = true }
+fracture-protocol = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "fracture-worker-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fracture-worker-cuda"
+path = "src/main.rs"
+
+[dependencies]
+fracture-core = { workspace = true }
+fracture-engine = { workspace = true }
+fracture-gguf = { workspace = true }
+fracture-cuda = { workspace = true }
+fracture-protocol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

@@ -919,6 +919,16 @@ sections:
       a blocking task to avoid holding the async runtime.
     shared: [error-handling]
     behaviors:
+      - name: tokenizer-loading
+        status: implemented
+        description: |
+          Loads a HuggingFace tokenizer.json file for BPE tokenization and
+          detokenization. Searches for tokenizer.json in the same directory
+          as the model GGUF file, or accepts an explicit --tokenizer CLI
+          path. Fails with a clear error if no tokenizer is found. The
+          tokenizer file must be placed alongside the model — it is not
+          embedded in the GGUF format.
+
       - name: completions-endpoint
         status: implemented
         description: |
@@ -1047,3 +1057,309 @@ sections:
           associated resources (KV cache). Without this, disconnected clients
           cause the server to generate tokens into the void, wasting GPU
           compute and leaking cache memory.
+
+  # ============================================================
+  # WIRE PROTOCOL (Phase 3)
+  # ============================================================
+  - name: Wire Protocol
+    path: crates/fracture-protocol/src
+    status: implemented
+    description: |
+      Custom binary wire protocol for distributed inference. TCP transport
+      with persistent connections, CRC32C integrity checking, and bincode
+      payload serialization. Supports 10 message types for registration,
+      forward pass, cache management, heartbeat, and error handling.
+    shared: [error-handling]
+    behaviors:
+      - name: frame-encoding
+        status: implemented
+        description: |
+          Encodes/decodes 16-byte frame headers (magic 0x4652, version,
+          message type, sequence ID, payload length) with 4-byte CRC32C
+          trailer. All multi-byte integers are big-endian. Validates magic,
+          version, and payload size limits (256 MB max) on decode. CRC32C
+          is computed over header + payload and verified on receive.
+
+      - name: message-types
+        status: implemented
+        description: |
+          10 message types: Register (0x01), RegisterAck (0x02), Forward
+          (0x03), ForwardResult (0x04), Heartbeat (0x05), HeartbeatAck
+          (0x06), CacheAlloc (0x07), CacheFree (0x08), Shutdown (0x09),
+          Error (0x0A). Each has a corresponding payload struct that
+          round-trips through bincode serialization.
+
+      - name: tensor-wire-format
+        status: implemented
+        description: |
+          Compact tensor serialization format: [2B ndim][4B×ndim shape]
+          [1B dtype][1B compression][4B data_len][raw data]. Supports all
+          DType variants (FP16, FP32, BF16, INT8, INT4). Compression field
+          is reserved (always 0=None in Phase 3). Header encode/decode is
+          independent of GPU — raw tensor data transfer is caller's
+          responsibility.
+
+      - name: framed-connection
+        status: implemented
+        description: |
+          Async TCP connection abstraction using tokio BufReader/BufWriter
+          over split TcpStream halves. Provides send (bincode serialize +
+          frame), send_raw (pre-serialized payload), send_empty (no payload),
+          and recv (frame decode + CRC verify). Handles partial reads via
+          read_exact. Detects closed connections.
+
+      - name: crc-integrity
+        status: implemented
+        description: |
+          CRC32C checksum computed over frame header + payload bytes using
+          hardware-accelerated SSE4.2 instructions (crc32c crate). Verified
+          on every received frame. Corrupted frames produce a Protocol error
+          with the expected vs actual CRC values.
+
+  # ============================================================
+  # SCHEDULER (Phase 3)
+  # ============================================================
+  - name: Scheduler
+    path: crates/fracture-coordinator/src
+    status: implemented
+    description: |
+      Layer assignment scheduler for distributed pipeline-parallel inference.
+      Pure function with no networking or side effects. Takes worker
+      capabilities and model config, returns optimal layer assignments.
+      Three modes: Auto (compute-balanced with slow-node pruning),
+      EqualSplit (for correctness testing), Manual (explicit override).
+    shared: [error-handling]
+    behaviors:
+      - name: scheduler-auto-mode
+        status: implemented
+        description: |
+          Compute-balanced layer assignment. Calculates relative speed from
+          measured decode_ms_per_layer, assigns layers proportional to speed,
+          clamps to memory ceilings (accounting for head/tail overhead),
+          redistributes remainder to fastest nodes. Reports imbalance ratio
+          and identifies bottleneck node.
+
+      - name: scheduler-node-pruning
+        status: implemented
+        description: |
+          Iteratively removes the slowest node if removing it reduces total
+          pipeline latency (including network hop overhead). Keeps slow nodes
+          when their memory is needed to fit the model. Logs exclusion
+          reasons with latency comparisons.
+
+      - name: scheduler-equal-split
+        status: implemented
+        description: |
+          Forces equal layer count per node regardless of compute speed.
+          Distributes remainder layers to nodes with most available memory.
+          Validates each node can hold its assignment within memory ceiling.
+
+      - name: scheduler-manual-mode
+        status: implemented
+        description: |
+          Applies explicit layer range assignments. Validates full coverage
+          of [0, num_layers) with no gaps or overlaps. Validates each node
+          has sufficient memory. Returns error for unknown node IDs.
+
+      - name: scheduler-memory-estimation
+        status: implemented
+        description: |
+          Estimates per-layer memory (weights + KV cache) from ModelConfig.
+          Accounts for head overhead (embedding table ~1 GB) and tail
+          overhead (LM head ~1 GB). Clamps ideal layer counts to what
+          each node can physically hold.
+
+      - name: scheduler-insufficient-capacity
+        status: implemented
+        description: |
+          Returns an error when total cluster memory cannot hold the model
+          at the configured max_seq_len. Error message includes the number
+          of layers that could be assigned vs the total needed.
+
+  # ============================================================
+  # PEER REGISTRY (Phase 3)
+  # ============================================================
+  - name: Peer Registry
+    path: crates/fracture-coordinator/src
+    status: implemented
+    description: |
+      Tracks connected workers: capabilities, connection handles, layer
+      assignments, health state, and heartbeat timestamps.
+    shared: [error-handling]
+    behaviors:
+      - name: worker-registration
+        status: implemented
+        description: |
+          Registers workers with capabilities and connection handle.
+          Rejects duplicate registrations for active workers. Allows
+          re-registration of dead workers (reconnection after failure).
+
+      - name: worker-health-tracking
+        status: implemented
+        description: |
+          Records heartbeat timestamps. check_heartbeats() returns node
+          IDs that have exceeded the timeout. mark_dead() transitions
+          workers to Dead status. Pipeline order only includes Ready
+          workers with assignments.
+
+  # ============================================================
+  # SEQUENCE STATE (Phase 3)
+  # ============================================================
+  - name: Sequence State
+    path: crates/fracture-coordinator/src
+    status: implemented
+    description: |
+      Per-sequence lifecycle tracking: status transitions, position
+      tracking, generated token accumulation, and cache allocation
+      tracking across workers.
+    shared: [error-handling]
+    behaviors:
+      - name: sequence-lifecycle
+        status: implemented
+        description: |
+          Sequences transition: Prefilling → Decoding → Complete/Error.
+          Invalid transitions (e.g., Complete → Decoding) return errors.
+          Tokens can only be recorded in Decoding state. Position advances
+          with each recorded token. Token limit checked via is_at_limit().
+
+      - name: sequence-cache-tracking
+        status: implemented
+        description: |
+          Each sequence records which worker node IDs have active KV cache
+          allocations. Used by the coordinator to send CacheFree messages
+          to all relevant workers when a sequence completes or errors.
+
+  # ============================================================
+  # DISTRIBUTED PIPELINE (Phase 3)
+  # ============================================================
+  - name: Distributed Pipeline
+    path: crates/fracture-coordinator/src
+    status: implemented
+    description: |
+      Orchestrates forward passes across distributed workers. Sends
+      Forward messages sequentially through workers in layer-range order,
+      passing activation tensors through the coordinator between stages.
+    shared: [error-handling]
+    behaviors:
+      - name: pipeline-forward
+        status: implemented
+        description: |
+          Sends token IDs to head worker, chains activation tensors through
+          intermediate workers, returns logits from tail worker. Validates
+          that intermediate workers return activations (not logits) and
+          the tail worker returns logits (not activations).
+
+      - name: distributed-cache-lifecycle
+        status: implemented
+        description: |
+          alloc_cache() sends CacheAlloc to all pipeline workers for a
+          new sequence. free_cache() sends CacheFree to all workers.
+          The coordinator is the single source of truth for cache state.
+
+      - name: pipeline-error-propagation
+        status: implemented
+        description: |
+          If a worker returns an Error message instead of ForwardResult,
+          the pipeline propagates the error with the worker ID and error
+          details. Unexpected message types also produce Protocol errors.
+
+  # ============================================================
+  # WORKER BINARY (Phase 3)
+  # ============================================================
+  - name: Worker Binary
+    path: bins/fracture-worker-cuda/src
+    status: implemented
+    description: |
+      CUDA worker process that connects to coordinator, benchmarks GPU,
+      registers with calibration data, receives layer assignment, loads
+      weights, and serves Forward/Cache/Heartbeat requests.
+    shared: [error-handling]
+    behaviors:
+      - name: worker-calibration
+        status: implemented
+        description: |
+          Runs 20 single-layer forward passes for decode (N=1) and prefill
+          (N=128), discards first 5 (warmup), averages remaining 15. Uses
+          a temporary CudaBackend instance that is dropped after calibration
+          to reclaim GPU memory before loading assigned weights.
+
+      - name: worker-registration-handshake
+        status: implemented
+        description: |
+          Connects to coordinator via TCP, sends Register with node_id,
+          GPU model, memory stats, compute capability, and calibration
+          benchmarks. Waits for RegisterAck with layer assignment and
+          model config. Loads only assigned layer weights from GGUF.
+
+      - name: worker-serve-loop
+        status: implemented
+        description: |
+          Handles Forward (deserialize input, run forward pass, serialize
+          output), CacheAlloc (allocate KV cache for seq_id), CacheFree
+          (free KV cache), Heartbeat (echo with GPU stats), and Shutdown
+          (graceful exit with cache cleanup). Unknown message types return
+          Error with ProtocolViolation code.
+
+  # ============================================================
+  # COORDINATOR BINARY (Phase 3)
+  # ============================================================
+  - name: Coordinator Binary
+    path: bins/fracture-coordinator-cuda/src
+    status: implemented
+    description: |
+      CUDA coordinator process that accepts worker connections, runs the
+      scheduler, assigns layers, builds the distributed pipeline, and
+      manages inference requests. HTTP API integration is pending.
+    shared: [error-handling]
+    behaviors:
+      - name: coordinator-worker-acceptance
+        status: implemented
+        description: |
+          Listens for TCP connections from workers. Reads Register messages,
+          records capabilities in the PeerRegistry, and waits until the
+          expected number of workers have registered before proceeding.
+
+      - name: coordinator-scheduling
+        status: implemented
+        description: |
+          Runs the scheduler with registered worker capabilities and model
+          config. Sends RegisterAck with layer assignments to each worker.
+          Logs scheduler results including per-node assignments, imbalance
+          ratio, bottleneck node, and any excluded nodes.
+
+      - name: coordinator-http-api
+        status: implemented
+        description: |
+          Serves OpenAI-compatible /v1/completions and /health endpoints.
+          Tokenizes prompts, runs async generation through the distributed
+          pipeline (prefill + decode loop with sampling), and returns
+          JSON responses with usage stats. Validates prompt length against
+          max_seq_len. Manages cache lifecycle (alloc before generation,
+          free after, even on error).
+
+      - name: coordinator-shutdown
+        status: implemented
+        description: |
+          On SIGINT/Ctrl-C, sends Shutdown messages to all workers in the
+          pipeline before exiting. Workers respond by freeing all caches
+          and terminating.
+
+  # ============================================================
+  # HEARTBEAT PROTOCOL (Phase 3)
+  # ============================================================
+  - name: Heartbeat Protocol
+    path: crates/fracture-coordinator/src
+    status: implemented
+    description: |
+      Coordinator-side heartbeat monitoring. Sends Heartbeat messages to
+      all ready workers and checks for missed heartbeats to detect failures.
+    shared: [error-handling]
+    behaviors:
+      - name: heartbeat-send-and-check
+        status: implemented
+        description: |
+          send_heartbeats() sends Heartbeat with timestamp and nonce to all
+          ready workers. Returns node IDs of workers that have exceeded the
+          heartbeat timeout. mark_dead_workers() transitions timed-out
+          workers to Dead status. Default interval is 5 seconds, default
+          threshold is 3 missed heartbeats (15 seconds).

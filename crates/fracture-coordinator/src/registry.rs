@@ -1,0 +1,283 @@
+//! Peer registry: tracks connected workers, their capabilities,
+//! layer assignments, health state, and connection handles.
+
+use crate::scheduler::{LayerAssignment, WorkerCapabilities};
+use fracture_core::{FractureError, Result};
+use fracture_protocol::FramedConnection;
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// Health status of a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// Connected but not yet assigned layers.
+    Connected,
+    /// Assigned layers and ready to serve.
+    Ready,
+    /// Missed too many heartbeats.
+    Dead,
+}
+
+/// A registered worker and its associated state.
+pub struct WorkerEntry {
+    pub capabilities: WorkerCapabilities,
+    pub connection: FramedConnection,
+    pub assignment: Option<LayerAssignment>,
+    pub last_heartbeat: Instant,
+    pub status: WorkerStatus,
+}
+
+impl std::fmt::Debug for WorkerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerEntry")
+            .field("node_id", &self.capabilities.node_id)
+            .field("status", &self.status)
+            .field("assignment", &self.assignment)
+            .finish()
+    }
+}
+
+/// Tracks all connected workers.
+pub struct PeerRegistry {
+    workers: HashMap<String, WorkerEntry>,
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeerRegistry {
+    pub fn new() -> Self {
+        Self {
+            workers: HashMap::new(),
+        }
+    }
+
+    /// Register a new worker. Returns error if a worker with the same
+    /// node_id is already registered and not dead.
+    pub fn register(
+        &mut self,
+        capabilities: WorkerCapabilities,
+        connection: FramedConnection,
+    ) -> Result<()> {
+        let node_id = capabilities.node_id.clone();
+
+        if let Some(existing) = self.workers.get(&node_id)
+            && existing.status != WorkerStatus::Dead
+        {
+            return Err(FractureError::Protocol(format!(
+                "worker '{node_id}' is already registered"
+            )));
+        }
+
+        self.workers.insert(
+            node_id,
+            WorkerEntry {
+                capabilities,
+                connection,
+                assignment: None,
+                last_heartbeat: Instant::now(),
+                status: WorkerStatus::Connected,
+            },
+        );
+        Ok(())
+    }
+
+    /// Get a reference to a worker entry.
+    pub fn get(&self, node_id: &str) -> Option<&WorkerEntry> {
+        self.workers.get(node_id)
+    }
+
+    /// Get a mutable reference to a worker entry.
+    pub fn get_mut(&mut self, node_id: &str) -> Option<&mut WorkerEntry> {
+        self.workers.get_mut(node_id)
+    }
+
+    /// Assign layers to a worker and mark it Ready.
+    pub fn assign(&mut self, node_id: &str, assignment: LayerAssignment) -> Result<()> {
+        let entry = self.workers.get_mut(node_id).ok_or_else(|| {
+            FractureError::Protocol(format!("worker '{node_id}' not found"))
+        })?;
+        entry.assignment = Some(assignment);
+        entry.status = WorkerStatus::Ready;
+        Ok(())
+    }
+
+    /// Mark a worker as dead.
+    pub fn mark_dead(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            entry.status = WorkerStatus::Dead;
+        }
+    }
+
+    /// Update a worker's last heartbeat time.
+    pub fn record_heartbeat(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            entry.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// Return all worker capabilities (for scheduler input).
+    pub fn all_capabilities(&self) -> Vec<WorkerCapabilities> {
+        self.workers
+            .values()
+            .filter(|e| e.status != WorkerStatus::Dead)
+            .map(|e| e.capabilities.clone())
+            .collect()
+    }
+
+    /// Return node IDs of all ready workers in pipeline order
+    /// (sorted by layer_range.start).
+    pub fn pipeline_order(&self) -> Vec<String> {
+        let mut ready: Vec<_> = self
+            .workers
+            .values()
+            .filter(|e| e.status == WorkerStatus::Ready && e.assignment.is_some())
+            .collect();
+        ready.sort_by_key(|e| e.assignment.as_ref().unwrap().layer_range.start);
+        ready
+            .into_iter()
+            .map(|e| e.capabilities.node_id.clone())
+            .collect()
+    }
+
+    /// Number of registered (non-dead) workers.
+    pub fn active_count(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|e| e.status != WorkerStatus::Dead)
+            .count()
+    }
+
+    /// Check all workers for missed heartbeats. Returns node IDs of
+    /// workers that have exceeded the timeout.
+    pub fn check_heartbeats(&self, timeout: std::time::Duration) -> Vec<String> {
+        let now = Instant::now();
+        self.workers
+            .values()
+            .filter(|e| e.status == WorkerStatus::Ready)
+            .filter(|e| now.duration_since(e.last_heartbeat) > timeout)
+            .map(|e| e.capabilities.node_id.clone())
+            .collect()
+    }
+
+    /// Iterate over mutable entries (for sending messages to all workers).
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut WorkerEntry)> {
+        self.workers.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::NodeRole;
+    use tokio::net::TcpListener;
+
+    fn test_caps(id: &str) -> WorkerCapabilities {
+        WorkerCapabilities {
+            node_id: id.into(),
+            gpu_model: "Test".into(),
+            gpu_memory_available: 24_000_000_000,
+            compute_capability: (8, 0),
+            decode_ms_per_layer: 1.0,
+            prefill_ms_per_layer_128: 3.0,
+        }
+    }
+
+    async fn dummy_connection() -> FramedConnection {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, _server) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        FramedConnection::new(client.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_register_and_get() {
+        let mut reg = PeerRegistry::new();
+        let conn = dummy_connection().await;
+        reg.register(test_caps("w1"), conn).unwrap();
+
+        assert_eq!(reg.active_count(), 1);
+        let entry = reg.get("w1").unwrap();
+        assert_eq!(entry.status, WorkerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_register_fails() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        assert!(reg.register(test_caps("w1"), dummy_connection().await).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dead_worker_can_reregister() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.mark_dead("w1");
+        assert!(reg.register(test_caps("w1"), dummy_connection().await).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_assign_and_pipeline_order() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("b"), dummy_connection().await).unwrap();
+        reg.register(test_caps("a"), dummy_connection().await).unwrap();
+
+        reg.assign(
+            "a",
+            LayerAssignment {
+                node_id: "a".into(),
+                layer_range: 0..16,
+                role: NodeRole::Head,
+                expected_decode_ms: 16.0,
+                weight_memory_gb: 6.0,
+                cache_memory_gb: 1.0,
+            },
+        )
+        .unwrap();
+        reg.assign(
+            "b",
+            LayerAssignment {
+                node_id: "b".into(),
+                layer_range: 16..32,
+                role: NodeRole::Tail,
+                expected_decode_ms: 16.0,
+                weight_memory_gb: 6.0,
+                cache_memory_gb: 1.0,
+            },
+        )
+        .unwrap();
+
+        let order = reg.pipeline_order();
+        assert_eq!(order, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_check() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign(
+            "w1",
+            LayerAssignment {
+                node_id: "w1".into(),
+                layer_range: 0..32,
+                role: NodeRole::Head,
+                expected_decode_ms: 32.0,
+                weight_memory_gb: 12.0,
+                cache_memory_gb: 2.0,
+            },
+        )
+        .unwrap();
+
+        // Just registered — should not be timed out with a 15s timeout
+        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(15));
+        assert!(timed_out.is_empty());
+
+        // With zero timeout, should immediately be detected
+        let timed_out = reg.check_heartbeats(std::time::Duration::ZERO);
+        assert_eq!(timed_out, vec!["w1"]);
+    }
+}

@@ -6,8 +6,12 @@ members = [
     "crates/fracture-generate",
     "crates/fracture-server",
     "crates/fracture-gguf",
+    "crates/fracture-protocol",
+    "crates/fracture-coordinator",
     "backends/fracture-cuda",
     "bins/fracture-server-cuda",
+    "bins/fracture-worker-cuda",
+    "bins/fracture-coordinator-cuda",
     "tests/validation",
     "tests/model-validation",
 ]
@@ -25,6 +29,8 @@ fracture-generate = { path = "crates/fracture-generate" }
 fracture-server = { path = "crates/fracture-server" }
 fracture-gguf = { path = "crates/fracture-gguf" }
 fracture-cuda = { path = "backends/fracture-cuda" }
+fracture-protocol = { path = "crates/fracture-protocol" }
+fracture-coordinator = { path = "crates/fracture-coordinator" }
 fracture-validation = { path = "tests/validation" }
 
 # Async runtime
@@ -60,3 +66,4 @@ async-stream = "0.3"
 futures-core = "0.3"
 tempfile = "3"
 http-body-util = "0.1"
+crc32c = "0.6"
