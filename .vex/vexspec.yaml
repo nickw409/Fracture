@@ -1283,6 +1283,14 @@ sections:
           a temporary CudaBackend instance that is dropped after calibration
           to reclaim GPU memory before loading assigned weights.
 
+      - name: worker-calibration-plausibility
+        status: not-tested
+        description: |
+          Validates that calibration benchmark results are plausible:
+          decode_ms_per_layer and prefill_ms_per_layer are not zero, not
+          negative, and not absurdly large (e.g. > 1000 ms). Implausible
+          values indicate a broken benchmark or misconfigured GPU.
+
       - name: worker-registration-handshake
         status: implemented
         description: |
@@ -1309,7 +1317,7 @@ sections:
     description: |
       CUDA coordinator process that accepts worker connections, runs the
       scheduler, assigns layers, builds the distributed pipeline, and
-      manages inference requests. HTTP API integration is pending.
+      serves an OpenAI-compatible HTTP API with async distributed generation.
     shared: [error-handling]
     behaviors:
       - name: coordinator-worker-acceptance
@@ -1363,3 +1371,53 @@ sections:
           heartbeat timeout. mark_dead_workers() transitions timed-out
           workers to Dead status. Default interval is 5 seconds, default
           threshold is 3 missed heartbeats (15 seconds).
+
+  # ============================================================
+  # END-TO-END VALIDATION (Phase 3)
+  # ============================================================
+  - name: Distributed Inference Validation
+    path: scripts
+    status: implemented
+    description: |
+      End-to-end validation of distributed inference across machines.
+      Covers the Phase 3 success criteria from the architecture document.
+    behaviors:
+      - name: cross-machine-inference
+        status: implemented
+        description: |
+          Two physical machines collaboratively run Llama 3 8B inference.
+          Coordinator on one machine sends Forward messages over TCP to a
+          worker on a different machine. Validated with RTX 5090 (coordinator)
+          and RTX 3090 over WSL (worker) on a local network.
+
+      - name: greedy-output-equivalence
+        status: implemented
+        description: |
+          Greedy generation (temperature=0) through the distributed pipeline
+          produces the same output as single-node Phase 1 inference.
+          Validated: "The capital of France is" → "Paris. The capital of
+          France is Paris..." — identical across local and distributed.
+
+      - name: long-generation-stability
+        status: not-tested
+        description: |
+          1000-token generation completes without errors, numerical drift,
+          or memory leaks. Validates that KV cache state is maintained
+          correctly across many decode steps through the network pipeline.
+          Requires dedicated test run with memory monitoring.
+
+      - name: network-failure-detection
+        status: not-tested
+        description: |
+          When a worker becomes unreachable (network interruption or process
+          death), the coordinator detects the failure within 15 seconds via
+          the heartbeat protocol. Active sequences on the failed worker are
+          aborted. Requires simulated network failure test.
+
+      - name: pipeline-setup-latency
+        status: implemented
+        description: |
+          Worker registration, calibration benchmark, layer assignment, and
+          pipeline setup complete in under 30 seconds. Observed: calibration
+          ~0.4s (5090), ~2s (3090 WSL), registration handshake <1ms,
+          weight loading ~1.5s. Total well under 30s threshold.

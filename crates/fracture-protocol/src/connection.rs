@@ -311,4 +311,71 @@ mod tests {
         let result = server.recv().await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_send_raw_with_pre_serialized_payload() {
+        let (client_stream, server_stream) = tcp_pair().await;
+        let mut client = FramedConnection::new(client_stream);
+        let mut server = FramedConnection::new(server_stream);
+
+        // Pre-serialize a payload manually
+        let payload = HeartbeatPayload {
+            timestamp_ns: 42,
+            nonce: 7,
+        };
+        let raw = bincode::serialize(&payload).unwrap();
+        client
+            .send_raw(MessageType::Heartbeat, 0, &raw)
+            .await
+            .unwrap();
+
+        let (header, data) = server.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::Heartbeat);
+        let decoded: HeartbeatPayload = FramedConnection::deserialize_payload(&data).unwrap();
+        assert_eq!(decoded.timestamp_ns, 42);
+        assert_eq!(decoded.nonce, 7);
+    }
+
+    #[tokio::test]
+    async fn test_forward_result_activations_roundtrip() {
+        let (client_stream, server_stream) = tcp_pair().await;
+        let mut client = FramedConnection::new(client_stream);
+        let mut server = FramedConnection::new(server_stream);
+
+        let tensor_data = vec![0xAB; 4096 * 2]; // [1, 4096] FP16
+        let payload = ForwardResultPayload {
+            output: ForwardOutputWire::Activations {
+                tensor_header: crate::tensor::TensorWireHeader {
+                    ndim: 2,
+                    shape: vec![1, 4096],
+                    dtype: 0,
+                    compression: 0,
+                    data_len: 4096 * 2,
+                },
+                tensor_data: tensor_data.clone(),
+            },
+        };
+
+        client
+            .send(MessageType::ForwardResult, 55, &payload)
+            .await
+            .unwrap();
+
+        let (header, data) = server.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::ForwardResult);
+        assert_eq!(header.seq_id, 55);
+
+        let decoded: ForwardResultPayload = FramedConnection::deserialize_payload(&data).unwrap();
+        match decoded.output {
+            ForwardOutputWire::Activations {
+                tensor_header,
+                tensor_data: data,
+            } => {
+                assert_eq!(tensor_header.shape, vec![1, 4096]);
+                assert_eq!(tensor_header.dtype, 0);
+                assert_eq!(data, tensor_data);
+            }
+            _ => panic!("expected Activations"),
+        }
+    }
 }

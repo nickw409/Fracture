@@ -280,4 +280,68 @@ mod tests {
         let timed_out = reg.check_heartbeats(std::time::Duration::ZERO);
         assert_eq!(timed_out, vec!["w1"]);
     }
+
+    #[tokio::test]
+    async fn test_mark_dead_sets_status() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.mark_dead("w1");
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Dead);
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_excludes_from_pipeline_order() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        let assign = |id: &str, start: usize, end: usize| LayerAssignment {
+            node_id: id.into(),
+            layer_range: start..end,
+            role: if start == 0 { NodeRole::Head } else { NodeRole::Tail },
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        };
+        reg.assign("w1", assign("w1", 0, 16)).unwrap();
+        reg.assign("w2", assign("w2", 16, 32)).unwrap();
+
+        assert_eq!(reg.pipeline_order().len(), 2);
+
+        reg.mark_dead("w1");
+        let order = reg.pipeline_order();
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0], "w2");
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_excludes_from_active_count() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        assert_eq!(reg.active_count(), 1);
+
+        reg.mark_dead("w1");
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_record_heartbeat_updates_timestamp() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign(
+            "w1",
+            LayerAssignment {
+                node_id: "w1".into(), layer_range: 0..32, role: NodeRole::Head,
+                expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+            },
+        ).unwrap();
+
+        // Should be timed out with zero timeout
+        assert!(!reg.check_heartbeats(std::time::Duration::ZERO).is_empty());
+
+        // Record heartbeat, then check with a generous timeout — should pass
+        reg.record_heartbeat("w1");
+        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(60));
+        assert!(timed_out.is_empty());
+    }
 }

@@ -255,4 +255,48 @@ mod tests {
         let id2 = mgr.create(10, 100, vec![]);
         assert_eq!(id2, id1 + 1);
     }
+
+    #[test]
+    fn test_cannot_record_token_while_complete() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.begin_decoding(id).unwrap();
+        mgr.complete(id).unwrap();
+        assert!(mgr.record_token(id, 42).is_err());
+    }
+
+    #[test]
+    fn test_cannot_record_token_while_error() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.mark_error(id).unwrap();
+        assert!(mgr.record_token(id, 42).is_err());
+    }
+
+    #[test]
+    fn test_invalid_transition_decode_from_error() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.mark_error(id).unwrap();
+        assert!(mgr.begin_decoding(id).is_err());
+    }
+
+    #[test]
+    fn test_invalid_transition_decode_from_decoding() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.begin_decoding(id).unwrap();
+        assert!(mgr.begin_decoding(id).is_err());
+    }
+
+    #[test]
+    fn test_cache_allocated_on_preserved() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec!["node-a".into(), "node-b".into()]);
+        mgr.begin_decoding(id).unwrap();
+        mgr.complete(id).unwrap();
+        // cache_allocated_on should still be accessible after completion
+        let seq = mgr.get(id).unwrap();
+        assert_eq!(seq.cache_allocated_on, vec!["node-a", "node-b"]);
+    }
 }

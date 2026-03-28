@@ -291,4 +291,35 @@ mod tests {
         let expected_crc = u32::from_be_bytes(crc_bytes);
         verify_crc(&frame[..HEADER_SIZE], expected_crc).unwrap();
     }
+
+    #[test]
+    fn test_header_big_endian_byte_layout() {
+        let header = FrameHeader {
+            msg_type: MessageType::Forward,
+            seq_id: 0x0102030405060708,
+            payload_len: 0x00010002,
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        encode_header(&header, &mut buf);
+
+        // Magic
+        assert_eq!(buf[0], 0x46);
+        assert_eq!(buf[1], 0x52);
+        // Version
+        assert_eq!(buf[2], 0x01);
+        // Message type
+        assert_eq!(buf[3], 0x03); // Forward = 0x03
+        // Seq ID (big-endian u64)
+        assert_eq!(&buf[4..12], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        // Payload length (big-endian u32)
+        assert_eq!(&buf[12..16], &[0x00, 0x01, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn test_crc_error_includes_values() {
+        let result = verify_crc(&[0, 1, 2, 3], 0xDEADBEEF);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("DEADBEEF"), "should show expected CRC: {msg}");
+    }
 }

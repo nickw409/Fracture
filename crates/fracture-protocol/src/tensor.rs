@@ -211,4 +211,36 @@ mod tests {
         assert_eq!(h.compression, 0);
         assert_eq!(h.data_len, 512 * 4096 * 2);
     }
+
+    #[test]
+    fn test_unsupported_compression_rejected() {
+        let mut header = make_header(&[1, 4096], DType::FP16, 8192);
+        header.compression = 1; // LZ4 — not supported in Phase 3
+        let mut bytes = encode_tensor_header(&header);
+        // Manually set compression byte to 1
+        // ndim(2) + shape(8) = 10 bytes, then dtype(1), then compression at offset 11
+        let result = decode_tensor_header(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("compression"));
+    }
+
+    #[test]
+    fn test_tensor_header_big_endian_layout() {
+        let header = make_header(&[256, 4096], DType::FP32, 0x00ABCDEF);
+        let bytes = encode_tensor_header(&header);
+
+        // ndim = 2 (big-endian u16)
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x02);
+        // shape[0] = 256 (big-endian u32)
+        assert_eq!(&bytes[2..6], &[0x00, 0x00, 0x01, 0x00]);
+        // shape[1] = 4096 (big-endian u32)
+        assert_eq!(&bytes[6..10], &[0x00, 0x00, 0x10, 0x00]);
+        // dtype = 1 (FP32)
+        assert_eq!(bytes[10], 0x01);
+        // compression = 0
+        assert_eq!(bytes[11], 0x00);
+        // data_len = 0x00ABCDEF (big-endian u32)
+        assert_eq!(&bytes[12..16], &[0x00, 0xAB, 0xCD, 0xEF]);
+    }
 }

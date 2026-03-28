@@ -423,3 +423,334 @@ async fn test_three_node_pipeline() {
         .await
         .unwrap();
 }
+
+// ── Error path tests ────────────────────────────────────────────────────
+
+/// Spawn a mock worker that returns an Error message on Forward.
+async fn spawn_error_worker(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::OutOfMemory,
+                        message: "GPU OOM during forward pass".into(),
+                    };
+                    conn.send(MessageType::Error, header.seq_id, &err)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Spawn a mock worker that returns the wrong output type.
+async fn spawn_wrong_output_worker(
+    listener: TcpListener,
+    return_logits: bool,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    let result = if return_logits {
+                        let data: Vec<u8> = (0..vocab_size)
+                            .flat_map(|i| (i as f32).to_le_bytes())
+                            .collect();
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Logits { data },
+                        }
+                    } else {
+                        let data_len = hidden_size * 2;
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Activations {
+                                tensor_header: TensorWireHeader {
+                                    ndim: 2,
+                                    shape: vec![1, hidden_size as u32],
+                                    dtype: 0,
+                                    compression: 0,
+                                    data_len: data_len as u32,
+                                },
+                                tensor_data: vec![0u8; data_len],
+                            },
+                        }
+                    };
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+fn make_caps(id: &str) -> fracture_coordinator::scheduler::WorkerCapabilities {
+    fracture_coordinator::scheduler::WorkerCapabilities {
+        node_id: id.into(),
+        gpu_model: "Mock".into(),
+        gpu_memory_available: 24_000_000_000,
+        compute_capability: (8, 0),
+        decode_ms_per_layer: 1.0,
+        prefill_ms_per_layer_128: 3.0,
+    }
+}
+
+#[tokio::test]
+async fn test_worker_error_propagates() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_error_worker(listener).await;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("err-worker"), conn).unwrap();
+
+    let assignment = LayerAssignment {
+        node_id: "err-worker".into(),
+        layer_range: 0..32,
+        role: NodeRole::Head,
+        expected_decode_ms: 32.0,
+        weight_memory_gb: 12.0,
+        cache_memory_gb: 2.0,
+    };
+    registry.assign("err-worker", assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+
+    let result = pipeline.forward(&mut registry, 1, &[1, 2], &[0, 1], true).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("GPU OOM"), "error should contain OOM: {err_msg}");
+}
+
+#[tokio::test]
+async fn test_non_tail_returning_logits_is_error() {
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    // Head returns logits (wrong)
+    let _h = spawn_wrong_output_worker(head_listener, true, hidden_size, vocab_size).await;
+    let _t = spawn_mock_worker(tail_listener, true, hidden_size, vocab_size).await;
+
+    let head_conn = FramedConnection::new(tokio::net::TcpStream::connect(head_addr).await.unwrap());
+    let tail_conn = FramedConnection::new(tokio::net::TcpStream::connect(tail_addr).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("head"), head_conn).unwrap();
+    registry.register(make_caps("tail"), tail_conn).unwrap();
+
+    let assignments = vec![
+        LayerAssignment { node_id: "head".into(), layer_range: 0..16, role: NodeRole::Head, expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0 },
+        LayerAssignment { node_id: "tail".into(), layer_range: 16..32, role: NodeRole::Tail, expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0 },
+    ];
+    for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
+
+    let pipeline = DistributedPipeline::new(&assignments).unwrap();
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+
+    let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("non-tail"));
+}
+
+#[tokio::test]
+async fn test_tail_returning_activations_is_error() {
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Tail returns activations (wrong)
+    let _t = spawn_wrong_output_worker(listener, false, hidden_size, vocab_size).await;
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("tail"), conn).unwrap();
+
+    let assignment = LayerAssignment { node_id: "tail".into(), layer_range: 0..32, role: NodeRole::Tail, expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0 };
+    registry.assign("tail", assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[assignment]).unwrap();
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+
+    let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("tail"));
+}
+
+// ── Heartbeat integration test ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_heartbeat_round_trip() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::Heartbeat);
+
+        let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+        let ack = HeartbeatAckPayload {
+            timestamp_echo: hb.timestamp_ns,
+            nonce_echo: hb.nonce,
+            gpu_memory_used: 8_000_000_000,
+            active_sequences: 2,
+        };
+        conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("hb-worker"), conn).unwrap();
+    let assignment = LayerAssignment { node_id: "hb-worker".into(), layer_range: 0..32, role: NodeRole::Head, expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0 };
+    registry.assign("hb-worker", assignment).unwrap();
+
+    let hb = HeartbeatPayload { timestamp_ns: 1234567890, nonce: 42 };
+    let entry = registry.get_mut("hb-worker").unwrap();
+    entry.connection.send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+
+    let (header, payload) = entry.connection.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::HeartbeatAck);
+    let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(ack.timestamp_echo, 1234567890);
+    assert_eq!(ack.nonce_echo, 42);
+    assert_eq!(ack.gpu_memory_used, 8_000_000_000);
+    assert_eq!(ack.active_sequences, 2);
+
+    worker.await.unwrap();
+}
+
+// ── Worker serve loop protocol tests ────────────────────────────────────
+
+async fn spawn_protocol_worker(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let mut cache_count: u32 = 0;
+
+        loop {
+            let (header, payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            match header.msg_type {
+                MessageType::CacheAlloc => { cache_count += 1; }
+                MessageType::CacheFree => { cache_count = cache_count.saturating_sub(1); }
+                MessageType::Heartbeat => {
+                    let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+                    let ack = HeartbeatAckPayload {
+                        timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
+                        gpu_memory_used: 0, active_sequences: cache_count,
+                    };
+                    conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::ProtocolViolation,
+                        message: format!("unexpected: {:?}", header.msg_type),
+                    };
+                    conn.send(MessageType::Error, header.seq_id, &err).await.unwrap();
+                }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_worker_cache_alloc_free_via_protocol() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_protocol_worker(listener).await;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Alloc 3 caches
+    for seq_id in 1..=3u64 {
+        conn.send(MessageType::CacheAlloc, seq_id, &CacheAllocPayload { max_seq_len: 4096 }).await.unwrap();
+    }
+
+    // Heartbeat to verify count
+    conn.send(MessageType::Heartbeat, 0, &HeartbeatPayload { timestamp_ns: 0, nonce: 1 }).await.unwrap();
+    let (_, payload) = conn.recv().await.unwrap();
+    let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(ack.active_sequences, 3);
+
+    // Free 2
+    conn.send_empty(MessageType::CacheFree, 1).await.unwrap();
+    conn.send_empty(MessageType::CacheFree, 2).await.unwrap();
+
+    // Verify count again
+    conn.send(MessageType::Heartbeat, 0, &HeartbeatPayload { timestamp_ns: 0, nonce: 2 }).await.unwrap();
+    let (_, payload) = conn.recv().await.unwrap();
+    let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(ack.active_sequences, 1);
+
+    conn.send_empty(MessageType::Shutdown, 0).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_worker_unknown_message_returns_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _task = spawn_protocol_worker(listener).await;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Send RegisterAck (unexpected for a worker)
+    let ack_payload = RegisterAckPayload {
+        layer_start: 0, layer_end: 32, total_layers: 32, max_seq_len: 4096,
+        model_config: fracture_core::ModelConfig {
+            hidden_size: 4096, num_layers: 32, num_q_heads: 32, num_kv_heads: 8,
+            head_dim: 128, intermediate_size: 14336, vocab_size: 128256,
+            rope_theta: 500000.0, rms_norm_eps: 1e-5, max_seq_len: 8192,
+        },
+    };
+    conn.send(MessageType::RegisterAck, 0, &ack_payload).await.unwrap();
+
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::Error);
+    let err: ErrorPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(err.error_code, ErrorCode::ProtocolViolation);
+
+    conn.send_empty(MessageType::Shutdown, 0).await.unwrap();
+}

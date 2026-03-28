@@ -1030,4 +1030,162 @@ mod tests {
         assert_eq!(result.assignments[1].role, NodeRole::Middle);
         assert_eq!(result.assignments[2].role, NodeRole::Tail);
     }
+
+    #[test]
+    fn test_pruning_exclusion_reason_has_latency_values() {
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("fast1", 30.0, 0.5),
+                worker("fast2", 30.0, 0.5),
+                worker("turtle", 22.0, 10.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        assert_eq!(result.excluded_nodes.len(), 1);
+        match &result.excluded_nodes[0].reason {
+            ExclusionReason::SlowsDownPipeline {
+                latency_with_ms,
+                latency_without_ms,
+            } => {
+                assert!(*latency_with_ms > 0.0);
+                assert!(*latency_without_ms > 0.0);
+                assert!(latency_without_ms < latency_with_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn test_equal_split_remainder_goes_to_largest_memory() {
+        // 32 layers / 3 = 10 each + 2 remainder
+        // Node "big" has most memory, should get a remainder layer
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("small", 20.0, 1.0),
+                worker("big", 30.0, 1.0),
+                worker("medium", 25.0, 1.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        // "big" (30 GB) should have 11 layers (got a remainder)
+        let big = result.assignments.iter().find(|a| a.node_id == "big").unwrap();
+        assert_eq!(big.layer_range.len(), 11);
+    }
+
+    #[test]
+    fn test_equal_split_memory_too_small_fails() {
+        let per_layer = weight_memory_per_layer(&llama_8b_config())
+            + cache_memory_per_layer(&llama_8b_config(), 4096);
+        // Node can hold only 5 layers but equal split wants 16
+        let tiny_mem = (per_layer * 5 + head_overhead(&llama_8b_config())) as f64 / 1e9;
+
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("small", tiny_mem, 1.0), worker("big", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot hold"));
+    }
+
+    #[test]
+    fn test_manual_mode_memory_too_small_fails() {
+        let per_layer = weight_memory_per_layer(&llama_8b_config())
+            + cache_memory_per_layer(&llama_8b_config(), 4096);
+        let tiny_mem = (per_layer * 5 + head_overhead(&llama_8b_config())) as f64 / 1e9;
+
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("small", tiny_mem, 1.0), worker("big", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Manual(vec![
+                ManualAssignment { node_id: "small".into(), layer_range: 0..20 },
+                ManualAssignment { node_id: "big".into(), layer_range: 20..32 },
+            ]),
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot hold"));
+    }
+
+    #[test]
+    fn test_memory_estimation_sanity() {
+        let config = llama_8b_config();
+        let w_per_layer = weight_memory_per_layer(&config);
+        let c_per_layer = cache_memory_per_layer(&config, 4096);
+        let h_overhead = head_overhead(&config);
+        let t_overhead = tail_overhead(&config);
+
+        // Llama 8B: ~440 MB per layer weights (FP16)
+        assert!(w_per_layer > 400_000_000, "weight/layer too small: {w_per_layer}");
+        assert!(w_per_layer < 500_000_000, "weight/layer too large: {w_per_layer}");
+
+        // KV cache at 4096 seq len: ~8 MB per layer
+        assert!(c_per_layer > 4_000_000, "cache/layer too small: {c_per_layer}");
+        assert!(c_per_layer < 20_000_000, "cache/layer too large: {c_per_layer}");
+
+        // Head overhead: embedding table ~1 GB
+        assert!(h_overhead > 500_000_000, "head overhead too small: {h_overhead}");
+        assert!(h_overhead < 2_000_000_000, "head overhead too large: {h_overhead}");
+
+        // Tail overhead: LM head ~1 GB + norm
+        assert!(t_overhead > 500_000_000, "tail overhead too small: {t_overhead}");
+        assert!(t_overhead < 2_000_000_000, "tail overhead too large: {t_overhead}");
+    }
+
+    #[test]
+    fn test_insufficient_capacity_error_message() {
+        let per_layer = weight_memory_per_layer(&llama_8b_config())
+            + cache_memory_per_layer(&llama_8b_config(), 4096);
+        let tiny_mem = (per_layer * 5) as f64 / 1e9;
+
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("a", tiny_mem, 1.0), worker("b", tiny_mem, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let err = schedule(&input).unwrap_err().to_string();
+        assert!(
+            err.contains("capacity") || err.contains("layers"),
+            "error should mention capacity: {err}"
+        );
+    }
+
+    #[test]
+    fn test_weight_and_cache_memory_in_result() {
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("a", 22.0, 1.0), worker("b", 22.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        for a in &result.assignments {
+            assert!(a.weight_memory_gb > 0.0, "weight_memory_gb should be positive");
+            assert!(a.cache_memory_gb > 0.0, "cache_memory_gb should be positive");
+        }
+    }
 }
