@@ -240,15 +240,18 @@ impl Backend for CudaBackend {
 
     fn matmul(&self, a: &DeviceTensor, b: &DeviceTensor, out: &DeviceTensor) -> Result<()> {
         nvtx::range_push("matmul");
-        // A is [M, K], B is [K, N], C is [M, N] — all row-major.
-        // cuBLAS expects column-major. The transpose trick:
-        //   In column-major, row-major A is A^T, row-major B is B^T.
-        //   We want C = A @ B in row-major.
-        //   Column-major: C^T = B^T @ A^T
-        //   So we call cublasGemmEx(N, N, N, M, ...) with B as first arg, A as second.
+        // C = A @ B^T  where A is [M, K], B is [N, K], C is [M, N].
+        // GGUF weight matrices are stored as [N, K] (output features × input features),
+        // matching PyTorch nn.Linear convention: y = x @ W^T.
+        //
+        // cuBLAS column-major trick:
+        //   Row-major X appears as X^T in column-major.
+        //   We want C = A @ B^T in row-major.
+        //   Column-major: C^T = B @ A^T  (B transposed becomes un-transposed, A stays transposed)
+        //   So: cublasGemmEx(N, N, ...) with B first, A second, N = b.shape[0].
         let m = a.shape[0] as c_int; // rows of A / rows of C
-        let k = a.shape[1] as c_int;
-        let n = b.shape[1] as c_int; // cols of B / cols of C
+        let k = a.shape[1] as c_int; // shared dimension (input features)
+        let n = b.shape[0] as c_int; // rows of B = output features = cols of C
 
         let a_ptr = self.get_ptr(a.id)?;
         let b_ptr = self.get_ptr(b.id)?;
@@ -257,24 +260,27 @@ impl Backend for CudaBackend {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
 
+        // Column-major layout: B[N,K] in row-major = B^T[K,N] in col-major.
+        // We call OP_T on B to get B^T^T = B, so the effective col-major op is
+        // C^T = B @ A^T, giving C = A @ B^T in row-major.
         cublas_check!(cublasGemmEx(
             self.cublas_handle,
-            cublasOperation_t::CUBLAS_OP_N, // B^T treated as non-transposed in col-major
-            cublasOperation_t::CUBLAS_OP_N, // A^T treated as non-transposed in col-major
-            n,                               // rows of op(B^T) in col-major = N
-            m,                               // cols of op(A^T) in col-major = M
-            k,                               // shared dimension
+            cublasOperation_t::CUBLAS_OP_T,  // transpose B in col-major view
+            cublasOperation_t::CUBLAS_OP_N,  // A^T in col-major = A non-transposed
+            n,                                // rows of op(B) = N (output features)
+            m,                                // cols of op(A^T) = M (batch/seq)
+            k,                                // shared dimension (input features)
             &alpha as *const f32 as *const c_void,
             b_ptr as *const c_void,
             cudaDataType_t::CUDA_R_16F,
-            n,                               // ldb = N (leading dim of B in col-major = cols of row-major B)
+            k,                                // ldb = K (B is [N,K] row-major → K cols)
             a_ptr as *const c_void,
             cudaDataType_t::CUDA_R_16F,
-            k,                               // lda = K (leading dim of A in col-major = cols of row-major A)
+            k,                                // lda = K (A is [M,K] row-major → K cols)
             &beta as *const f32 as *const c_void,
             c_ptr,
             cudaDataType_t::CUDA_R_16F,
-            n,                               // ldc = N
+            n,                                // ldc = N (C is [M,N] row-major → N cols)
             cublasComputeType_t::CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT,
         ));
@@ -840,12 +846,13 @@ mod tests {
     #[test]
     fn test_matmul() {
         let b = make_backend();
-        // A = [2, 3], B = [3, 2], C = [2, 2]
+        // A = [2, 3], B = [2, 3] (transposed storage), C = [2, 2]
+        // matmul computes C = A @ B^T
         let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b_data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b_data: Vec<f32> = vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0];
 
         let a = alloc_with_data(&b, &[2, 3], &a_data);
-        let bt = alloc_with_data(&b, &[3, 2], &b_data);
+        let bt = alloc_with_data(&b, &[2, 3], &b_data);
         let out = b.alloc(&[2, 2], DType::FP16).unwrap();
 
         b.matmul(&a, &bt, &out).unwrap();
@@ -873,13 +880,13 @@ mod tests {
 
     #[test]
     fn test_matmul_m1() {
-        // M=1 decode-like shape
+        // M=1 decode-like shape, matmul computes C = A @ B^T
         let b = make_backend();
         let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0]; // [1, 4]
-        let b_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]; // [4, 2]
+        let b_data: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0]; // [2, 4]
 
         let a = alloc_with_data(&b, &[1, 4], &a_data);
-        let bt = alloc_with_data(&b, &[4, 2], &b_data);
+        let bt = alloc_with_data(&b, &[2, 4], &b_data);
         let out = b.alloc(&[1, 2], DType::FP16).unwrap();
 
         b.matmul(&a, &bt, &out).unwrap();
@@ -1400,10 +1407,12 @@ mod tests {
         let cos1 = angle1.cos() as f32;
         let sin1 = angle1.sin() as f32;
 
-        let exp0 = x0 * cos0 - x1 * sin0;
-        let exp1 = x0 * sin0 + x1 * cos0;
-        let exp2 = x2 * cos1 - x3 * sin1;
-        let exp3 = x2 * sin1 + x3 * cos1;
+        // Split-half convention: pairs (d, d+half_dim) where half_dim = head_dim/2
+        // Pair (0, 2) uses freq0, pair (1, 3) uses freq1
+        let exp0 = x0 * cos0 - x2 * sin0;
+        let exp1 = x1 * cos1 - x3 * sin1;
+        let exp2 = x0 * sin0 + x2 * cos0;
+        let exp3 = x1 * sin1 + x3 * cos1;
 
         // FP16 precision at magnitude ~5 is ~0.002, use numpy-style allclose
         let atol = 1e-3f32;
@@ -1853,15 +1862,15 @@ mod tests {
     #[test]
     fn test_matmul_gqa_projection() {
         let b = make_backend();
-        // [1, 64] x [64, 16] — K/V projection-like shape
+        // [1, 64] x [16, 64]^T — K/V projection-like shape, matmul computes C = A @ B^T
         let m = 1;
         let k = 64;
         let n = 16;
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
-        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.05).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32) * 0.05).collect();
 
         let a = alloc_with_data(&b, &[m, k], &a_data);
-        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
         let out = b.alloc(&[m, n], DType::FP16).unwrap();
 
         b.matmul(&a, &bt, &out).unwrap();
@@ -1869,11 +1878,11 @@ mod tests {
 
         let result = read_fp16(&b, &out);
 
-        // CPU reference
+        // CPU reference: C = A @ B^T, B is [N, K] so B^T[i, j] = B[j, i] = b_data[j * k + i]
         for j in 0..n {
             let mut expected = 0.0f32;
             for i in 0..k {
-                expected += a_data[i] * b_data[i * n + j];
+                expected += a_data[i] * b_data[j * k + i];
             }
             assert!(
                 (result[j] - expected).abs() < 1.0,
@@ -2442,10 +2451,10 @@ mod tests {
 
         for (m, k, n) in shapes {
             let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-            let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
 
             let a = alloc_with_data(&b, &[m, k], &a_data);
-            let bt = alloc_with_data(&b, &[k, n], &b_data);
+            let bt = alloc_with_data(&b, &[n, k], &b_data);
             let out = b.alloc(&[m, n], DType::FP16).unwrap();
 
             b.matmul(&a, &bt, &out).unwrap();
@@ -2456,11 +2465,11 @@ mod tests {
             for (i, &v) in result.iter().enumerate() {
                 assert!(
                     !v.is_nan(),
-                    "matmul llama3 [{m},{k}]x[{k},{n}] idx {i}: NaN"
+                    "matmul llama3 [{m},{k}]x[{n},{k}]^T idx {i}: NaN"
                 );
                 assert!(
                     v.is_finite(),
-                    "matmul llama3 [{m},{k}]x[{k},{n}] idx {i}: not finite"
+                    "matmul llama3 [{m},{k}]x[{n},{k}]^T idx {i}: not finite"
                 );
             }
 
@@ -2548,10 +2557,10 @@ mod tests {
         let n = 1024;
 
         let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-        let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
 
         let a = alloc_with_data(&b, &[m, k], &a_data);
-        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
         let out = b.alloc(&[m, n], DType::FP16).unwrap();
 
         b.matmul(&a, &bt, &out).unwrap();
@@ -2587,5 +2596,896 @@ mod tests {
         b.destroy_timer(&timer).unwrap();
         let err = b.destroy_timer(&timer);
         assert!(err.is_err(), "second destroy_timer should error");
+    }
+
+    // ── Numerical correctness: add reference ────────────────────────
+
+    #[test]
+    fn test_add_reference_correctness() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let n = 4096;
+
+        let a_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let a = alloc_with_data(&b, &[1, n], &a_data);
+        let bt = alloc_with_data(&b, &[1, n], &b_data);
+        let out = b.alloc(&[1, n], DType::FP16).unwrap();
+
+        b.add(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference: element-wise add in f32, then convert to f16 and back
+        for i in 0..n {
+            let expected = f16::from_f32(a_data[i]).to_f32() + f16::from_f32(b_data[i]).to_f32();
+            let expected_f16 = f16::from_f32(expected).to_f32();
+            let got = result[i];
+            let abs_err = (got - expected_f16).abs();
+            let tol = 1e-3 + 1e-3 * expected_f16.abs();
+            assert!(
+                abs_err <= tol,
+                "add_reference [{i}]: got {got}, expected {expected_f16} (abs_err={abs_err}, tol={tol})"
+            );
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Numerical correctness: add large tensor ─────────────────────
+
+    #[test]
+    fn test_add_large_tensor() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let rows = 128;
+        let cols = 4096;
+        let n = rows * cols;
+
+        let a_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let a = alloc_with_data(&b, &[rows, cols], &a_data);
+        let bt = alloc_with_data(&b, &[rows, cols], &b_data);
+        let out = b.alloc(&[rows, cols], DType::FP16).unwrap();
+
+        b.add(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        for i in 0..n {
+            let expected = f16::from_f32(a_data[i]).to_f32() + f16::from_f32(b_data[i]).to_f32();
+            let expected_f16 = f16::from_f32(expected).to_f32();
+            let got = result[i];
+            let abs_err = (got - expected_f16).abs();
+            let tol = 1e-3 + 1e-3 * expected_f16.abs();
+            assert!(
+                abs_err <= tol,
+                "add_large [{i}]: got {got}, expected {expected_f16} (abs_err={abs_err}, tol={tol})"
+            );
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Numerical correctness: matmul llama3 shapes ─────────────────
+
+    #[test]
+    fn test_matmul_llama3_shapes_correctness() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 1;
+        let k = 64;
+        let n = 64;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference: C = A @ B^T, where B is [N, K], so C[row][col] = sum_i A[row,i] * B[col,i]
+        for row in 0..m {
+            for col in 0..n {
+                let mut expected = 0.0f32;
+                for i in 0..k {
+                    let av = f16::from_f32(a_data[row * k + i]).to_f32();
+                    let bv = f16::from_f32(b_data[col * k + i]).to_f32();
+                    expected += av * bv;
+                }
+                let got = result[row * n + col];
+                let abs_err = (got - expected).abs();
+                let tol = 1e-2 + 1e-2 * expected.abs();
+                assert!(
+                    abs_err <= tol,
+                    "matmul_llama3_correctness [{row},{col}]: got {got}, expected {expected} (abs_err={abs_err})"
+                );
+            }
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Numerical correctness: matmul large M fix ───────────────────
+
+    #[test]
+    fn test_matmul_large_m_fix() {
+        let b = make_backend();
+        // Non-square B to ensure we compute A @ B^T correctly
+        // A: [32, 64], B: [48, 64] => C: [32, 48]
+        let m = 32;
+        let k = 64;
+        let n = 48;
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.05).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 11) as f32) * 0.05).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let out = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference: C = A @ B^T => C[row][col] = sum_i A[row,i] * B[col,i]
+        for &row in &[0, 15, 31] {
+            for &col in &[0, 24, 47] {
+                let mut expected = 0.0f32;
+                for i in 0..k {
+                    let av = f16::from_f32(a_data[row * k + i]).to_f32();
+                    let bv = f16::from_f32(b_data[col * k + i]).to_f32();
+                    expected += av * bv;
+                }
+                let got = result[row * n + col];
+                let abs_err = (got - expected).abs();
+                let tol = 1e-2 + 1e-2 * expected.abs();
+                assert!(
+                    abs_err <= tol,
+                    "matmul_large_m_fix [{row},{col}]: got {got}, expected {expected} (abs_err={abs_err})"
+                );
+            }
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Numerical correctness: rmsnorm prefill n128 ─────────────────
+
+    #[test]
+    fn test_rmsnorm_prefill_n128() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let rows = 128;
+        let cols = 4096;
+
+        let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+
+        let x = alloc_with_data(&b, &[rows, cols], &x_data);
+        let w = alloc_with_data(&b, &[cols], &w_data);
+        let out = b.alloc(&[rows, cols], DType::FP16).unwrap();
+
+        b.rmsnorm(&x, &w, 1e-5, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference
+        for row in 0..rows {
+            let start = row * cols;
+            let end = start + cols;
+            let row_data = &x_data[start..end];
+            let mean_sq: f32 = row_data.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let rms = (mean_sq + 1e-5).sqrt();
+            for j in 0..cols {
+                let expected = (row_data[j] / rms) * w_data[j];
+                let got = result[start + j];
+                let abs_err = (got - expected).abs();
+                let tol = 1e-3 + 1e-3 * expected.abs();
+                assert!(
+                    abs_err <= tol,
+                    "rmsnorm_prefill_n128 [{row},{j}]: got {got}, expected {expected} (abs_err={abs_err}, tol={tol})"
+                );
+            }
+        }
+
+        b.free(&x).unwrap();
+        b.free(&w).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── Numerical correctness: rmsnorm prefill n512 ─────────────────
+
+    #[test]
+    fn test_rmsnorm_prefill_n512() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let rows = 512;
+        let cols = 4096;
+
+        let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+
+        let x = alloc_with_data(&b, &[rows, cols], &x_data);
+        let w = alloc_with_data(&b, &[cols], &w_data);
+        let out = b.alloc(&[rows, cols], DType::FP16).unwrap();
+
+        b.rmsnorm(&x, &w, 1e-5, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // CPU reference — check sampled rows to keep test fast
+        for &row in &[0, 127, 255, 384, 511] {
+            let start = row * cols;
+            let end = start + cols;
+            let row_data = &x_data[start..end];
+            let mean_sq: f32 = row_data.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let rms = (mean_sq + 1e-5).sqrt();
+            for j in 0..cols {
+                let expected = (row_data[j] / rms) * w_data[j];
+                let got = result[start + j];
+                let abs_err = (got - expected).abs();
+                let tol = 1e-3 + 1e-3 * expected.abs();
+                assert!(
+                    abs_err <= tol,
+                    "rmsnorm_prefill_n512 [{row},{j}]: got {got}, expected {expected} (abs_err={abs_err}, tol={tol})"
+                );
+            }
+        }
+
+        b.free(&x).unwrap();
+        b.free(&w).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── GPU error handling ────────────────────────────────────────────
+
+    #[test]
+    fn test_rmsnorm_error_context() {
+        let b = make_backend();
+        let fake = DeviceTensor::new(TensorId(999999), vec![1, 4], DType::FP16);
+        let w = alloc_with_data(&b, &[4], &[1.0; 4]);
+        let out = b.alloc(&[1, 4], DType::FP16).unwrap();
+        let err = b.rmsnorm(&fake, &w, 1e-5, &out).unwrap_err();
+        assert!(matches!(err, FractureError::TensorNotFound(_)), "expected TensorNotFound, got: {err:?}");
+        assert!(err.to_string().contains("999999"), "error should contain tensor id: {err}");
+        b.free(&w).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_silu_mul_error_type() {
+        let b = make_backend();
+        let fake = DeviceTensor::new(TensorId(999999), vec![1, 4], DType::FP16);
+        let up = alloc_with_data(&b, &[1, 4], &[1.0; 4]);
+        let out = b.alloc(&[1, 4], DType::FP16).unwrap();
+        let err = b.silu_mul(&fake, &up, &out).unwrap_err();
+        assert!(matches!(err, FractureError::TensorNotFound(_)), "expected TensorNotFound, got: {err:?}");
+        assert!(err.to_string().contains("999999"), "error should mention tensor id: {err}");
+        b.free(&up).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_silu_mul_invalid_up_tensor() {
+        let b = make_backend();
+        let gate = alloc_with_data(&b, &[1, 4], &[1.0; 4]);
+        let fake = DeviceTensor::new(TensorId(999998), vec![1, 4], DType::FP16);
+        let out = b.alloc(&[1, 4], DType::FP16).unwrap();
+        let result = b.silu_mul(&gate, &fake, &out);
+        assert!(result.is_err(), "invalid up tensor should fail");
+        b.free(&gate).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_silu_mul_invalid_out_tensor() {
+        let b = make_backend();
+        let gate = alloc_with_data(&b, &[1, 4], &[1.0; 4]);
+        let up = alloc_with_data(&b, &[1, 4], &[1.0; 4]);
+        let fake = DeviceTensor::new(TensorId(999997), vec![1, 4], DType::FP16);
+        let result = b.silu_mul(&gate, &up, &fake);
+        assert!(result.is_err(), "invalid out tensor should fail");
+        b.free(&gate).unwrap();
+        b.free(&up).unwrap();
+    }
+
+    #[test]
+    fn test_embedding_error_context() {
+        let b = make_backend();
+        let fake_table = DeviceTensor::new(TensorId(999999), vec![4, 8], DType::FP16);
+        let out = b.alloc(&[1, 8], DType::FP16).unwrap();
+        let err = b.embedding(&[0], &fake_table, &out).unwrap_err();
+        assert!(matches!(err, FractureError::TensorNotFound(_)), "expected TensorNotFound, got: {err:?}");
+        assert!(err.to_string().contains("999999"), "error should contain tensor id: {err}");
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_add_error_context() {
+        let b = make_backend();
+        let a = alloc_with_data(&b, &[2, 2], &[1.0; 4]);
+        let fake = DeviceTensor::new(TensorId(999999), vec![2, 2], DType::FP16);
+        let out = b.alloc(&[2, 2], DType::FP16).unwrap();
+        let err = b.add(&a, &fake, &out).unwrap_err();
+        assert!(matches!(err, FractureError::TensorNotFound(_)), "expected TensorNotFound, got: {err:?}");
+        assert!(err.to_string().contains("999999"), "error should contain tensor id: {err}");
+        b.free(&a).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_rmsnorm_large_values_full_dim() {
+        let b = make_backend();
+        let n = 4096;
+        let data: Vec<f32> = vec![60000.0; n];
+        let x = alloc_with_data(&b, &[1, n], &data);
+        let w = alloc_with_data(&b, &[n], &vec![1.0; n]);
+        let out = b.alloc(&[1, n], DType::FP16).unwrap();
+        b.rmsnorm(&x, &w, 1e-5, &out).unwrap();
+        let result = read_fp16(&b, &out);
+        for (i, &val) in result.iter().enumerate() {
+            assert!(val.is_finite(), "element {i} is not finite: {val}");
+        }
+        // RMSNorm of all-same values with weight=1 should give 1.0 for each element
+        // rms = sqrt(mean(60000^2) + eps) = sqrt(60000^2 + eps) ≈ 60000
+        // output = (60000 / 60000) * 1.0 = 1.0
+        let expected = 1.0f32;
+        for (i, &val) in result.iter().enumerate() {
+            assert!((val - expected).abs() < 0.01, "element {i}: expected ~{expected}, got {val}");
+        }
+        b.free(&x).unwrap();
+        b.free(&w).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    // ── RoPE numerical correctness ────────────────────────────────────
+    // The RoPE kernel uses split-half convention: dimension d pairs with d + half_dim.
+    // x0 = tensor[d], x1 = tensor[d + half_dim]
+    // tensor[d]            = x0 * cos - x1 * sin
+    // tensor[d + half_dim] = x0 * sin + x1 * cos
+
+    #[test]
+    fn test_rope_precompute_freq_values() {
+        let mut b = CudaBackend::new(0).expect("CUDA init");
+        let head_dim = 128;
+        let theta = 500000.0;
+        let half_dim = head_dim / 2;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        // Split-half input: set first half to 1.0, second half to 0.0
+        // After RoPE at position 1: first half becomes cos(freq), second half becomes sin(freq)
+        let mut q_data = vec![0.0f32; head_dim];
+        for d in 0..half_dim {
+            q_data[d] = 1.0;           // x0 = 1.0
+            q_data[d + half_dim] = 0.0; // x1 = 0.0
+        }
+
+        let q = alloc_with_data(&b, &[1, 1, head_dim], &q_data);
+        let k = alloc_with_data(&b, &[1, 1, head_dim], &q_data);
+
+        b.rope(&q, &k, &[1], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+
+        for d in 0..half_dim {
+            let freq = 1.0 / (theta as f32).powf(2.0 * d as f32 / head_dim as f32);
+            let angle = freq; // position=1
+            let expected_cos = angle.cos();
+            let expected_sin = angle.sin();
+
+            assert!(
+                (q_result[d] - expected_cos).abs() < 1e-2,
+                "freq[{d}]: cos mismatch: got {}, expected {expected_cos}", q_result[d]
+            );
+            assert!(
+                (q_result[d + half_dim] - expected_sin).abs() < 1e-2,
+                "freq[{d}]: sin mismatch: got {}, expected {expected_sin}", q_result[d + half_dim]
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    #[test]
+    fn test_rope_decode_position_47_numerical() {
+        let mut b = CudaBackend::new(0).expect("CUDA init");
+        let head_dim = 8;
+        let half = head_dim / 2;
+        let theta = 10000.0;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let k_data: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+        let k = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &k_data);
+
+        b.rope(&q, &k, &[47], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+        let k_result = read_fp16(&b, &k);
+
+        for h in 0..num_q_heads {
+            let base = h * head_dim;
+            for d in 0..half {
+                let freq = 1.0 / (theta as f32).powf(2.0 * d as f32 / head_dim as f32);
+                let angle = 47.0 * freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+
+                let x0 = q_data[base + d];
+                let x1 = q_data[base + d + half];
+                let exp_lo = x0 * cos_a - x1 * sin_a;
+                let exp_hi = x0 * sin_a + x1 * cos_a;
+
+                assert!((q_result[base + d] - exp_lo).abs() < 0.05,
+                    "Q head {h} d={d}: got {}, expected {exp_lo}", q_result[base + d]);
+                assert!((q_result[base + d + half] - exp_hi).abs() < 0.05,
+                    "Q head {h} d={}: got {}, expected {exp_hi}", d + half, q_result[base + d + half]);
+            }
+        }
+
+        for d in 0..half {
+            let freq = 1.0 / (theta as f32).powf(2.0 * d as f32 / head_dim as f32);
+            let angle = 47.0 * freq;
+            let (sin_a, cos_a) = angle.sin_cos();
+
+            let x0 = k_data[d];
+            let x1 = k_data[d + half];
+            let exp_lo = x0 * cos_a - x1 * sin_a;
+            let exp_hi = x0 * sin_a + x1 * cos_a;
+
+            assert!((k_result[d] - exp_lo).abs() < 0.05,
+                "K d={d}: got {}, expected {exp_lo}", k_result[d]);
+            assert!((k_result[d + half] - exp_hi).abs() < 0.05,
+                "K d={}: got {}, expected {exp_hi}", d + half, k_result[d + half]);
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    #[test]
+    fn test_rope_prod_dimensions_numerical() {
+        use rand::Rng;
+        let mut b = CudaBackend::new(0).expect("CUDA init");
+        let head_dim = 128;
+        let half = head_dim / 2;
+        let theta = 500000.0;
+        let num_q_heads = 32;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+        let k = alloc_with_data(&b, &[1, 8, head_dim], &vec![0.1f32; 8 * head_dim]);
+
+        b.rope(&q, &k, &[42], theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+
+        for &h in &[0, 15, 31] {
+            let base = h * head_dim;
+            for d in 0..half {
+                let freq = 1.0 / (theta as f32).powf(2.0 * d as f32 / head_dim as f32);
+                let angle = 42.0 * freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+
+                let x0 = f16::from_f32(q_data[base + d]).to_f32();
+                let x1 = f16::from_f32(q_data[base + d + half]).to_f32();
+                let exp_lo = x0 * cos_a - x1 * sin_a;
+                let exp_hi = x0 * sin_a + x1 * cos_a;
+
+                assert!((q_result[base + d] - exp_lo).abs() < 0.05,
+                    "Q[{h}][{d}]: got {}, expected {exp_lo}", q_result[base + d]);
+                assert!((q_result[base + d + half] - exp_hi).abs() < 0.05,
+                    "Q[{h}][{}]: got {}, expected {exp_hi}", d + half, q_result[base + d + half]);
+            }
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    #[test]
+    fn test_rope_prefill_numerical() {
+        let mut b = CudaBackend::new(0).expect("CUDA init");
+        let head_dim = 8;
+        let half = head_dim / 2;
+        let theta = 10000.0;
+        let num_q_heads = 2;
+        let seq_len = 4;
+        b.precompute_rope_freqs(head_dim, theta).unwrap();
+
+        let total_q = seq_len * num_q_heads * head_dim;
+        let q_data: Vec<f32> = (0..total_q).map(|i| ((i % 7) as f32 + 1.0) * 0.1).collect();
+        let k_data: Vec<f32> = (0..seq_len * 1 * head_dim).map(|i| ((i % 5) as f32 + 1.0) * 0.2).collect();
+
+        let q = alloc_with_data(&b, &[seq_len, num_q_heads, head_dim], &q_data);
+        let k = alloc_with_data(&b, &[seq_len, 1, head_dim], &k_data);
+
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        b.rope(&q, &k, &positions, theta, head_dim).unwrap();
+        b.synchronize().unwrap();
+
+        let q_result = read_fp16(&b, &q);
+
+        for tok in 0..seq_len {
+            let pos = tok as f32;
+            for h in 0..num_q_heads {
+                let base = tok * num_q_heads * head_dim + h * head_dim;
+                for d in 0..half {
+                    let freq = 1.0 / (theta as f32).powf(2.0 * d as f32 / head_dim as f32);
+                    let angle = pos * freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+
+                    let x0 = f16::from_f32(q_data[base + d]).to_f32();
+                    let x1 = f16::from_f32(q_data[base + d + half]).to_f32();
+                    let exp_lo = x0 * cos_a - x1 * sin_a;
+                    let exp_hi = x0 * sin_a + x1 * cos_a;
+
+                    assert!((q_result[base + d] - exp_lo).abs() < 0.05,
+                        "tok {tok} head {h} d={d}: got {}, expected {exp_lo}", q_result[base + d]);
+                    assert!((q_result[base + d + half] - exp_hi).abs() < 0.05,
+                        "tok {tok} head {h} d={}: got {}, expected {exp_hi}", d + half, q_result[base + d + half]);
+                }
+            }
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k).unwrap();
+    }
+
+    // ── Attention numerical correctness ───────────────────────────────
+
+    #[test]
+    fn test_attention_prefill_gqa_group4() {
+        let b = make_backend();
+        let head_dim = 4;
+        let num_q_heads = 8;
+        let num_kv_heads = 2;
+        let max_seq = 16;
+
+        let q_data = vec![1.0f32; num_q_heads * head_dim];
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        let mut k_data = vec![0.0f32; max_seq * num_kv_heads * head_dim];
+        for d in 0..head_dim { k_data[0 * num_kv_heads * head_dim + 0 * head_dim + d] = 1.0; }
+        for d in 0..head_dim { k_data[0 * num_kv_heads * head_dim + 1 * head_dim + d] = 2.0; }
+        let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
+
+        let mut v_data = vec![0.0f32; max_seq * num_kv_heads * head_dim];
+        for d in 0..head_dim { v_data[0 * num_kv_heads * head_dim + 0 * head_dim + d] = 0.5; }
+        for d in 0..head_dim { v_data[0 * num_kv_heads * head_dim + 1 * head_dim + d] = 0.9; }
+        let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
+
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, 0, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        for h in 0..4 {
+            for d in 0..head_dim {
+                assert!((result[h * head_dim + d] - 0.5).abs() < 0.05,
+                    "Q head {h} dim {d}: expected ~0.5, got {}", result[h * head_dim + d]);
+            }
+        }
+        for h in 4..8 {
+            for d in 0..head_dim {
+                assert!((result[h * head_dim + d] - 0.9).abs() < 0.05,
+                    "Q head {h} dim {d}: expected ~0.9, got {}", result[h * head_dim + d]);
+            }
+        }
+
+        b.free(&q).unwrap(); b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap(); b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_attention_decode_weighted_sum() {
+        let b = make_backend();
+        let head_dim = 4;
+        let max_seq = 16;
+
+        let q_data = vec![0.0, 1.0, 0.0, 0.0f32];
+        let q = alloc_with_data(&b, &[1, 1, head_dim], &q_data);
+
+        let mut k_data = vec![0.0f32; max_seq * 1 * head_dim];
+        k_data[0] = 1.0;
+        k_data[head_dim + 1] = 1.0;
+        k_data[2 * head_dim + 2] = 1.0;
+        let k_cache = alloc_with_data(&b, &[max_seq, 1, head_dim], &k_data);
+
+        let mut v_data = vec![0.0f32; max_seq * 1 * head_dim];
+        v_data[0] = 1.0;
+        v_data[head_dim + 1] = 1.0;
+        v_data[2 * head_dim + 2] = 1.0;
+        let v_cache = alloc_with_data(&b, &[max_seq, 1, head_dim], &v_data);
+
+        let out = b.alloc(&[1, 1, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, 1, 2, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        assert!(result[1] > result[0], "dim 1 should dominate: got {:?}", &result[..4]);
+        assert!(result[1] > result[2], "dim 1 should be > dim 2");
+
+        b.free(&q).unwrap(); b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap(); b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_attention_scaling_unequal_scores() {
+        let b = make_backend();
+        let head_dim = 4;
+        let max_seq = 16;
+
+        let q_data = vec![2.0, 0.0, 0.0, 0.0f32];
+        let q = alloc_with_data(&b, &[1, 1, head_dim], &q_data);
+
+        let mut k_data = vec![0.0f32; max_seq * 1 * head_dim];
+        k_data[0] = 2.0;
+        k_data[head_dim] = 1.0;
+        let k_cache = alloc_with_data(&b, &[max_seq, 1, head_dim], &k_data);
+
+        let mut v_data = vec![0.0f32; max_seq * 1 * head_dim];
+        v_data[0] = 1.0;
+        v_data[head_dim + 1] = 1.0;
+        let v_cache = alloc_with_data(&b, &[max_seq, 1, head_dim], &v_data);
+
+        let out = b.alloc(&[1, 1, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, 1, 1, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let s0 = (4.0 * scale).exp();
+        let s1 = (2.0 * scale).exp();
+        let w0 = s0 / (s0 + s1);
+        let w1 = s1 / (s0 + s1);
+
+        assert!((result[0] - w0).abs() < 0.05, "dim 0: expected {w0}, got {}", result[0]);
+        assert!((result[1] - w1).abs() < 0.05, "dim 1: expected {w1}, got {}", result[1]);
+
+        b.free(&q).unwrap(); b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap(); b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_attention_gqa_multi_kv_heads() {
+        let b = make_backend();
+        let head_dim = 4;
+        let num_q_heads = 8;
+        let num_kv_heads = 2;
+        let max_seq = 16;
+
+        let q_data = vec![1.0f32; num_q_heads * head_dim];
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        let mut k_data = vec![0.0f32; max_seq * num_kv_heads * head_dim];
+        for kv in 0..num_kv_heads {
+            for d in 0..head_dim {
+                k_data[0 * num_kv_heads * head_dim + kv * head_dim + d] = 1.0;
+            }
+        }
+        let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
+
+        let mut v_data = vec![0.0f32; max_seq * num_kv_heads * head_dim];
+        v_data[0 * num_kv_heads * head_dim + 0 * head_dim + 0] = 1.0;
+        v_data[0 * num_kv_heads * head_dim + 1 * head_dim + 1] = 1.0;
+        let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
+
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, 0, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        for h in 0..4 {
+            let base = h * head_dim;
+            assert!((result[base] - 1.0).abs() < 0.05, "head {h} dim 0: expected 1.0, got {}", result[base]);
+            assert!(result[base + 1].abs() < 0.05, "head {h} dim 1: expected 0.0, got {}", result[base + 1]);
+        }
+        for h in 4..8 {
+            let base = h * head_dim;
+            assert!(result[base].abs() < 0.05, "head {h} dim 0: expected 0.0, got {}", result[base]);
+            assert!((result[base + 1] - 1.0).abs() < 0.05, "head {h} dim 1: expected 1.0, got {}", result[base + 1]);
+        }
+
+        b.free(&q).unwrap(); b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap(); b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_attention_decode_production_dims() {
+        use rand::Rng;
+        let b = make_backend();
+        let head_dim = 128;
+        let num_q_heads = 32;
+        let num_kv_heads = 8;
+        let max_seq = 256;
+        let cache_len = 64;
+
+        let mut rng = rand::thread_rng();
+        let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
+        let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
+
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, cache_len - 1, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        for (i, &val) in result.iter().enumerate() {
+            assert!(val.is_finite(), "output[{i}] is not finite: {val}");
+        }
+        assert_eq!(result.len(), num_q_heads * head_dim);
+
+        b.free(&q).unwrap(); b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap(); b.free(&out).unwrap();
+    }
+
+    // ── GEMM correctness: Llama 3 FFN shapes ─────────────────────────
+    // matmul computes C = A @ B^T where A is [M,K], B is [N,K], C is [M,N]
+
+    #[test]
+    fn test_matmul_llama3_ffn_shapes() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+
+        // Gate/up projection: A[1,4096] x B[14336,4096]^T = C[1,14336]
+        {
+            let m = 1; let k = 4096; let n = 14336;
+            let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let a = alloc_with_data(&b, &[m, k], &a_data);
+            let bt = alloc_with_data(&b, &[n, k], &b_data);
+            let c = b.alloc(&[m, n], DType::FP16).unwrap();
+            b.matmul(&a, &bt, &c).unwrap();
+            b.synchronize().unwrap();
+            let result = read_fp16(&b, &c);
+
+            for &col in &[0, n/2, n-1] {
+                let mut expected = 0.0f64;
+                for i in 0..k {
+                    let av = f16::from_f32(a_data[i]).to_f32() as f64;
+                    let bv = f16::from_f32(b_data[col * k + i]).to_f32() as f64; // B[col, i]
+                    expected += av * bv;
+                }
+                let got = result[col] as f64;
+                let tol = expected.abs() * 0.05 + 0.1;
+                assert!((got - expected).abs() < tol, "gate/up col {col}: got {got}, expected {expected}");
+            }
+            b.free(&a).unwrap(); b.free(&bt).unwrap(); b.free(&c).unwrap();
+        }
+
+        // Down projection: A[1,14336] x B[4096,14336]^T = C[1,4096]
+        {
+            let m = 1; let k = 14336; let n = 4096;
+            let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let a = alloc_with_data(&b, &[m, k], &a_data);
+            let bt = alloc_with_data(&b, &[n, k], &b_data);
+            let c = b.alloc(&[m, n], DType::FP16).unwrap();
+            b.matmul(&a, &bt, &c).unwrap();
+            b.synchronize().unwrap();
+            let result = read_fp16(&b, &c);
+
+            for &col in &[0, n/2, n-1] {
+                let mut expected = 0.0f64;
+                for i in 0..k {
+                    let av = f16::from_f32(a_data[i]).to_f32() as f64;
+                    let bv = f16::from_f32(b_data[col * k + i]).to_f32() as f64;
+                    expected += av * bv;
+                }
+                let got = result[col] as f64;
+                let tol = expected.abs() * 0.05 + 0.1;
+                assert!((got - expected).abs() < tol, "down col {col}: got {got}, expected {expected}");
+            }
+            b.free(&a).unwrap(); b.free(&bt).unwrap(); b.free(&c).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_matmul_prefill_correctness() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+
+        // A[128,4096] x B[14336,4096]^T = C[128,14336]
+        let m = 128; let k = 4096; let n = 14336;
+        let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let c = b.alloc(&[m, n], DType::FP16).unwrap();
+        b.matmul(&a, &bt, &c).unwrap();
+        b.synchronize().unwrap();
+        let result = read_fp16(&b, &c);
+
+        let samples = [(0, 0), (0, n-1), (m/2, n/2), (m-1, 0), (m-1, n-1)];
+        for &(row, col) in &samples {
+            let mut expected = 0.0f64;
+            for i in 0..k {
+                let av = f16::from_f32(a_data[row * k + i]).to_f32() as f64;
+                let bv = f16::from_f32(b_data[col * k + i]).to_f32() as f64;
+                expected += av * bv;
+            }
+            let got = result[row * n + col] as f64;
+            let tol = expected.abs() * 0.05 + 0.5;
+            assert!((got - expected).abs() < tol, "prefill ({row},{col}): got {got}, expected {expected}");
+        }
+
+        b.free(&a).unwrap(); b.free(&bt).unwrap(); b.free(&c).unwrap();
+    }
+
+    #[test]
+    fn test_matmul_gqa_kv_correctness() {
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+
+        // GQA K/V: A[1,4096] x B[1024,4096]^T = C[1,1024]
+        let m = 1; let k = 4096; let n = 1024;
+        let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let c = b.alloc(&[m, n], DType::FP16).unwrap();
+        b.matmul(&a, &bt, &c).unwrap();
+        b.synchronize().unwrap();
+        let result = read_fp16(&b, &c);
+
+        for &col in &[0, n/4, n/2, 3*n/4, n-1] {
+            let mut expected = 0.0f64;
+            for i in 0..k {
+                let av = f16::from_f32(a_data[i]).to_f32() as f64;
+                let bv = f16::from_f32(b_data[col * k + i]).to_f32() as f64;
+                expected += av * bv;
+            }
+            let got = result[col] as f64;
+            let tol = expected.abs() * 0.05 + 0.1;
+            assert!((got - expected).abs() < tol, "GQA KV col {col}: got {got}, expected {expected}");
+        }
+
+        b.free(&a).unwrap(); b.free(&bt).unwrap(); b.free(&c).unwrap();
     }
 }

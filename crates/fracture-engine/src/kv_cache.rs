@@ -431,4 +431,95 @@ mod tests {
             "seq_len should be 0 immediately after alloc"
         );
     }
+
+    /// FailingMockBackend: alloc fails after `fail_at` calls.
+    struct FailingMockBackend {
+        next_id: AtomicU64,
+        alloc_count: AtomicU64,
+        fail_at: u64,
+    }
+
+    impl FailingMockBackend {
+        fn new(fail_at: u64) -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+                alloc_count: AtomicU64::new(0),
+                fail_at,
+            }
+        }
+    }
+
+    impl Backend for FailingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let n = self.alloc_count.fetch_add(1, Ordering::SeqCst);
+            if n >= self.fail_at {
+                return Err(FractureError::Backend("OOM".into()));
+            }
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { unimplemented!() }
+        fn copy_to_host(&self, _src: &DeviceTensor, _dst: &mut [u8]) -> Result<()> { unimplemented!() }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> { unimplemented!() }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { unimplemented!() }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> Result<()> { unimplemented!() }
+        fn device_name(&self) -> &str { "failing-mock" }
+        fn total_memory(&self) -> usize { 1 << 30 }
+        fn available_memory(&self) -> usize { 1 << 30 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn test_kv_cache_alloc_oom() {
+        // 2 layers × 2 tensors (k+v) = 4 allocs needed. Fail on the 3rd.
+        let backend = FailingMockBackend::new(3);
+        let mut mgr = KvCacheManager::new(2, 2, 16, 256);
+
+        let result = mgr.alloc(&backend);
+        assert!(result.is_err(), "alloc should fail when backend OOMs");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, FractureError::Backend(_)),
+            "expected Backend error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_kv_cache_multi_sequence_independence() {
+        let backend = MockBackend::new();
+        let mut mgr = KvCacheManager::new(2, 2, 16, 512);
+
+        let a = mgr.alloc(&backend).unwrap();
+        let b = mgr.alloc(&backend).unwrap();
+        assert_ne!(a, b, "handles should be distinct");
+
+        // Set different seq_lens
+        mgr.set_seq_len(a, 10).unwrap();
+        mgr.set_seq_len(b, 20).unwrap();
+        assert_eq!(mgr.seq_len(a).unwrap(), 10);
+        assert_eq!(mgr.seq_len(b).unwrap(), 20);
+
+        // Tensor IDs should be distinct between sequences
+        let ka = mgr.k_cache(a, 0).unwrap().id;
+        let kb = mgr.k_cache(b, 0).unwrap().id;
+        assert_ne!(ka, kb, "different sequences should have different tensor IDs");
+
+        // Free A, verify B is unaffected
+        mgr.free(a, &backend).unwrap();
+        assert!(mgr.seq_len(a).is_err(), "A should be freed");
+        assert_eq!(mgr.seq_len(b).unwrap(), 20, "B should be unaffected by freeing A");
+        assert!(mgr.k_cache(b, 0).is_ok(), "B's k_cache should still be accessible");
+
+        mgr.free(b, &backend).unwrap();
+    }
 }

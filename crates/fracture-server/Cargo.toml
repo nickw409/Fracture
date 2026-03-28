@@ -24,3 +24,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
+half = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+fracture-gguf = { workspace = true }

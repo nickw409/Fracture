@@ -7,7 +7,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 /// GGUF magic number: "GGUF" in little-endian.
-const GGUF_MAGIC: u32 = 0x46475547;
+const GGUF_MAGIC: u32 = 0x46554747;
 /// Only GGUF version 3 is supported.
 const GGUF_VERSION: u32 = 3;
 
@@ -276,6 +276,9 @@ impl GgufParser {
             for _ in 0..ndims {
                 shape.push(cursor.read_u64::<LittleEndian>()? as usize);
             }
+            // GGUF stores dimensions innermost-first. Reverse to match the
+            // row-major convention used by the engine.
+            shape.reverse();
             let dtype_code = cursor.read_u32::<LittleEndian>()?;
             let gguf_dtype = GgufDType::from_u32(dtype_code)?;
             let dtype = gguf_dtype.to_fracture_dtype()?;
@@ -514,11 +517,12 @@ mod tests {
         // vocab via token array (4 dummy tokens)
         write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
 
-        // Tensor info: one tensor [4, 64] FP16
+        // Tensor info: token_embd [vocab=4, hidden=64] after reversal.
+        // Write in GGUF order (innermost first): [64, 4].
         write_gguf_string(&mut buf, "token_embd.weight");
         buf.write_u32::<LittleEndian>(2).unwrap(); // ndims
-        buf.write_u64::<LittleEndian>(4).unwrap(); // dim 0
-        buf.write_u64::<LittleEndian>(64).unwrap(); // dim 1
+        buf.write_u64::<LittleEndian>(64).unwrap(); // innermost dim (hidden)
+        buf.write_u64::<LittleEndian>(4).unwrap(); // outermost dim (vocab)
         buf.write_u32::<LittleEndian>(1).unwrap(); // dtype = FP16
         buf.write_u64::<LittleEndian>(0).unwrap(); // offset (from tensor data start)
 
@@ -695,27 +699,27 @@ mod tests {
         write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
         write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
 
-        // Tensor 0: [4, 64] FP16 at offset 0
+        // Tensor 0: after reversal [4, 64]. GGUF order: [64, 4].
         write_gguf_string(&mut buf, "tensor_a");
         buf.write_u32::<LittleEndian>(2).unwrap();
-        buf.write_u64::<LittleEndian>(4).unwrap();
         buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
         buf.write_u32::<LittleEndian>(1).unwrap(); // FP16
         buf.write_u64::<LittleEndian>(0).unwrap();
 
-        // Tensor 1: [10] FP32 at offset 512
+        // Tensor 1: [10] FP32 at offset 512 (1D, no reversal)
         write_gguf_string(&mut buf, "tensor_b");
         buf.write_u32::<LittleEndian>(1).unwrap();
         buf.write_u64::<LittleEndian>(10).unwrap();
         buf.write_u32::<LittleEndian>(0).unwrap(); // FP32
         buf.write_u64::<LittleEndian>(512).unwrap();
 
-        // Tensor 2: [2, 3, 4] BF16 at offset 552
+        // Tensor 2: after reversal [2, 3, 4]. GGUF order: [4, 3, 2].
         write_gguf_string(&mut buf, "tensor_c");
         buf.write_u32::<LittleEndian>(3).unwrap();
-        buf.write_u64::<LittleEndian>(2).unwrap();
-        buf.write_u64::<LittleEndian>(3).unwrap();
         buf.write_u64::<LittleEndian>(4).unwrap();
+        buf.write_u64::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(2).unwrap();
         buf.write_u32::<LittleEndian>(30).unwrap(); // BF16
         buf.write_u64::<LittleEndian>(552).unwrap();
 
@@ -803,19 +807,19 @@ mod tests {
         write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
         write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
 
-        // Tensor 0: [8, 16] FP16 at offset 0
+        // Tensor 0: after reversal [8, 16]. GGUF order: [16, 8].
         write_gguf_string(&mut buf, "fp16_tensor");
         buf.write_u32::<LittleEndian>(2).unwrap();
-        buf.write_u64::<LittleEndian>(8).unwrap();
         buf.write_u64::<LittleEndian>(16).unwrap();
+        buf.write_u64::<LittleEndian>(8).unwrap();
         buf.write_u32::<LittleEndian>(1).unwrap(); // FP16
         buf.write_u64::<LittleEndian>(0).unwrap();
 
-        // Tensor 1: [4, 8] FP32 at offset 256 (8*16*2 = 256 bytes for tensor 0)
+        // Tensor 1: after reversal [4, 8]. GGUF order: [8, 4].
         write_gguf_string(&mut buf, "fp32_tensor");
         buf.write_u32::<LittleEndian>(2).unwrap();
-        buf.write_u64::<LittleEndian>(4).unwrap();
         buf.write_u64::<LittleEndian>(8).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
         buf.write_u32::<LittleEndian>(0).unwrap(); // FP32
         buf.write_u64::<LittleEndian>(256).unwrap();
 
@@ -880,6 +884,114 @@ mod tests {
         assert!(
             matches!(err, FractureError::UnsupportedDType(_)),
             "expected UnsupportedDType, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rms_norm_eps_extraction() {
+        // Build a GGUF with explicit rms_norm_eps = 1e-6 and verify it is extracted.
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(9).unwrap(); // metadata_kv_count (8 base + 1 eps)
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+        // Explicit rms_norm_eps
+        write_metadata_kv_f32(
+            &mut buf,
+            "llama.attention.layer_norm_rms_epsilon",
+            1e-6,
+        );
+
+        // One tensor [4, 64] FP16
+        write_gguf_string(&mut buf, "token_embd.weight");
+        buf.write_u32::<LittleEndian>(2).unwrap();
+        buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap(); // FP16
+        buf.write_u64::<LittleEndian>(0).unwrap();
+
+        let current = buf.len();
+        let aligned = align_offset(current, 32);
+        buf.resize(aligned, 0);
+        buf.extend(vec![0u8; 4 * 64 * 2]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eps.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+        assert!(
+            (gguf.config.rms_norm_eps - 1e-6).abs() < 1e-10,
+            "expected rms_norm_eps ~1e-6, got {}",
+            gguf.config.rms_norm_eps
+        );
+    }
+
+    #[test]
+    fn test_context_length_extraction() {
+        // Test 1: explicit context_length = 4096
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(GGUF_VERSION).unwrap();
+        buf.write_u64::<LittleEndian>(1).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(9).unwrap(); // metadata_kv_count (8 base + 1 ctx)
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", 64);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 2);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", 128);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+        // Explicit context_length
+        write_metadata_kv_u32(&mut buf, "llama.context_length", 4096);
+
+        write_gguf_string(&mut buf, "token_embd.weight");
+        buf.write_u32::<LittleEndian>(2).unwrap();
+        buf.write_u64::<LittleEndian>(64).unwrap();
+        buf.write_u64::<LittleEndian>(4).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap();
+        buf.write_u64::<LittleEndian>(0).unwrap();
+
+        let current = buf.len();
+        let aligned = align_offset(current, 32);
+        buf.resize(aligned, 0);
+        buf.extend(vec![0u8; 4 * 64 * 2]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ctx.gguf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let gguf = GgufParser::parse(&path).unwrap();
+        assert_eq!(
+            gguf.config.max_seq_len, 4096,
+            "expected max_seq_len=4096, got {}",
+            gguf.config.max_seq_len
+        );
+
+        // Test 2: default context_length when key is absent (should be 8192)
+        let data = build_test_gguf(); // has no context_length key
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("default_ctx.gguf");
+        std::fs::write(&path2, &data).unwrap();
+
+        let gguf2 = GgufParser::parse(&path2).unwrap();
+        assert_eq!(
+            gguf2.config.max_seq_len, 8192,
+            "expected default max_seq_len=8192, got {}",
+            gguf2.config.max_seq_len
         );
     }
 }

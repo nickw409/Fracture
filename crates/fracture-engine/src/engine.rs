@@ -88,6 +88,12 @@ impl<B: Backend> Engine<B> {
         cache_handle: CacheHandle,
         profile: Option<&mut ForwardProfile>,
     ) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(fracture_core::FractureError::InvalidShape(
+                "token_ids must not be empty".into(),
+            ));
+        }
+
         let cfg = &self.weights.config;
         let seq_len = token_ids.len();
         let hidden = cfg.hidden_size;
@@ -355,4 +361,452 @@ mod tests {
     // prefill-decode-consistency is tested in bins/fracture-server-cuda/tests/gpu_integration.rs
     // via test_gpu_prefill_decode_consistency, which runs on the actual CudaBackend with a
     // tiny model built directly on the GPU.
+
+    use super::*;
+    use fracture_core::{DType, DeviceTimer, FractureError, ModelConfig, TensorId};
+    use fracture_gguf::{LayerWeights, WeightStore};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    struct MockBackend {
+        next_id: AtomicU64,
+        fail_on_matmul: bool,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1000),
+                fail_on_matmul: false,
+            }
+        }
+
+        fn failing_matmul() -> Self {
+            Self {
+                next_id: AtomicU64::new(1000),
+                fail_on_matmul: true,
+            }
+        }
+    }
+
+    impl Backend for MockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> Result<()> {
+            // Zero-fill so logits decode to valid f16 zeros
+            dst.fill(0);
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> {
+            if self.fail_on_matmul {
+                return Err(FractureError::Backend("mock matmul failure".into()));
+            }
+            Ok(())
+        }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "mock" }
+        fn total_memory(&self) -> usize { 1_000_000_000 }
+        fn available_memory(&self) -> usize { 1_000_000_000 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    fn test_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 8,
+            num_layers: 1,
+            num_q_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 16,
+            vocab_size: 32,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            max_seq_len: 512,
+        }
+    }
+
+    fn mock_tensor(id: u64, shape: Vec<usize>) -> DeviceTensor {
+        DeviceTensor::new(TensorId(id), shape, DType::FP16)
+    }
+
+    fn mock_weights(cfg: &ModelConfig) -> WeightStore {
+        let h = cfg.hidden_size;
+        let kv = cfg.num_kv_heads * cfg.head_dim;
+        let inter = cfg.intermediate_size;
+        let mut id = 1u64;
+        let mut t = |shape: Vec<usize>| -> DeviceTensor {
+            let t = mock_tensor(id, shape);
+            id += 1;
+            t
+        };
+
+        let layers = (0..cfg.num_layers)
+            .map(|_| LayerWeights {
+                q_proj: t(vec![h, h]),
+                k_proj: t(vec![kv, h]),
+                v_proj: t(vec![kv, h]),
+                o_proj: t(vec![h, h]),
+                gate_proj: t(vec![inter, h]),
+                up_proj: t(vec![inter, h]),
+                down_proj: t(vec![h, inter]),
+                attn_norm: t(vec![h]),
+                ffn_norm: t(vec![h]),
+            })
+            .collect();
+
+        WeightStore {
+            config: cfg.clone(),
+            token_embedding: t(vec![cfg.vocab_size, h]),
+            layers,
+            output_norm: t(vec![h]),
+            lm_head: t(vec![cfg.vocab_size, h]),
+        }
+    }
+
+    /// Verify that forward() with empty token_ids returns an error, not a panic.
+    #[test]
+    fn test_forward_empty_token_ids_returns_error() {
+        let cfg = test_config();
+        let backend = MockBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        // Empty token_ids should fail (seq_len=0 causes zero-size allocs or index OOB)
+        let result = engine.forward(&[], &[], &mut cache, handle, None);
+        assert!(result.is_err(), "forward with empty tokens should return Err");
+    }
+
+    /// Verify that a backend error during forward() propagates as FractureError::Backend.
+    #[test]
+    fn test_forward_backend_error_propagation() {
+        let cfg = test_config();
+        let backend = MockBackend::failing_matmul();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let result = engine.forward(&[1], &[0], &mut cache, handle, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, FractureError::Backend(_)),
+            "expected Backend error, got: {err:?}"
+        );
+        assert!(err.to_string().contains("mock matmul failure"));
+    }
+
+    // ── RecordingMockBackend ──────────────────────────────────────
+
+    /// A mock backend that records profiling-related calls (timers and markers)
+    /// while providing the same no-op behavior as MockBackend for compute ops.
+    struct RecordingMockBackend {
+        next_id: AtomicU64,
+        timer_create_count: AtomicU64,
+        marker_names: Mutex<Vec<String>>,
+        marker_pop_count: AtomicU64,
+        timer_stop_value: f32,
+    }
+
+    impl RecordingMockBackend {
+        fn new(timer_stop_value: f32) -> Self {
+            Self {
+                next_id: AtomicU64::new(1000),
+                timer_create_count: AtomicU64::new(0),
+                marker_names: Mutex::new(Vec::new()),
+                marker_pop_count: AtomicU64::new(0),
+                timer_stop_value,
+            }
+        }
+    }
+
+    impl Backend for RecordingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> Result<()> {
+            dst.fill(0);
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "recording-mock" }
+        fn total_memory(&self) -> usize { 1_000_000_000 }
+        fn available_memory(&self) -> usize { 1_000_000_000 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+
+        fn create_timer(&self) -> Result<DeviceTimer> {
+            self.timer_create_count.fetch_add(1, Ordering::Relaxed);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(DeviceTimer(id))
+        }
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> {
+            Ok(self.timer_stop_value)
+        }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+
+        fn marker_push(&self, name: &str) {
+            self.marker_names.lock().unwrap().push(name.to_string());
+        }
+        fn marker_pop(&self) {
+            self.marker_pop_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // ── Profiling dispatch tests ──────────────────────────────────
+
+    /// Verify that forward() with profiling enabled populates ForwardProfile
+    /// with the correct number of LayerProfile entries and timing data.
+    #[test]
+    fn test_forward_with_profiling_collects_layer_profiles() {
+        let cfg = test_config(); // 1 layer
+        let backend = RecordingMockBackend::new(1.0); // stop_timer returns 1.0 ms
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(
+            cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+        );
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let mut profile = ForwardProfile {
+            total_ms: 0.0,
+            prefill: false,
+            seq_len: 0,
+            layer_profiles: Vec::new(),
+        };
+
+        let result = engine.forward(&[1], &[0], &mut cache, handle, Some(&mut profile));
+        assert!(result.is_ok(), "forward should succeed: {:?}", result.err());
+
+        assert_eq!(
+            profile.layer_profiles.len(),
+            1,
+            "should have exactly 1 layer profile for 1-layer config"
+        );
+        assert_eq!(profile.layer_profiles[0].layer_idx, 0);
+        assert!(
+            profile.total_ms > 0.0,
+            "total_ms should be positive when stop_timer returns 1.0, got {}",
+            profile.total_ms
+        );
+    }
+
+    /// Verify that forward() emits NVTX markers (marker_push/marker_pop)
+    /// for each layer, regardless of whether profiling is enabled.
+    #[test]
+    fn test_forward_emits_nvtx_markers() {
+        let cfg = test_config(); // 1 layer
+        let backend = RecordingMockBackend::new(0.0);
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(
+            cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+        );
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        // Run with profile=None — markers should still fire
+        let result = engine.forward(&[1], &[0], &mut cache, handle, None);
+        assert!(result.is_ok(), "forward should succeed: {:?}", result.err());
+
+        let marker_names = engine.backend().marker_names.lock().unwrap();
+        assert!(
+            marker_names.contains(&"layer_0".to_string()),
+            "marker_push should be called with 'layer_0', got: {:?}",
+            *marker_names
+        );
+
+        let pop_count = engine.backend().marker_pop_count.load(Ordering::Relaxed);
+        assert_eq!(
+            pop_count,
+            marker_names.len() as u64,
+            "marker_pop count ({}) should equal marker_push count ({})",
+            pop_count,
+            marker_names.len()
+        );
+    }
+
+    /// Verify that forward() with profile=None does NOT create any GPU timers,
+    /// ensuring zero overhead when profiling is disabled.
+    #[test]
+    fn test_forward_no_profiling_skips_timers() {
+        let cfg = test_config(); // 1 layer
+        let backend = RecordingMockBackend::new(0.0);
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(
+            cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+        );
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let result = engine.forward(&[1], &[0], &mut cache, handle, None);
+        assert!(result.is_ok(), "forward should succeed: {:?}", result.err());
+
+        let timer_count = engine.backend().timer_create_count.load(Ordering::Relaxed);
+        assert_eq!(
+            timer_count, 0,
+            "create_timer should not be called when profiling is disabled, but was called {} times",
+            timer_count
+        );
+    }
+
+    // ── CopyRowsRecordingBackend ─────────────────────────────────
+
+    /// Records copy_rows calls to verify KV cache append behavior.
+    struct CopyRowsRecordingBackend {
+        next_id: AtomicU64,
+        /// (src_id, dst_id, src_offset, dst_offset, count)
+        copy_rows_calls: Mutex<Vec<(u64, u64, usize, usize, usize)>>,
+    }
+
+    impl CopyRowsRecordingBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1000),
+                copy_rows_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for CopyRowsRecordingBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> Result<()> {
+            dst.fill(0);
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, src: &DeviceTensor, dst: &DeviceTensor, src_offset: usize, dst_offset: usize, count: usize) -> Result<()> {
+            self.copy_rows_calls.lock().unwrap().push((src.id.0, dst.id.0, src_offset, dst_offset, count));
+            Ok(())
+        }
+        fn device_name(&self) -> &str { "copy-rows-mock" }
+        fn total_memory(&self) -> usize { 1_000_000_000 }
+        fn available_memory(&self) -> usize { 1_000_000_000 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    // ── Cache append tests ───────────────────────────────────────
+
+    /// Verify that prefill with multiple tokens calls copy_rows with
+    /// src_offset=0, dst_offset=0 (start_pos), count=seq_len for K and V.
+    #[test]
+    fn test_cache_append_prefill() {
+        let cfg = test_config();
+        let backend = CopyRowsRecordingBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        // Prefill with 3 tokens
+        let result = engine.forward(&[1, 2, 3], &[0, 1, 2], &mut cache, handle, None);
+        assert!(result.is_ok(), "forward should succeed: {:?}", result.err());
+
+        let calls = engine.backend().copy_rows_calls.lock().unwrap();
+        // For 1 layer: 2 copy_rows (K and V), each with count=3, dst_offset=0
+        let prefill_copies: Vec<_> = calls.iter().filter(|c| c.4 == 3).collect(); // count==3
+        assert!(
+            prefill_copies.len() >= 2,
+            "expected at least 2 copy_rows with count=3 (K+V), got {}: {:?}",
+            prefill_copies.len(), *calls
+        );
+        // All prefill copies should have dst_offset=0 (start_pos was 0)
+        for c in &prefill_copies {
+            assert_eq!(c.3, 0, "prefill dst_offset should be 0, got {}", c.3);
+        }
+    }
+
+    /// Verify that a single-token decode step calls copy_rows with
+    /// count=1 and dst_offset=start_pos (the position after prefill).
+    #[test]
+    fn test_cache_append_decode() {
+        let cfg = test_config();
+        let backend = CopyRowsRecordingBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        // Prefill with 3 tokens first
+        engine.forward(&[1, 2, 3], &[0, 1, 2], &mut cache, handle, None).unwrap();
+
+        // Clear recorded calls
+        engine.backend().copy_rows_calls.lock().unwrap().clear();
+
+        // Decode: single token at position 3
+        let result = engine.forward(&[4], &[3], &mut cache, handle, None);
+        assert!(result.is_ok(), "decode forward should succeed: {:?}", result.err());
+
+        let calls = engine.backend().copy_rows_calls.lock().unwrap();
+        // Should have copy_rows with count=1, dst_offset=3 (start_pos after prefill set seq_len=3)
+        let decode_copies: Vec<_> = calls.iter().filter(|c| c.4 == 1).collect();
+        assert!(
+            decode_copies.len() >= 2,
+            "expected at least 2 copy_rows with count=1 (K+V), got {}: {:?}",
+            decode_copies.len(), *calls
+        );
+        for c in &decode_copies {
+            assert_eq!(c.3, 3, "decode dst_offset should be 3 (start_pos), got {}", c.3);
+        }
+    }
+
+    /// Verify partial layer range: Engine with layer_range 0..1 out of 2 layers
+    /// should still produce logits (since we have all the global tensors).
+    #[test]
+    fn test_partial_layer_range() {
+        let mut cfg = test_config();
+        cfg.num_layers = 2; // model has 2 layers
+        let backend = MockBackend::new();
+        let weights = mock_weights(&cfg);
+        // Only process layer 0
+        let engine = Engine::new(backend, weights, 0..1);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let result = engine.forward(&[1], &[0], &mut cache, handle, None);
+        assert!(result.is_ok(), "partial layer range should succeed: {:?}", result.err());
+
+        let logits = result.unwrap();
+        assert_eq!(logits.len(), cfg.vocab_size, "should still produce vocab_size logits");
+    }
 }

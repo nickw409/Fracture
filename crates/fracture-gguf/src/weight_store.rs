@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use fracture_core::{Backend, DeviceTensor, FractureError, ModelConfig, Result};
+use fracture_core::{Backend, DType, DeviceTensor, FractureError, ModelConfig, Result};
 
 use crate::parser::{GgufParser, TensorInfo};
 
@@ -99,8 +99,82 @@ fn upload_tensor<B: Backend>(
     }
 
     let slice = &mmap[start..end];
-    let device_tensor = backend.alloc(&tensor.shape, tensor.dtype)?;
-    backend.copy_to_device(&device_tensor, slice)?;
+
+    // GGUF norm weights are stored as F32 but the engine operates in FP16.
+    // Convert on the host before uploading.
+    if tensor.dtype == DType::FP32 {
+        let f16_bytes: Vec<u8> = slice
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                half::f16::from_f32(val).to_le_bytes()
+            })
+            .collect();
+        let device_tensor = backend.alloc(&tensor.shape, DType::FP16)?;
+        backend.copy_to_device(&device_tensor, &f16_bytes)?;
+        Ok(device_tensor)
+    } else {
+        let device_tensor = backend.alloc(&tensor.shape, tensor.dtype)?;
+        backend.copy_to_device(&device_tensor, slice)?;
+        Ok(device_tensor)
+    }
+}
+
+/// Reverse the RoPE interleaving that llama.cpp's convert_hf_to_gguf.py applies to Q and K
+/// weight matrices. Within each attention head's output rows, even-indexed rows hold the
+/// first half of the head and odd-indexed rows hold the second half.
+/// This function restores the original PyTorch row ordering.
+fn reverse_qk_permutation(data: &[u8], num_heads: usize, head_dim: usize, hidden: usize) -> Vec<u8> {
+    let half = head_dim / 2;
+    let row_bytes = hidden * 2; // FP16
+    let head_bytes = head_dim * row_bytes;
+    let mut out = vec![0u8; data.len()];
+
+    for h in 0..num_heads {
+        let head_start = h * head_bytes;
+        for i in 0..half {
+            // Even row (2*i) in GGUF → row i in original (first half of head)
+            let src = head_start + (2 * i) * row_bytes;
+            let dst = head_start + i * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+
+            // Odd row (2*i+1) in GGUF → row i+half in original (second half of head)
+            let src = head_start + (2 * i + 1) * row_bytes;
+            let dst = head_start + (i + half) * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+        }
+    }
+    out
+}
+
+/// Upload a Q or K weight tensor, reversing the RoPE interleave permutation.
+fn upload_qk_tensor<B: Backend>(
+    backend: &B,
+    tensor: &TensorInfo,
+    mmap: &[u8],
+    tensor_data_offset: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<DeviceTensor> {
+    let numel: usize = tensor.shape.iter().product();
+    let byte_size = numel * tensor.dtype.size_bytes();
+    let start = tensor_data_offset + tensor.offset as usize;
+    let end = start + byte_size;
+
+    if end > mmap.len() {
+        return Err(FractureError::WeightLoad(format!(
+            "tensor '{}' data [{start}..{end}) exceeds mmap length {}",
+            tensor.name,
+            mmap.len()
+        )));
+    }
+
+    let slice = &mmap[start..end];
+    let hidden = tensor.shape[1];
+    let fixed = reverse_qk_permutation(slice, num_heads, head_dim, hidden);
+
+    let device_tensor = backend.alloc(&tensor.shape, DType::FP16)?;
+    backend.copy_to_device(&device_tensor, &fixed)?;
     Ok(device_tensor)
 }
 
@@ -174,12 +248,23 @@ impl WeightStore {
         consumed.insert("output_norm.weight");
         consumed.insert("output.weight");
 
+        let head_dim = gguf.config.head_dim;
+        let num_q_heads = gguf.config.num_q_heads;
+        let num_kv_heads = gguf.config.num_kv_heads;
+
         for layer_idx in range.clone() {
             let builder_idx = layer_idx - range.start;
             for &(suffix, setter) in layer_fields {
                 let name = format!("blk.{layer_idx}.{suffix}");
                 if let Some(info) = tensor_map.get(name.as_str()) {
-                    let device_tensor = upload_tensor(backend, info, mmap, data_offset)?;
+                    // Q and K weights need RoPE interleave reversal
+                    let device_tensor = if suffix == "attn_q.weight" {
+                        upload_qk_tensor(backend, info, mmap, data_offset, num_q_heads, head_dim)?
+                    } else if suffix == "attn_k.weight" {
+                        upload_qk_tensor(backend, info, mmap, data_offset, num_kv_heads, head_dim)?
+                    } else {
+                        upload_tensor(backend, info, mmap, data_offset)?
+                    };
                     setter(&mut layer_builders[builder_idx], device_tensor);
                     consumed.insert(info.name.as_str());
                 }
@@ -416,7 +501,8 @@ mod tests {
     fn write_tensor_info(buf: &mut Vec<u8>, name: &str, shape: &[u64], dtype: u32, offset: u64) {
         write_gguf_string(buf, name);
         buf.write_u32::<LittleEndian>(shape.len() as u32).unwrap();
-        for &dim in shape {
+        // Write dims in GGUF order (innermost first = reversed)
+        for &dim in shape.iter().rev() {
             buf.write_u64::<LittleEndian>(dim).unwrap();
         }
         buf.write_u32::<LittleEndian>(dtype).unwrap();
@@ -515,7 +601,7 @@ mod tests {
         let mut buf = Vec::new();
 
         // Header
-        buf.write_u32::<LittleEndian>(0x46475547).unwrap(); // GGUF_MAGIC
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap(); // GGUF_MAGIC
         buf.write_u32::<LittleEndian>(3).unwrap(); // version
         buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
         buf.write_u64::<LittleEndian>(metadata_count as u64).unwrap();
@@ -612,7 +698,7 @@ mod tests {
 
         let mut buf = Vec::new();
 
-        buf.write_u32::<LittleEndian>(0x46475547).unwrap();
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap();
         buf.write_u32::<LittleEndian>(3).unwrap();
         buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
         buf.write_u64::<LittleEndian>(metadata_count as u64).unwrap();
@@ -963,6 +1049,446 @@ mod tests {
         assert!(
             msg.contains("layer_range end 10") && msg.contains("2"),
             "expected error about range exceeding layer count: {msg}"
+        );
+    }
+
+    /// A MockBackend that captures the bytes passed to copy_to_device for each tensor.
+    struct CapturingMockBackend {
+        next_id: AtomicU64,
+        /// Maps TensorId -> (shape, dtype, bytes) for each copy_to_device call.
+        captured: std::sync::Mutex<HashMap<u64, (Vec<usize>, DType, Vec<u8>)>>,
+    }
+
+    impl CapturingMockBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+                captured: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn get_captured(&self, id: u64) -> Option<(Vec<usize>, DType, Vec<u8>)> {
+            self.captured.lock().unwrap().get(&id).cloned()
+        }
+    }
+
+    impl Backend for CapturingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            // Pre-register with empty bytes so we know shape/dtype
+            self.captured
+                .lock()
+                .unwrap()
+                .insert(id, (shape.to_vec(), dtype, Vec::new()));
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_to_device(&self, dst: &DeviceTensor, src: &[u8]) -> Result<()> {
+            let mut map = self.captured.lock().unwrap();
+            if let Some(entry) = map.get_mut(&dst.id.0) {
+                entry.2 = src.to_vec();
+            }
+            Ok(())
+        }
+
+        fn copy_to_host(&self, _src: &DeviceTensor, _dst: &mut [u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn matmul(
+            &self,
+            _a: &DeviceTensor,
+            _b: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rmsnorm(
+            &self,
+            _input: &DeviceTensor,
+            _weight: &DeviceTensor,
+            _eps: f64,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn rope(
+            &self,
+            _q: &DeviceTensor,
+            _k: &DeviceTensor,
+            _positions: &[u32],
+            _theta: f64,
+            _head_dim: usize,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn attention(
+            &self,
+            _q: &DeviceTensor,
+            _k_cache: &DeviceTensor,
+            _v_cache: &DeviceTensor,
+            _num_kv_heads: usize,
+            _start_pos: usize,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn silu_mul(
+            &self,
+            _gate: &DeviceTensor,
+            _up: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn embedding(
+            &self,
+            _token_ids: &[u32],
+            _embedding_table: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn add(
+            &self,
+            _a: &DeviceTensor,
+            _b: &DeviceTensor,
+            _out: &DeviceTensor,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn copy_rows(
+            &self,
+            _src: &DeviceTensor,
+            _dst: &DeviceTensor,
+            _src_offset: usize,
+            _dst_offset: usize,
+            _count: usize,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn device_name(&self) -> &str {
+            "capturing-mock"
+        }
+
+        fn total_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn available_memory(&self) -> usize {
+            1 << 30
+        }
+
+        fn synchronize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_timer(&self) -> Result<DeviceTimer> {
+            Ok(DeviceTimer(0))
+        }
+
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> {
+            Ok(0.0)
+        }
+
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a GGUF where norm weights (attn_norm, ffn_norm, output_norm) are stored as F32
+    /// while all other tensors remain FP16.
+    fn build_gguf_with_f32_norms(num_layers: usize) -> Vec<u8> {
+        let hidden: u64 = 64;
+        let kv_dim: u64 = 32;
+        let ffn: u64 = 128;
+        let vocab: u64 = 4;
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+            dtype_code: u32, // 0=FP32, 1=FP16
+            byte_size: u64,
+        }
+
+        let mut tensors: Vec<TensorSpec> = Vec::new();
+
+        // Global tensors
+        tensors.push(TensorSpec {
+            name: "token_embd.weight".into(),
+            shape: vec![vocab, hidden],
+            dtype_code: 1,
+            byte_size: vocab * hidden * 2,
+        });
+        // output_norm is F32
+        tensors.push(TensorSpec {
+            name: "output_norm.weight".into(),
+            shape: vec![hidden],
+            dtype_code: 0, // F32
+            byte_size: hidden * 4,
+        });
+        tensors.push(TensorSpec {
+            name: "output.weight".into(),
+            shape: vec![vocab, hidden],
+            dtype_code: 1,
+            byte_size: vocab * hidden * 2,
+        });
+
+        for layer in 0..num_layers {
+            // FP16 tensors
+            for (suffix, shape) in &[
+                ("attn_q.weight", vec![hidden, hidden]),
+                ("attn_k.weight", vec![kv_dim, hidden]),
+                ("attn_v.weight", vec![kv_dim, hidden]),
+                ("attn_output.weight", vec![hidden, hidden]),
+                ("ffn_gate.weight", vec![ffn, hidden]),
+                ("ffn_up.weight", vec![ffn, hidden]),
+                ("ffn_down.weight", vec![hidden, ffn]),
+            ] {
+                let numel: u64 = shape.iter().product();
+                tensors.push(TensorSpec {
+                    name: format!("blk.{layer}.{suffix}"),
+                    shape: shape.clone(),
+                    dtype_code: 1,
+                    byte_size: numel * 2,
+                });
+            }
+            // F32 norm tensors
+            for suffix in &["attn_norm.weight", "ffn_norm.weight"] {
+                tensors.push(TensorSpec {
+                    name: format!("blk.{layer}.{suffix}"),
+                    shape: vec![hidden],
+                    dtype_code: 0, // F32
+                    byte_size: hidden * 4,
+                });
+            }
+        }
+
+        // Compute offsets
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut data_size: u64 = 0;
+        for t in &tensors {
+            offsets.push(data_size);
+            data_size += t.byte_size;
+        }
+
+        let tensor_count = tensors.len();
+        let metadata_count = 8;
+
+        let mut buf = Vec::new();
+
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
+        buf.write_u64::<LittleEndian>(metadata_count as u64).unwrap();
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", hidden as u32);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", num_layers as u32);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", ffn as u32);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &["a", "b", "c", "d"],
+        );
+
+        for (i, t) in tensors.iter().enumerate() {
+            write_tensor_info(&mut buf, &t.name, &t.shape, t.dtype_code, offsets[i]);
+        }
+
+        let current = buf.len();
+        let aligned = align_offset(current, 32);
+        buf.resize(aligned, 0);
+
+        // Write tensor data. For F32 norm tensors, write known f32 values.
+        let data_start = buf.len();
+        buf.extend(vec![0u8; data_size as usize]);
+
+        // Write known F32 values into the output_norm and per-layer norm tensors
+        // We'll write [1.0, 2.0, 3.0, ...] as f32 into each F32 tensor
+        for (i, t) in tensors.iter().enumerate() {
+            if t.dtype_code == 0 {
+                // F32 tensor
+                let start = data_start + offsets[i] as usize;
+                let numel = (t.byte_size / 4) as usize;
+                for j in 0..numel {
+                    let val = (j + 1) as f32;
+                    let bytes = val.to_le_bytes();
+                    let off = start + j * 4;
+                    buf[off..off + 4].copy_from_slice(&bytes);
+                }
+            }
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_f32_to_fp16_conversion() {
+        let data = build_gguf_with_f32_norms(1);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = CapturingMockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+
+        // output_norm should have been converted from F32 to FP16
+        let norm_id = store.output_norm.id.0;
+        let (shape, dtype, bytes) = backend.get_captured(norm_id).unwrap();
+        assert_eq!(shape, vec![64]);
+        assert_eq!(dtype, DType::FP16, "output_norm should be allocated as FP16");
+        // 64 elements * 2 bytes = 128 bytes (FP16), NOT 64*4=256 (FP32)
+        assert_eq!(bytes.len(), 64 * 2, "expected FP16 byte count (128), got {}", bytes.len());
+
+        // Verify the FP16 values are correct conversions from [1.0, 2.0, ..., 64.0]
+        for i in 0..64usize {
+            let expected_f32 = (i + 1) as f32;
+            let expected_f16 = half::f16::from_f32(expected_f32);
+            let actual_bytes = [bytes[i * 2], bytes[i * 2 + 1]];
+            let actual_f16 = half::f16::from_le_bytes(actual_bytes);
+            assert_eq!(
+                actual_f16, expected_f16,
+                "element {i}: expected f16({expected_f32}) = {expected_f16}, got {actual_f16}"
+            );
+        }
+
+        // Also check per-layer norms
+        let layer = &store.layers[0];
+        let attn_norm_id = layer.attn_norm.id.0;
+        let (_, dtype, bytes) = backend.get_captured(attn_norm_id).unwrap();
+        assert_eq!(dtype, DType::FP16, "attn_norm should be FP16");
+        assert_eq!(bytes.len(), 64 * 2);
+
+        let ffn_norm_id = layer.ffn_norm.id.0;
+        let (_, dtype, bytes) = backend.get_captured(ffn_norm_id).unwrap();
+        assert_eq!(dtype, DType::FP16, "ffn_norm should be FP16");
+        assert_eq!(bytes.len(), 64 * 2);
+    }
+
+    #[test]
+    fn test_reverse_qk_permutation_correctness() {
+        // Test with 2 heads, head_dim=4, hidden=8
+        // Each head has head_dim=4 rows of hidden*2=16 bytes each
+        // head_bytes = head_dim * row_bytes = 4 * 16 = 64
+        // total = 2 heads * 64 = 128 bytes
+        let num_heads = 2;
+        let head_dim = 4;
+        let hidden = 8;
+        let _half_dim = head_dim / 2; // 2
+        let row_bytes = hidden * 2; // 16 bytes per row (FP16)
+        let total_bytes = num_heads * head_dim * row_bytes; // 128
+
+        // Create interleaved input where:
+        //   even rows (0, 2) contain first-half data
+        //   odd rows (1, 3) contain second-half data
+        // For head 0:
+        //   row 0 (even, i=0, first-half row 0): fill with 0x10
+        //   row 1 (odd,  i=0, second-half row 0): fill with 0x20
+        //   row 2 (even, i=1, first-half row 1): fill with 0x30
+        //   row 3 (odd,  i=1, second-half row 1): fill with 0x40
+        // For head 1:
+        //   row 0: 0x50, row 1: 0x60, row 2: 0x70, row 3: 0x80
+        let mut input = vec![0u8; total_bytes];
+        let fill_values: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+        for (row_idx, &val) in fill_values.iter().enumerate() {
+            let start = row_idx * row_bytes;
+            for b in &mut input[start..start + row_bytes] {
+                *b = val;
+            }
+        }
+
+        let output = reverse_qk_permutation(&input, num_heads, head_dim, hidden);
+        assert_eq!(output.len(), total_bytes);
+
+        // Expected output after de-interleaving:
+        // Head 0 (rows 0-3 of output):
+        //   row 0 = first-half row 0 (from even row 0) = 0x10
+        //   row 1 = first-half row 1 (from even row 2) = 0x30
+        //   row 2 = second-half row 0 (from odd row 1) = 0x20
+        //   row 3 = second-half row 1 (from odd row 3) = 0x40
+        // Head 1 (rows 4-7 of output):
+        //   row 4 = 0x50, row 5 = 0x70, row 6 = 0x60, row 7 = 0x80
+        let expected_vals: [u8; 8] = [0x10, 0x30, 0x20, 0x40, 0x50, 0x70, 0x60, 0x80];
+        for (row_idx, &expected_val) in expected_vals.iter().enumerate() {
+            let start = row_idx * row_bytes;
+            for (byte_idx, &b) in output[start..start + row_bytes].iter().enumerate() {
+                assert_eq!(
+                    b, expected_val,
+                    "row {row_idx}, byte {byte_idx}: expected 0x{expected_val:02x}, got 0x{b:02x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_weight_store_missing_global_tensor() {
+        // Missing token_embd.weight
+        let data = build_gguf_without(1, &["token_embd.weight"]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("token_embd.weight"),
+            "expected mention of token_embd.weight in: {err}"
+        );
+
+        // Missing output_norm.weight
+        let data = build_gguf_without(1, &["output_norm.weight"]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("output_norm.weight"),
+            "expected mention of output_norm.weight in: {err}"
+        );
+
+        // Missing output.weight
+        let data = build_gguf_without(1, &["output.weight"]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let result = WeightStore::load(&path, &backend, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, FractureError::WeightLoad(_)),
+            "expected WeightLoad, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("output.weight"),
+            "expected mention of output.weight in: {err}"
         );
     }
 

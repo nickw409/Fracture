@@ -100,7 +100,7 @@ impl Sampler {
             }
         }
 
-        Ok(indices[*filtered.last().unwrap()] as u32)
+        Ok(indices[*filtered.last().unwrap()] as u32) // safe: filtered is non-empty (logits checked above)
     }
 }
 
@@ -522,6 +522,55 @@ mod tests {
             assert_eq!(
                 token, 1,
                 "with top_k=3 and top_p=0.3 on a dominant logit, only the top token should be selected"
+            );
+        }
+    }
+
+    /// Verify the sampler produces an approximately uniform distribution
+    /// when given uniform logits and temperature=1.0.
+    #[test]
+    fn test_sampler_softmax_empirical_uniform() {
+        let n = 4;
+        let logits = vec![0.0f32; n];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+
+        let mut counts = vec![0u32; n];
+        let trials = 10000;
+        for _ in 0..trials {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            counts[token as usize] += 1;
+        }
+
+        let expected = trials as f64 / n as f64;
+        for (i, &c) in counts.iter().enumerate() {
+            let ratio = c as f64 / expected;
+            assert!(
+                ratio > 0.7 && ratio < 1.3,
+                "token {i}: count {c}, expected ~{expected}, ratio {ratio:.2}"
+            );
+        }
+    }
+
+    /// Verify top-K is applied before top-P by using logits where the order matters.
+    /// top_k=3 restricts to indices 0,1,2, then top_p=0.99 keeps all 3.
+    /// Tokens 3 and 4 should never appear.
+    #[test]
+    fn test_combined_filtering_order_k_before_p() {
+        let logits = vec![10.0, 9.0, 8.0, 1.0, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 0.99,
+        };
+        for _ in 0..200 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert!(
+                token <= 2,
+                "token {token} should be in top-3 (0,1,2)"
             );
         }
     }

@@ -60,12 +60,22 @@ sections:
           num_q_heads % num_kv_heads != 0. This invariant is assumed by
           the attention kernel where group_size = num_q_heads / num_kv_heads.
 
-      - name: dtype-support
+      - name: device-tensor-metadata
         status: implemented
         description: |
-          DType enum covers FP16, FP32, BF16, INT8, INT4. Size-in-bytes
-          calculation is correct for each variant. DType is used in DeviceTensor
-          metadata and tensor serialization.
+          DeviceTensor exposes shape, dtype, and element count but never
+          exposes device pointers. Operations that require shape/dtype
+          (e.g., size validation, reshape) work correctly through the
+          opaque handle. Only the backend can map a TensorId to actual
+          device memory.
+
+      - name: dtype-size-calculation
+        status: implemented
+        description: |
+          DType::size_bytes returns correct byte sizes for each variant:
+          FP16=2, FP32=4, BF16=2, INT8=1. Used pervasively for buffer
+          size validation in copy_to_device, copy_to_host, and weight loading.
+          Incorrect sizes would cause silent memory corruption.
 
   # ============================================================
   # GGUF PARSER AND WEIGHT LOADING
@@ -82,9 +92,10 @@ sections:
       - name: header-parsing
         status: implemented
         description: |
-          Reads GGUF magic number (0x46475547) and version. Rejects files with
-          wrong magic number. Rejects unsupported versions (only v3 supported).
-          Extracts tensor count and metadata KV count from header.
+          Reads GGUF magic number (0x46554747, "GGUF" as LE u32) and version.
+          Rejects files with wrong magic number. Rejects unsupported versions
+          (only v3 supported). Extracts tensor count and metadata KV count
+          from header.
 
       - name: metadata-extraction
         status: implemented
@@ -98,18 +109,34 @@ sections:
         status: implemented
         description: |
           Parses the tensor info table. Extracts tensor name, shape, data type,
-          and byte offset for each tensor. Validates that expected tensors exist
-          for the Llama architecture (embedding, per-layer Q/K/V/O/gate/up/down/norms,
-          output norm, LM head). Errors on missing required tensors.
+          and byte offset for each tensor. GGUF stores dimensions innermost-first;
+          the parser reverses them to row-major order. Validates that expected
+          tensors exist for the Llama architecture (embedding, per-layer
+          Q/K/V/O/gate/up/down/norms, output norm, LM head). Errors on missing
+          required tensors.
 
       - name: weight-loading
         status: implemented
         description: |
           Memory-maps the GGUF file and copies tensor data to GPU memory.
           Respects alignment requirements (256-byte aligned GPU allocations).
-          Handles FP16 tensor data type. Validates tensor byte sizes match
-          expected shape x dtype size. Returns WeightStore with all tensors
-          on GPU. Errors on size mismatches or GPU allocation failures.
+          Handles FP16 and FP32 tensor data types — F32 norm weights are
+          converted to FP16 on the host before upload. Q and K weight matrices
+          have their RoPE interleave permutation reversed on load (llama.cpp's
+          convert_hf_to_gguf.py interleaves head rows for RoPE optimization;
+          this is undone so the engine uses standard PyTorch weight ordering).
+          Validates tensor byte sizes match expected shape x dtype size.
+          Returns WeightStore with all tensors on GPU as FP16.
+          Errors on size mismatches or GPU allocation failures.
+
+      - name: alignment-handling
+        status: implemented
+        description: |
+          GGUF v3 files specify a data alignment value in metadata (default 32
+          bytes). The parser uses this alignment to correctly compute the start
+          offset of the tensor data section after the metadata and tensor info
+          table. Incorrect alignment calculation would cause all tensor reads
+          to be shifted, producing corrupt weights.
 
       - name: truncated-file-detection
         status: implemented
@@ -186,10 +213,12 @@ sections:
         status: implemented
         description: |
           Applies rotary embedding to Q [N, 32, 128] and K [N, 8, 128] tensors.
-          Rotates pairs of adjacent dimensions using pre-computed sin/cos values
-          at the given sequence positions. Must handle non-contiguous positions
-          (e.g. positions=[47] during decode at step 47). Must match PyTorch
-          reference for both prefill (many positions) and decode (single position).
+          Uses the split-half convention matching PyTorch/HuggingFace: dimension
+          pairs (d, d+head_dim/2) are rotated together, not adjacent pairs.
+          Pre-computed sin/cos values are looked up at the given sequence positions.
+          Must handle non-contiguous positions (e.g. positions=[47] during decode
+          at step 47). Must match PyTorch reference for both prefill (many
+          positions) and decode (single position).
 
   - name: SiLU Multiply Kernel
     path: backends/fracture-cuda
@@ -273,27 +302,30 @@ sections:
     status: implemented
     description: |
       CUDA implementation of the Backend::matmul method. Wraps cuBLAS GEMM
-      for FP16 matrix multiplication with FP32 accumulation. Handles the
-      row-major to column-major translation via the transpose trick internally
-      — the engine always passes row-major tensors.
+      for FP16 matrix multiplication with FP32 accumulation. Computes
+      C = A @ B^T, matching the GGUF/PyTorch nn.Linear weight convention
+      where weights are stored as [N, K] (output_features x input_features).
+      Handles the row-major to column-major translation internally —
+      the engine always passes row-major tensors.
     shared: [numerical-correctness, error-handling]
     behaviors:
       - name: gemm-correctness
         status: implemented
         description: |
-          Computes C = A @ B where A is [M, K] and B is [K, N], all FP16 row-major.
-          Uses cublasGemmEx with CUBLAS_COMPUTE_32F. Row-major convention handled
-          via the transpose trick (swap A,B in cuBLAS call). Output C is [M, N] FP16.
-          Must match PyTorch matmul reference for the specific shapes used in Llama 3:
-          [1, 4096]x[4096, 4096], [512, 4096]x[4096, 14336], [1, 14336]x[14336, 4096],
-          [1, 4096]x[4096, 128256].
+          Computes C = A @ B^T where A is [M, K] and B is [N, K], all FP16
+          row-major. GGUF weight matrices are stored as [N, K] matching
+          PyTorch nn.Linear convention (y = x @ W^T). Uses cublasGemmEx with
+          CUBLAS_COMPUTE_32F and CUBLAS_OP_T on B. Output C is [M, N] FP16.
+          Must match PyTorch reference for the specific shapes used in Llama 3:
+          [1, 4096]x[4096, 4096], [512, 4096]x[14336, 4096],
+          [1, 14336]x[4096, 14336], [1, 4096]x[128256, 4096].
 
       - name: gemm-edge-cases
         status: implemented
         description: |
           Handles M=1 (decode) and large M (prefill) correctly. Handles the
-          asymmetric shapes in GQA (K/V projections are [4096, 1024] not [4096, 4096]).
-          Does not crash or produce NaN for any valid input shape.
+          asymmetric shapes in GQA (K/V projections are [1024, 4096] not
+          [4096, 4096]). Does not crash or produce NaN for any valid input shape.
 
   # ============================================================
   # CUDA BACKEND (MEMORY MANAGEMENT)
@@ -329,7 +361,7 @@ sections:
           buffers at the correct offset.
 
       - name: copy-rows-bounds-validation
-        status: not-implemented
+        status: implemented
         description: |
           copy_rows validates that the source row range (offset + count)
           does not exceed the source tensor's row dimension, and that the
@@ -439,6 +471,14 @@ sections:
           than writing out of bounds. Retrieval with seq_len=0 returns
           empty tensors (valid for first prefill step).
 
+      - name: cache-multi-sequence
+        status: implemented
+        description: |
+          Multiple sequences can be allocated and managed simultaneously
+          with independent cache state. Appending to or freeing one
+          sequence's cache does not corrupt another sequence's cached
+          values. Required for Phase 4 continuous batching.
+
   # ============================================================
   # COMPUTE ENGINE
   # ============================================================
@@ -496,12 +536,13 @@ sections:
           with per-layer LayerProfile structs.
 
       - name: prefill-decode-consistency
-        status: not-tested
+        status: implemented
         description: |
           The logits produced by decode step N+1 are identical to what you'd
           get by running prefill on the full sequence [0..N+1] and taking
           the last position's logits. This validates that KV caching produces
-          numerically identical results to recomputation.
+          numerically identical results to recomputation. Tested by
+          test_gpu_prefill_decode_consistency in GPU integration tests.
 
   # ============================================================
   # SAMPLING
@@ -603,6 +644,17 @@ sections:
           or max_tokens reached. The stop token itself is not included in the output.
           Cache is always freed on completion, even on error.
 
+      - name: greedy-golden-output
+        status: implemented
+        description: |
+          Greedy generation (temperature=0) on known prompts produces token
+          sequences matching PyTorch reference output. This is the top-level
+          end-to-end correctness property: prefill, sample, decode loop, and
+          stop must produce the expected tokens. Individual kernel and forward-pass
+          numerical correctness are necessary but not sufficient — this validates
+          the full pipeline including sampling, position tracking, and KV cache
+          interaction across multiple decode steps.
+
       - name: token-streaming
         status: implemented
         description: |
@@ -626,7 +678,7 @@ sections:
           server's stream-cancellation to propagate client disconnects.
 
       - name: prompt-exceeds-max-seq-len
-        status: not-implemented
+        status: implemented
         description: |
           When the tokenized prompt length exceeds max_seq_len, the generation
           loop returns a clear error before attempting prefill rather than
@@ -675,6 +727,23 @@ sections:
           When stream=false (default), waits for full generation to complete
           and returns the complete response in a single JSON object.
           Includes usage stats (prompt_tokens, completion_tokens, total_tokens).
+
+      - name: usage-stats-accuracy
+        status: implemented
+        description: |
+          Non-streaming responses include a usage object with prompt_tokens,
+          completion_tokens, and total_tokens that accurately reflect the
+          actual tokenized prompt length and number of generated tokens
+          (total = prompt + completion). Clients and billing systems depend
+          on these counts being exact.
+
+      - name: streaming-usage-stats
+        status: not-implemented
+        description: |
+          When stream=true, the final SSE chunk before [DONE] includes a
+          usage object with prompt_tokens, completion_tokens, and total_tokens,
+          matching OpenAI API behavior. Streaming clients also need token
+          counts for billing and monitoring.
 
       - name: request-validation
         status: implemented
