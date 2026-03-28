@@ -1231,7 +1231,7 @@ sections:
   # DISTRIBUTED PIPELINE (Phase 3)
   # ============================================================
   - name: Distributed Pipeline
-    path: crates/fracture-coordinator/src
+    path: [crates/fracture-coordinator/src, crates/fracture-coordinator/tests]
     status: implemented
     description: |
       Orchestrates forward passes across distributed workers. Sends
@@ -1281,6 +1281,13 @@ sections:
       registers with calibration data, receives layer assignment, loads
       weights, and serves Forward/Cache/Heartbeat requests.
     shared: [error-handling]
+    covered:
+      - behavior: worker-calibration
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_worker_lifecycle)
+      - behavior: worker-registration-handshake
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_worker_lifecycle, test_e2e_inference_pipeline)
+      - behavior: worker-serve-loop
+        reason: tested via e2e binary spawn (test_e2e_inference_pipeline exercises Forward/CacheAlloc/CacheFree) and mock protocol workers in crates/fracture-coordinator/tests/distributed_pipeline.rs
     behaviors:
       - name: worker-calibration
         status: implemented
@@ -1328,6 +1335,15 @@ sections:
       scheduler, assigns layers, builds the distributed pipeline, and
       serves an OpenAI-compatible HTTP API with async distributed generation.
     shared: [error-handling]
+    covered:
+      - behavior: coordinator-worker-acceptance
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_worker_lifecycle)
+      - behavior: coordinator-scheduling
+        reason: tested via e2e binary spawn (test_e2e_worker_lifecycle verifies pipeline becomes operational after scheduling)
+      - behavior: coordinator-http-api
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_inference_pipeline exercises /health, /v1/models, /v1/completions)
+      - behavior: coordinator-shutdown
+        reason: tested via e2e ProcessGuard which kills coordinator and verifies clean exit
     behaviors:
       - name: coordinator-worker-acceptance
         status: implemented
@@ -1390,7 +1406,7 @@ sections:
   # HEARTBEAT PROTOCOL (Phase 3)
   # ============================================================
   - name: Heartbeat Protocol
-    path: crates/fracture-coordinator/src
+    path: [crates/fracture-coordinator/src, crates/fracture-coordinator/tests]
     status: implemented
     description: |
       Coordinator-side heartbeat monitoring. Sends Heartbeat messages to
@@ -1410,7 +1426,7 @@ sections:
   # END-TO-END VALIDATION (Phase 3)
   # ============================================================
   - name: Distributed Inference Validation
-    path: scripts
+    path: [scripts, bins/fracture-coordinator-cuda/tests]
     status: implemented
     description: |
       End-to-end validation of distributed inference across machines.
