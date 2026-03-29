@@ -304,6 +304,180 @@ impl DistributedPipeline {
         ))
     }
 
+    /// Run a batched forward pass through the entire pipeline.
+    ///
+    /// Sends a batch of sequences to each worker, chaining activations
+    /// through the pipeline. Returns per-sequence logits from the tail worker.
+    pub async fn batched_forward(
+        &self,
+        registry: &mut PeerRegistry,
+        sequences: &[SequenceMetadataWire],
+        all_token_ids: &[u32],
+        all_positions: &[u32],
+        is_prefill: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        // Verify all sequences have allocated caches.
+        let seqs = self.allocated_seqs.lock().unwrap();
+        for s in sequences {
+            if !seqs.contains(&s.seq_id) {
+                return Err(FractureError::Pipeline(format!(
+                    "batched_forward: seq {} cache not allocated",
+                    s.seq_id
+                )));
+            }
+        }
+        drop(seqs);
+
+        let n = self.pipeline_order.len();
+
+        // First worker gets token IDs
+        let mut current_input = ForwardInputWire::TokenIds {
+            ids: all_token_ids.to_vec(),
+        };
+
+        for (i, node_id) in self.pipeline_order.iter().enumerate() {
+            let is_last = i == n - 1;
+
+            let payload = BatchedForwardPayload {
+                is_prefill,
+                sequences: sequences.to_vec(),
+                input: current_input,
+            };
+
+            let entry = registry.get_mut(node_id).ok_or_else(|| {
+                FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
+            })?;
+
+            // Use the first sequence's seq_id in the frame header for compatibility
+            let frame_seq_id = sequences.first().map(|s| s.seq_id).unwrap_or(0);
+            entry
+                .connection
+                .send(MessageType::BatchedForward, frame_seq_id, &payload)
+                .await?;
+
+            let (header, resp_payload) = entry.connection.recv().await?;
+
+            if header.msg_type == MessageType::Error {
+                let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
+                return Err(FractureError::Pipeline(format!(
+                    "worker '{}' returned error during batched forward: {} (code {:?})",
+                    node_id, err.message, err.error_code
+                )));
+            }
+
+            if header.msg_type == MessageType::BatchedForwardResult {
+                let result: BatchedForwardResultPayload =
+                    FramedConnection::deserialize_payload(&resp_payload)?;
+
+                match result.output {
+                    ForwardOutputWire::Logits { data } => {
+                        if !is_last {
+                            return Err(FractureError::Pipeline(format!(
+                                "non-tail worker '{}' returned logits in batched forward",
+                                node_id
+                            )));
+                        }
+                        // Split logits by per-sequence offsets.
+                        let all_logits: Vec<f32> = data
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+
+                        let vocab_size = if !sequences.is_empty() {
+                            all_logits.len() / sequences.len()
+                        } else {
+                            0
+                        };
+
+                        let per_seq: Vec<Vec<f32>> = sequences
+                            .iter()
+                            .enumerate()
+                            .map(|(si, _)| {
+                                let start = si * vocab_size;
+                                let end = start + vocab_size;
+                                all_logits[start..end].to_vec()
+                            })
+                            .collect();
+
+                        return Ok(per_seq);
+                    }
+                    ForwardOutputWire::Activations {
+                        tensor_header,
+                        tensor_data,
+                    } => {
+                        if is_last {
+                            return Err(FractureError::Pipeline(format!(
+                                "tail worker '{}' returned activations in batched forward",
+                                node_id
+                            )));
+                        }
+                        current_input = ForwardInputWire::Activations {
+                            tensor_header,
+                            tensor_data,
+                        };
+                    }
+                }
+            } else if header.msg_type == MessageType::ForwardResult {
+                // Worker responded with non-batched ForwardResult — handle gracefully.
+                let result: ForwardResultPayload =
+                    FramedConnection::deserialize_payload(&resp_payload)?;
+                match result.output {
+                    ForwardOutputWire::Logits { data } => {
+                        if !is_last {
+                            return Err(FractureError::Pipeline(format!(
+                                "non-tail worker '{}' returned logits",
+                                node_id
+                            )));
+                        }
+                        let all_logits: Vec<f32> = data
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        let vocab_size = if !sequences.is_empty() {
+                            all_logits.len() / sequences.len()
+                        } else {
+                            0
+                        };
+                        let per_seq: Vec<Vec<f32>> = sequences
+                            .iter()
+                            .enumerate()
+                            .map(|(si, _)| {
+                                let start = si * vocab_size;
+                                let end = start + vocab_size;
+                                all_logits[start..end].to_vec()
+                            })
+                            .collect();
+                        return Ok(per_seq);
+                    }
+                    ForwardOutputWire::Activations {
+                        tensor_header,
+                        tensor_data,
+                    } => {
+                        if is_last {
+                            return Err(FractureError::Pipeline(format!(
+                                "tail worker '{}' returned activations",
+                                node_id
+                            )));
+                        }
+                        current_input = ForwardInputWire::Activations {
+                            tensor_header,
+                            tensor_data,
+                        };
+                    }
+                }
+            } else {
+                return Err(FractureError::Protocol(format!(
+                    "expected BatchedForwardResult from '{}', got {:?}",
+                    node_id, header.msg_type
+                )));
+            }
+        }
+
+        Err(FractureError::Pipeline(
+            "batched pipeline completed without producing logits".into(),
+        ))
+    }
+
     /// Get the pipeline order (node IDs).
     pub fn pipeline_order(&self) -> &[String] {
         &self.pipeline_order
