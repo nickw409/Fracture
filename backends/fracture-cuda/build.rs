@@ -13,6 +13,7 @@ fn main() {
         "rope.cu",
         "silu_mul.cu",
         "attention.cu",
+        "attention_paged.cu",
         "embedding.cu",
         "add.cu",
     ];

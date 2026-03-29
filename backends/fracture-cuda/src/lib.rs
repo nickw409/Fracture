@@ -418,6 +418,85 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn attention_paged(
+        &self,
+        q: &DeviceTensor,
+        block_table: &[i32],
+        k_block_ptrs: &[*const c_void],
+        v_block_ptrs: &[*const c_void],
+        num_kv_heads: usize,
+        kv_len: usize,
+        start_pos: usize,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        nvtx::range_push("attention_paged");
+        let q_ptr = self.get_ptr(q.id)?;
+        let out_ptr = self.get_ptr(out.id)?;
+
+        let num_tokens = q.shape[0] as c_int;
+        let num_q_heads = q.shape[1] as c_int;
+        let head_dim = q.shape[2] as c_int;
+
+        // Copy block_table to device
+        let bt_size = block_table.len() * std::mem::size_of::<i32>();
+        let mut bt_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut bt_dev, bt_size));
+        cuda_check!(cudaMemcpy(
+            bt_dev,
+            block_table.as_ptr() as *const c_void,
+            bt_size,
+            CUDA_MEMCPY_HOST_TO_DEVICE
+        ));
+
+        // Copy K block pointers to device
+        let kbp_size = k_block_ptrs.len() * std::mem::size_of::<*const c_void>();
+        let mut kbp_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut kbp_dev, kbp_size));
+        cuda_check!(cudaMemcpy(
+            kbp_dev,
+            k_block_ptrs.as_ptr() as *const c_void,
+            kbp_size,
+            CUDA_MEMCPY_HOST_TO_DEVICE
+        ));
+
+        // Copy V block pointers to device
+        let vbp_size = v_block_ptrs.len() * std::mem::size_of::<*const c_void>();
+        let mut vbp_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut vbp_dev, vbp_size));
+        cuda_check!(cudaMemcpy(
+            vbp_dev,
+            v_block_ptrs.as_ptr() as *const c_void,
+            vbp_size,
+            CUDA_MEMCPY_HOST_TO_DEVICE
+        ));
+
+        cuda_check!(launch_paged_attention(
+            out_ptr,
+            q_ptr as *const c_void,
+            bt_dev as *const c_int,
+            kbp_dev as *const *const c_void,
+            vbp_dev as *const *const c_void,
+            num_tokens,
+            num_q_heads,
+            num_kv_heads as c_int,
+            head_dim,
+            kv_len as c_int,
+            start_pos as c_int,
+            block_table.len() as c_int,
+            self.stream,
+        ));
+
+        // Free temporary device allocations
+        unsafe {
+            cudaFree(bt_dev);
+            cudaFree(kbp_dev);
+            cudaFree(vbp_dev);
+        }
+
+        nvtx::range_pop();
+        Ok(())
+    }
+
     fn silu_mul(
         &self,
         gate: &DeviceTensor,

@@ -183,6 +183,22 @@ unsafe extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn launch_paged_attention(
+        output: *mut c_void,
+        q: *const c_void,
+        block_table: *const c_int,
+        k_block_ptrs: *const *const c_void,
+        v_block_ptrs: *const *const c_void,
+        num_tokens: c_int,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        kv_len: c_int,
+        start_pos: c_int,
+        num_blocks_in_seq: c_int,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn launch_embedding(
         output: *mut c_void,
         table: *const c_void,
