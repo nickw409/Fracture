@@ -4,6 +4,8 @@ description: |
   Phase 1: single-node inference for Llama 3 8B via GGUF, served over OpenAI-compatible HTTP API.
   Phase 2: node abstraction — engine operates on arbitrary layer ranges, accepts/returns activation
   tensors, enabling pipeline-parallel inference across multiple nodes on one machine.
+  Phase 3: distributed inference — wire protocol, scheduling, heartbeat, multi-machine pipeline.
+  Phase 4 (in progress): production inference — paged KV cache, continuous batching, fault tolerance.
   CUDA backend initially; engine is backend-agnostic via the Backend trait to support Metal in Phase 5+.
   Testing validates correctness at every layer from individual GPU kernels through end-to-end generation.
 
@@ -2136,3 +2138,176 @@ sections:
           to the coordinator is routed through the distributed pipeline and
           returns a correct response. Validates end-to-end from HTTP request
           through TCP-based multi-machine inference back to HTTP response.
+
+  # ============================================================
+  # PAGED KV CACHE (Phase 4)
+  # ============================================================
+  - name: Block Pool
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Pre-allocated pool of fixed-size KV cache blocks on GPU memory.
+      Each block holds 16 tokens of K and V data per layer. Blocks are
+      allocated at startup and managed via a free list.
+    shared: [error-handling]
+    dismissed:
+      - suggestion: block-pool-batch-alloc-rollback
+        reason: append_kv allocates blocks one at a time within a loop; partial failure leaves the sequence with its previously-written data and returns error — no orphaned blocks
+      - suggestion: block-pool-double-free
+        reason: blocks are only freed via PagedKvCacheManager::free() which removes the sequence entry atomically; double-free is prevented at the cache manager level, not the pool level
+    behaviors:
+      - name: block-pool-alloc-free
+        status: implemented
+        description: |
+          Blocks are allocated from a free list (stack pop) and returned
+          on free (stack push). Pool exhaustion returns OutOfMemory error.
+          Freed blocks are immediately reusable.
+
+      - name: block-pool-gpu-preallocation
+        status: implemented
+        description: |
+          All GPU memory for the block pool is allocated at startup via
+          backend.alloc(). Each block is [16, num_kv_heads, head_dim] FP16
+          for both K and V, across all layers. Pool creation failure
+          (OOM) is reported as a KvCache error.
+
+      - name: block-pool-capacity
+        status: implemented
+        description: |
+          The pool reports total capacity, free block count, and bytes
+          per block. For Llama 3 8B with 32 layers, each block is 2 MB
+          (16 tokens × 8 heads × 128 dim × 2 bytes × 2 (K+V) × 32 layers).
+
+  - name: Paged KV Cache Manager
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Per-sequence block table management for paged KV cache. Each sequence
+      maintains a list of physical block IDs mapping logical token positions
+      to blocks in the pool. Blocks are allocated on demand as tokens are
+      appended.
+    shared: [error-handling]
+    dismissed:
+      - suggestion: paged-cache-pool-creation
+        reason: covered by block-pool-gpu-preallocation in the Block Pool section
+      - suggestion: paged-cache-pool-utilization
+        reason: covered by block-pool-capacity in the Block Pool section
+    behaviors:
+      - name: paged-cache-alloc-free
+        status: implemented
+        description: |
+          Allocating a new sequence reserves one initial block from the pool.
+          Freeing a sequence returns all its blocks to the pool's free list.
+          Operations on freed handles return errors.
+
+      - name: paged-cache-append
+        status: implemented
+        description: |
+          Appending KV data writes into the current block's remaining slots
+          via backend.copy_rows(). When the current block is full, a new
+          block is automatically allocated from the pool. Prefill appends
+          multiple tokens at once, spanning multiple blocks if needed.
+          Layer 0 manages block allocation and metadata; layers 1+ write
+          to the same offsets without re-allocating.
+
+      - name: paged-cache-block-table
+        status: implemented
+        description: |
+          Each sequence exposes its block table (list of physical block IDs)
+          for the paged attention kernel. Also exposes seq_len (total tokens)
+          and last_block_tokens (fill level of final block).
+
+      - name: paged-cache-oom
+        status: implemented
+        description: |
+          When append_kv needs a new block but the pool is exhausted,
+          returns OutOfMemory error. The sequence remains valid with its
+          previously written data.
+
+      - name: paged-cache-multi-sequence
+        status: implemented
+        description: |
+          Multiple sequences have independent block tables with no
+          overlapping block IDs. Freeing one sequence does not affect
+          others. Freed blocks are reusable by subsequent allocations.
+
+  - name: Paged Attention Kernel
+    path: backends/fracture-cuda
+    status: implemented
+    description: |
+      CUDA kernel for scaled dot-product attention reading KV data from
+      a paged block pool instead of contiguous cache arrays. Written from
+      scratch (not adapted from vLLM or other implementations).
+    shared: [numerical-correctness, error-handling]
+    dismissed:
+      - suggestion: paged-attention-block-iteration
+        reason: implementation detail of internal kernel addressing, not observable input/output; correctness verified by paged-attention-correctness
+    behaviors:
+      - name: paged-attention-correctness
+        status: implemented
+        description: |
+          Paged attention produces bit-identical output to contiguous
+          attention for both prefill and decode. Validated with a random-
+          weight model: 5-token prefill and 5 greedy decode steps both
+          produce max_diff=0.000000 between paged and contiguous paths.
+
+      - name: paged-attention-multi-block
+        status: not-implemented
+        description: |
+          Paged attention produces correct output when a sequence spans
+          multiple physical blocks, verifying block-boundary crossings.
+          Requires a test with > 16 tokens to exercise cross-block reads.
+
+      - name: paged-attention-causal-mask
+        status: implemented
+        description: |
+          Causal masking is applied: query at position (start_pos + q_idx)
+          attends only to keys at positions 0..start_pos+q_idx. GQA head
+          grouping (num_q_heads / num_kv_heads) is handled identically
+          to the contiguous attention kernel.
+
+  - name: Paged Engine Integration
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      The engine provides forward_paged() and forward_node_paged() methods
+      that use PagedKvCacheManager instead of the contiguous KvCacheManager.
+      Both paths coexist via KvCacheBackend enum for A/B validation.
+    shared: [error-handling, backend-agnostic]
+    behaviors:
+      - name: paged-forward-prefill
+        status: implemented
+        description: |
+          forward_paged() processes a prompt through the full transformer
+          (embedding, all layers, LM head) using paged KV cache. Each
+          layer appends K/V via cache.append_kv() and calls
+          backend.attention_paged() with the sequence's block table.
+
+      - name: paged-forward-decode
+        status: implemented
+        description: |
+          Decode steps append a single token's K/V per layer. The block
+          table grows automatically when the current block fills. Greedy
+          token sequences from paged decode are identical to contiguous.
+
+      - name: kv-cache-backend-enum
+        status: implemented
+        description: |
+          KvCacheBackend enum wraps both Contiguous(KvCacheManager) and
+          Paged(PagedKvCacheManager). Provides unified alloc/seq_len/free
+          methods. The contiguous path is the default until paged is
+          fully validated end-to-end on the production model.
+
+      - name: paged-forward-node
+        status: implemented
+        description: |
+          forward_node_paged() processes activations through an arbitrary
+          layer range using paged KV cache, accepting NodeInput and
+          returning NodeOutput for pipeline-parallel inference.
+
+      - name: paged-contiguous-equivalence
+        status: implemented
+        description: |
+          Paged and contiguous forward paths produce identical greedy
+          token sequences on the same input. Validated with GPU tests:
+          prefill and 5 decode steps both produce max_diff=0.000000.
