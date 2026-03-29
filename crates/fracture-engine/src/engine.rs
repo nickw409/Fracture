@@ -116,6 +116,10 @@ impl<B: Backend> Engine<B> {
         &self.weights.config
     }
 
+    pub fn layer_range(&self) -> &Range<usize> {
+        &self.layer_range
+    }
+
     pub fn weights(&self) -> &WeightStore {
         &self.weights
     }
