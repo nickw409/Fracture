@@ -8,14 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::sampling::{Sampler, SamplingParams};
 
-/// Why generation stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    /// Hit an EOS/stop token.
-    Stop,
-    /// Reached max_tokens limit.
-    Length,
-}
+// StopReason is defined in fracture-core for sharing across crates.
+pub use fracture_core::StopReason;
 
 /// Result of a generation request, including tokens and stop reason.
 #[derive(Debug, Clone)]
