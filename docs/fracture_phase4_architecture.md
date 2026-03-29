@@ -109,7 +109,7 @@ With block_size = 16:
   Total per block (all 32 layers): 64 KB × 32 = 2 MB
 ```
 
-Why 16 tokens per block:
+Why 16 tokens per block (hardcoded, not configurable — the attention kernel is tuned for this size):
 - **Fragmentation:** Maximum waste is 15 tokens per sequence = 15 × 128 KB/token = 1.92 MB. Acceptable.
 - **Block table size:** 4096-token context = 256 block table entries. At 4 bytes each = 1 KB per sequence. Negligible.
 - **GPU alignment:** 32 KB (K data per block per layer) is a multiple of the 128-byte GPU cache line. Memory coalescing preserved.
@@ -289,7 +289,7 @@ fn attention_paged(
 ) -> Result<()>;
 ```
 
-The kernel receives the block table (copied to GPU as a small integer array) and iterates over blocks instead of a contiguous range.
+The kernel receives the block table (copied to GPU as a small integer array) and iterates over blocks instead of a contiguous range. The paged attention kernel is written from scratch rather than adapted from an existing implementation (e.g., vLLM) — this follows the project's convention of implementing GPU kernels from first principles for learning purposes.
 
 **Paged attention kernel pseudocode (decode, single query token):**
 ```
@@ -359,11 +359,11 @@ The key insight: within each block, tokens are contiguous in memory, so the inne
 
 ### Keeping the Contiguous Path
 
-The Phase 3 contiguous `KvCacheManager` is not deleted. Both implementations coexist behind the same trait, selected at startup. This enables:
+The Phase 3 contiguous `KvCacheManager` is not deleted. Both implementations coexist behind the same enum, selected at startup. The contiguous path remains the default until paged attention is fully validated against reference outputs.
 
-- A/B correctness validation (identical inputs, both paths, compare outputs)
-- Fallback for single-sequence serving where paging overhead isn't worth it
-- Gradual rollout: get paged cache working and validated before wiring it into batching
+- A/B correctness validation: run identical prompts through both paths, compare token sequences
+- Fallback if paging bugs surface during batching development
+- The contiguous path may eventually be removed, but not until paged attention has been validated end-to-end on the full Llama 3 8B model with greedy golden output comparison
 
 ```rust
 enum KvCacheBackend {
@@ -642,7 +642,7 @@ fn schedule() -> SchedulerDecision:
 
 A 2048-token prefill processes 2048× more tokens than a single decode step. Without chunking, a large prefill monopolizes an entire batch iteration, adding 50-100ms of latency to every active decode sequence's next token.
 
-**Policy:** Split prefills into chunks of at most `max_prefill_tokens` (default: 512). A 2048-token prompt takes 4 iterations to fully prefill. During those iterations, active decode sequences continue generating tokens normally — they're included in the same batch.
+**Policy:** Split prefills into chunks of at most `max_prefill_tokens` (configurable, default: 512). A 2048-token prompt takes 4 iterations to fully prefill. During those iterations, active decode sequences continue generating tokens normally — they're included in the same batch. Operators can tune this via CLI flag (`--max-prefill-tokens`) to trade TTFT against decode latency for their workload.
 
 The sequence transitions to decode after its entire prompt is prefilled. Until then, it doesn't produce any tokens.
 
@@ -729,12 +729,12 @@ The scheduler must balance three pressures:
 
 **Tuning parameters:**
 
-| Parameter | Default | Description |
-|---|---|---|
-| `max_batch_size` | 64 | Maximum sequences in a batch |
-| `max_batch_tokens` | 4096 | Maximum total tokens per iteration |
-| `max_prefill_tokens` | 512 | Maximum prefill tokens per iteration |
-| `block_pool_reserve` | 10% | Reserve this fraction of blocks for active sequence growth |
+| Parameter | Default | CLI Flag | Description |
+|---|---|---|---|
+| `max_batch_size` | 64 | `--max-batch-size` | Maximum sequences in a batch |
+| `max_batch_tokens` | 4096 | `--max-batch-tokens` | Maximum total tokens per iteration |
+| `max_prefill_tokens` | 512 | `--max-prefill-tokens` | Maximum prefill tokens per iteration (tradeoff: higher = faster TTFT, lower = steadier decode latency) |
+| `block_pool_reserve` | 10% | `--block-pool-reserve` | Reserve this fraction of blocks for active sequence growth |
 
 The `block_pool_reserve` prevents a failure mode where all blocks are allocated to new prefills, leaving no room for active sequences to grow during decode. With 10% reserve: if the pool has 7850 blocks, 785 are reserved. New sequences are only admitted if `free_blocks - needed_blocks > reserved_blocks`.
 
@@ -787,8 +787,9 @@ When a worker is detected as dead:
 - **Transparent failover:** No hiding the failure from clients. They get an error and must retry.
 - **Coordinator redundancy:** Coordinator is single point of failure. Its death kills everything.
 - **Partial pipeline serving:** Can't serve requests on a subset of layers. Either the full pipeline works or it doesn't.
+- **Sequence migration:** When a worker dies, its sequences are aborted rather than migrated to surviving workers. Migration would require serializing KV cache blocks over the network and rebuilding block tables on the target worker — a viable future extension of the paged cache architecture but not worth the complexity in Phase 4.
 
-These are all reasonable for the target use case (small cluster, dev/research workload). Production clusters with SLA requirements need consensus-based coordination, which is a different project.
+These are all reasonable for the target use case (small cluster, dev/research workload). Sequence migration is the most natural future extension — the paged cache architecture makes it possible (blocks are self-contained, block tables can be rewritten), but the coordination logic and network transfer cost are non-trivial. Listed as a future possibility, not a Phase 4 goal.
 
 ---
 
@@ -825,10 +826,7 @@ The coordinator manages this by tracking multiple in-flight batches. Each worker
 
 ### Implementation
 
-This is marked as **Step 6 (stretch)** in the implementation order because:
-1. Continuous batching already provides the majority of the throughput improvement
-2. Micro-batching adds significant coordination complexity (tracking in-flight state for multiple batches)
-3. The benefit is proportional to the number of pipeline stages — with 2 workers, the gain is 2× utilization; with 3 workers, 3×. For the typical 2-3 worker setup, continuous batching alone gets most of the benefit.
+This is the final implementation step. The throughput gain is proportional to the number of pipeline stages (2× for 2 workers, 3× for 3 workers), and continuous batching already provides the majority of the improvement. However, implementing micro-batching is valuable as a learning exercise in pipeline scheduling and concurrent distributed coordination — understanding how to overlap stages translates to any system that pipelines work across machines.
 
 ---
 
@@ -967,16 +965,20 @@ Extend batching to the distributed pipeline.
 3. Implement worker reconnection with re-scheduling
 4. Test: kill a worker mid-generation, verify other sequences are unaffected, verify pipeline recovers
 
-### Step 6 (Stretch): Pipeline Micro-Batching
+### Step 6: Pipeline Micro-Batching
+
+Included as a learning exercise in pipeline scheduling, even though the throughput gain is modest for 2-3 worker setups. Understanding how to overlap pipeline stages is valuable for reasoning about distributed system performance.
 
 1. Coordinator tracks multiple in-flight batches
 2. Workers have a 1-deep input queue (process current batch while receiving next)
 3. Measure utilization improvement with 2 and 3 workers
+4. Compare measured vs theoretical speedup (should approach N× for N stages in steady state)
 
 ---
 
 ## What Phase 4 Does NOT Include (Deferred)
 
+- **Sequence migration on worker failure** — Transferring KV cache blocks from a dead worker to survivors. The paged architecture makes this architecturally feasible (blocks are self-contained, block tables can be rewritten), but the coordination logic and network transfer cost are significant. Listed as the most natural future extension of Phase 4's fault tolerance.
 - **Dynamic rebalancing** — Re-partitioning layers while inference is running requires live KV cache migration between workers. Hard distributed state problem. Deferred.
 - **Mixed quantization** — Different precision per node. Requires dequantization kernels and quality calibration. Deferred to Phase 5 alongside Metal.
 - **GPU-direct RDMA** — Bypassing CPU for activation transfer. Requires InfiniBand. Only matters at data center scale.
