@@ -2383,7 +2383,7 @@ sections:
   # ============================================================
   - name: Batch Scheduler
     path: crates/fracture-engine/src
-    status: not-implemented
+    status: implemented
     description: |
       Iteration-level batch scheduler that decides which sequences to
       include in each forward pass. Manages the prefill queue and active
@@ -2391,14 +2391,14 @@ sections:
     shared: [error-handling]
     behaviors:
       - name: scheduler-decode-priority
-        status: not-implemented
+        status: implemented
         description: |
           All active decode sequences are included in every batch before
           any new prefills are admitted. Decodes are cheap (1 token each)
           and latency-sensitive.
 
       - name: scheduler-prefill-admission
-        status: not-implemented
+        status: implemented
         description: |
           New requests from the prefill queue are admitted when batch
           capacity (max_batch_tokens, max_batch_size) and memory
@@ -2406,7 +2406,7 @@ sections:
           reserve to prevent starving active decodes.
 
       - name: scheduler-prefill-chunking
-        status: not-implemented
+        status: implemented
         description: |
           Prompts longer than max_prefill_tokens (configurable, default
           512) are split into chunks. Each chunk is processed in a
@@ -2414,7 +2414,7 @@ sections:
           chunks and enters decode after the final chunk.
 
       - name: scheduler-batch-construction
-        status: not-implemented
+        status: implemented
         description: |
           The scheduler builds a SchedulerDecision containing prefill
           and decode jobs. Total tokens across all jobs respects
@@ -2422,7 +2422,7 @@ sections:
           entries for batched_forward.
 
       - name: scheduler-sequence-completion
-        status: not-implemented
+        status: implemented
         description: |
           After sampling, sequences that hit a stop token or max_tokens
           are removed from active_sequences. Their cache blocks are
@@ -2430,7 +2430,7 @@ sections:
           with the stop reason.
 
       - name: scheduler-block-pool-reserve
-        status: not-implemented
+        status: implemented
         description: |
           A configurable fraction (default 10%) of the block pool is
           reserved for active sequence growth. New sequences are only
@@ -2441,7 +2441,7 @@ sections:
   # ============================================================
   - name: Async Request Handling
     path: crates/fracture-server/src
-    status: not-implemented
+    status: implemented
     description: |
       HTTP handlers enqueue requests and return immediately with a
       streaming connection. A dedicated scheduler loop processes all
@@ -2449,14 +2449,14 @@ sections:
     shared: [error-handling]
     behaviors:
       - name: async-request-enqueue
-        status: not-implemented
+        status: implemented
         description: |
           The HTTP handler validates the request, tokenizes the prompt,
           creates a token channel, and enqueues an InFlightRequest in
           the prefill queue. It does not block on generation.
 
       - name: async-streaming-response
-        status: not-implemented
+        status: implemented
         description: |
           SSE streaming reads from the GenerationEvent channel. Each
           Token event becomes an SSE data chunk. Finished triggers the
@@ -2464,14 +2464,14 @@ sections:
           an error event.
 
       - name: async-non-streaming-response
-        status: not-implemented
+        status: implemented
         description: |
           Non-streaming requests use a oneshot channel. The scheduler
           collects all tokens and sends the complete response when the
           sequence finishes. The HTTP handler awaits the oneshot.
 
       - name: async-cancellation-on-disconnect
-        status: not-implemented
+        status: implemented
         description: |
           When a client disconnects (token_tx receiver dropped), the
           scheduler detects the closed channel on the next send and
@@ -2482,7 +2482,7 @@ sections:
   # ============================================================
   - name: Scheduler Loop
     path: crates/fracture-server/src
-    status: not-implemented
+    status: implemented
     description: |
       Dedicated tokio task that runs the batch scheduler every iteration.
       It is the sole consumer of the inference pipeline — no Mutex on
@@ -2490,14 +2490,14 @@ sections:
     shared: [error-handling]
     behaviors:
       - name: scheduler-loop-iteration
-        status: not-implemented
+        status: implemented
         description: |
           Each iteration: build batch via scheduler, run batched_forward,
           sample per-sequence tokens, send tokens to channels, check
           stop conditions, free completed sequences.
 
       - name: scheduler-loop-sampling
-        status: not-implemented
+        status: implemented
         description: |
           After batched_forward returns per-sequence logits, the scheduler
           samples a token for each sequence using its individual
@@ -2505,14 +2505,14 @@ sections:
           runs on CPU (same as Phase 1-3).
 
       - name: scheduler-loop-token-streaming
-        status: not-implemented
+        status: implemented
         description: |
           Each sampled token is immediately sent through the sequence's
           token_tx channel as GenerationEvent::Token. Tokens are not
           buffered — they stream to clients as generated.
 
       - name: scheduler-loop-concurrent-correctness
-        status: not-implemented
+        status: implemented
         description: |
           Multiple concurrent HTTP requests produce correct, independent
           results. Each sequence's output matches what it would produce
