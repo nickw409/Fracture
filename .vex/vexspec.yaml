@@ -2252,7 +2252,7 @@ sections:
           produce max_diff=0.000000 between paged and contiguous paths.
 
       - name: paged-attention-multi-block
-        status: not-implemented
+        status: implemented
         description: |
           Paged attention produces correct output when a sequence spans
           multiple physical blocks, verifying block-boundary crossings.

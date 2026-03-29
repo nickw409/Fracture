@@ -769,3 +769,107 @@ fn test_paged_vs_contiguous_decode_steps() {
         "final logits diverge: max_diff={max_diff:.6}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: Paged attention across multiple blocks (>16 tokens)
+// ---------------------------------------------------------------------------
+//
+// Validates that the paged attention kernel correctly handles sequences
+// spanning multiple physical blocks. A 20-token prefill spans 2 blocks
+// (block 0: tokens 0-15, block 1: tokens 16-19). Subsequent decode steps
+// continue filling block 1 and eventually spill into block 2.
+
+#[test]
+fn test_paged_vs_contiguous_multi_block() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+
+    // 20-token prompt → 2 blocks (16 + 4)
+    let prompt: Vec<u32> = (1..=20).collect();
+    let prompt_positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    let num_decode_steps = 15; // total will be 35 tokens → 3 blocks (16+16+3)
+
+    // --- Contiguous path ---
+    let mut cont_cache = KvCacheManager::new(
+        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+    );
+    let cont_handle = cont_cache.alloc(engine.backend()).expect("cont alloc");
+
+    let mut cont_logits = engine
+        .forward(&prompt, &prompt_positions, &mut cont_cache, cont_handle, None)
+        .expect("cont prefill");
+    let mut cont_tokens = Vec::new();
+
+    for step in 0..num_decode_steps {
+        let token = cont_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        cont_tokens.push(token);
+        let pos = (prompt.len() + step) as u32;
+        cont_logits = engine
+            .forward(&[token], &[pos], &mut cont_cache, cont_handle, None)
+            .expect(&format!("cont decode step {step}"));
+    }
+    cont_cache.free(cont_handle, engine.backend()).expect("free");
+
+    // --- Paged path ---
+    let mut paged_cache = PagedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    )
+    .expect("paged cache creation");
+    let paged_handle = paged_cache.alloc().expect("paged alloc");
+
+    let mut paged_logits = engine
+        .forward_paged(&prompt, &prompt_positions, &mut paged_cache, paged_handle)
+        .expect("paged prefill");
+    let mut paged_tokens = Vec::new();
+
+    for step in 0..num_decode_steps {
+        let token = paged_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        paged_tokens.push(token);
+        let pos = (prompt.len() + step) as u32;
+        paged_logits = engine
+            .forward_paged(&[token], &[pos], &mut paged_cache, paged_handle)
+            .expect(&format!("paged decode step {step}"));
+    }
+
+    // Verify block table spans 3 blocks: ceil(35/16) = 3
+    let block_table = paged_cache.block_table(paged_handle).expect("block table");
+    assert_eq!(
+        block_table.len(), 3,
+        "35 tokens should span 3 blocks, got {}",
+        block_table.len()
+    );
+
+    paged_cache.free(paged_handle).expect("free");
+    paged_cache.destroy(engine.backend()).expect("pool destroy");
+
+    // Compare: greedy token sequences must match
+    assert_eq!(
+        cont_tokens, paged_tokens,
+        "multi-block paged decode diverges:\n  contiguous: {cont_tokens:?}\n  paged:      {paged_tokens:?}"
+    );
+
+    // Compare final logits
+    let mut max_diff: f32 = 0.0;
+    for (c, p) in cont_logits.iter().zip(paged_logits.iter()) {
+        max_diff = max_diff.max((c - p).abs());
+    }
+    eprintln!(
+        "Multi-block paged vs contiguous (20 prefill + {num_decode_steps} decode = {} tokens, 3 blocks): \
+         max_diff={max_diff:.6}, tokens match: {}",
+        prompt.len() + num_decode_steps,
+        cont_tokens == paged_tokens
+    );
+    assert!(
+        max_diff < 0.05,
+        "multi-block logits diverge: max_diff={max_diff:.6}"
+    );
+}
