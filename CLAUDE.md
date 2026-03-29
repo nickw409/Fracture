@@ -7,18 +7,18 @@ Distributed cross-platform LLM inference engine in Rust with pluggable GPU backe
 Rust workspace with strict crate boundaries enforcing backend-agnosticism:
 
 ### Core Crates
-- `crates/fracture-core` — Backend trait, DeviceTensor, ModelConfig, profiling types, error types
-- `crates/fracture-engine` — Backend-generic transformer forward pass, KV cache, node abstraction, pipeline coordinator, IPC transport
+- `crates/fracture-core` — Backend trait, DeviceTensor, ModelConfig, StopReason, profiling types, error types
+- `crates/fracture-engine` — Backend-generic transformer forward pass, KV cache (contiguous + paged), node abstraction, pipeline coordinator, IPC transport, batch scheduler, batched forward
 - `crates/fracture-generate` — Sampling (temperature/top-k/top-p/seeded), generation loop with StopReason, cooperative cancellation
-- `crates/fracture-server` — OpenAI-compatible HTTP API (axum) with SSE streaming, finish_reason, usage stats
+- `crates/fracture-server` — OpenAI-compatible HTTP API (axum) with SSE streaming, finish_reason, usage stats. Two modes: Phase 3 Mutex-serialized (`routes.rs`) and Phase 4 batched (`batched_routes.rs` + `scheduler_loop.rs`)
 - `crates/fracture-gguf` — GGUF file parser and weight loader (FP16/FP32/BF16)
 
 ### Distributed Inference (Phase 3)
-- `crates/fracture-protocol` — Binary wire protocol (TCP, CRC32C integrity, 10 message types)
-- `crates/fracture-coordinator` — Scheduler, peer registry, sequence state, heartbeat, distributed pipeline
+- `crates/fracture-protocol` — Binary wire protocol (TCP, CRC32C integrity, 12 message types including BatchedForward/Result)
+- `crates/fracture-coordinator` — Scheduler, peer registry, sequence state, heartbeat, distributed pipeline (single + batched forward)
 
 ### Backend & Binaries
-- `backends/fracture-cuda` — CUDA Backend trait implementation
+- `backends/fracture-cuda` — CUDA Backend trait implementation (includes paged attention kernel)
 - `bins/fracture-server-cuda` — Single-node server binary
 - `bins/fracture-worker-cuda` — Distributed worker binary (calibration, registration, forward serving)
 - `bins/fracture-coordinator-cuda` — Distributed coordinator binary (scheduling, pipeline orchestration, HTTP API)
@@ -56,12 +56,16 @@ Tests are serialized by GPU memory sensitivity via `.config/nextest.toml`:
 - SSE streaming includes `id`, `object`, `created`, `model`, `finish_reason`, and `usage` in the final chunk
 - Wire protocol uses CRC32C integrity checks; all payloads capped at 256 MB
 - Distributed pipeline tracks cache lifecycle: alloc with rollback on partial failure, duplicate/unknown checks, reuse after free
+- Paged KV cache uses 16-token blocks; block_size is hardcoded (kernel tuned for it)
+- Both contiguous and paged KV cache coexist via `KvCacheBackend` enum; contiguous is default until paged is validated on production model
+- BatchScheduler uses decode-priority policy: active decodes always scheduled before new prefills
+- Prefill chunking splits prompts > `max_prefill_tokens` (default 512, configurable) across iterations
 
 ## Build & Test
 
 ```bash
 cargo check          # Verify workspace compiles
-cargo nextest run    # Run all tests (542 tests: unit + GPU kernel + integration + e2e)
+cargo nextest run    # Run all tests (570 tests: unit + GPU kernel + integration + e2e)
 cargo clippy         # Lint
 ```
 
@@ -73,11 +77,55 @@ CUDA backend requires NVIDIA GPU + CUDA toolkit. The workspace compiles without 
 
 On WSL2, `libcudart.so` (dynamic) segfaults during initialization due to a version mismatch in the WSL2 CUDA forwarding layer. The build.rs links `libcudart_static.a` instead, which works correctly. cuBLAS remains dynamically linked. If CUDA tests segfault, check that `.cargo/config.toml` exists and `nvidia-smi` works.
 
+## Phase 4 Progress
+
+Phase 4 adds production inference capabilities. See `docs/fracture_phase4_architecture.md` for full design.
+
+### Completed (Steps 1-3)
+
+**Step 1 — Paged KV Cache:**
+- `BlockPool` (`paged_kv_cache.rs`): pre-allocated GPU memory blocks with free list
+- `PagedKvCacheManager`: per-sequence block tables, auto-growing append, OOM detection
+- `attention_paged` CUDA kernel (`attention_paged.cu`): reads K/V from block tables
+- `Backend::attention_paged()` trait method with DeviceTensor-based interface
+- `Engine::forward_paged()` / `forward_node_paged()`: paged engine forward path
+- GPU validated: bit-identical to contiguous (max_diff=0.000000 across 35 tokens, 3 blocks)
+
+**Step 2 — Batched Forward Pass:**
+- `batched_forward()` (`batched.rs`): processes multiple sequences in one call
+- Concatenates tokens for matmul/RMSNorm/RoPE/FFN, dispatches attention per-sequence
+- GPU validated: batched = sequential (max_diff=0.000000 for each sequence)
+
+**Step 3 — Continuous Batching:**
+- `BatchScheduler` (`scheduler.rs`): decode-priority, prefill chunking, admission control, block pool reserve
+- `scheduler_loop.rs`: tokio task driving batched_forward, per-sequence sampling, token streaming
+- `batched_routes.rs`: async HTTP handlers that enqueue via SchedulerHandle (no Mutex)
+- GPU validated: 3 concurrent requests produce identical tokens to sequential reference
+
+### In Progress (Step 4 — Distributed Batching)
+
+**Completed:**
+- Wire protocol: `BatchedForward` (0x0C) and `BatchedForwardResult` (0x0D) message types
+- `SequenceMetadataWire`: per-sequence positions, block_table, cache_seq_len
+- `HeartbeatAckPayload.free_blocks`: block pool stats in heartbeat
+- `DistributedPipeline::batched_forward()`: coordinator sends batched payloads through pipeline
+- Worker `BatchedForward` handler stub (responds with error — full impl pending)
+
+**Remaining (pick up here):**
+- Step 4c (full): Worker-side paged block pool + `batched_forward()` in serve loop
+- Step 4d: Coordinator uses heartbeat `free_blocks` for distributed admission control
+- Step 4e: Validate distributed batched output matches local batched output
+
+### Planned (Steps 5-6)
+
+- Step 5: Fault tolerance (worker failure → abort sequences → rebuild pipeline)
+- Step 6: Pipeline micro-batching (overlap pipeline stages for ~100% utilization)
+
 ## Vex
 
 [Vex](https://github.com/nickw409/vex) is a behavioral spec and test gap analysis tool. Install via `go install github.com/nickw409/vex@latest`.
 
-- `.vex/vexspec.yaml` — The behavioral specification (229 implemented, 1 not-implemented, 2 not-tested). Organized into 30 sections covering core types, kernels, engine, server, protocol, coordinator, and e2e validation.
+- `.vex/vexspec.yaml` — The behavioral specification (274 implemented, 1 not-implemented, 2 not-tested). Organized into 38 sections covering core types, kernels, engine, server, protocol, coordinator, paged cache, batched forward, and scheduler.
 - `.vex/report.json` — Gap analysis output. Generated by `vex check`.
 - `.vex/validation.json` — Validation status. Generated by `vex validate`.
 
