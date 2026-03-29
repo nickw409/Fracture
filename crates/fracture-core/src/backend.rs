@@ -64,7 +64,7 @@ pub trait Backend: Send + Sync {
     /// Paged attention: scaled dot-product attention reading KV data from block tables.
     /// q: [N, num_q_heads, head_dim]
     /// block_table: physical block IDs for this sequence
-    /// k_block_ptrs / v_block_ptrs: device pointers to each block's K/V data for this layer
+    /// k_blocks / v_blocks: per-block DeviceTensors for this layer, indexed by block ID
     /// kv_len: total tokens across all blocks
     /// start_pos: tokens before this batch (for causal mask)
     /// out: [N, num_q_heads, head_dim]
@@ -74,8 +74,8 @@ pub trait Backend: Send + Sync {
         &self,
         _q: &DeviceTensor,
         _block_table: &[i32],
-        _k_block_ptrs: &[*const std::ffi::c_void],
-        _v_block_ptrs: &[*const std::ffi::c_void],
+        _k_blocks: &[&DeviceTensor],
+        _v_blocks: &[&DeviceTensor],
         _num_kv_heads: usize,
         _kv_len: usize,
         _start_pos: usize,

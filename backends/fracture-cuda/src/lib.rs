@@ -422,8 +422,8 @@ impl Backend for CudaBackend {
         &self,
         q: &DeviceTensor,
         block_table: &[i32],
-        k_block_ptrs: &[*const c_void],
-        v_block_ptrs: &[*const c_void],
+        k_blocks: &[&DeviceTensor],
+        v_blocks: &[&DeviceTensor],
         num_kv_heads: usize,
         kv_len: usize,
         start_pos: usize,
@@ -437,6 +437,16 @@ impl Backend for CudaBackend {
         let num_q_heads = q.shape[1] as c_int;
         let head_dim = q.shape[2] as c_int;
 
+        // Resolve block tensor IDs to device pointers
+        let k_ptrs: Vec<*const c_void> = k_blocks
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+        let v_ptrs: Vec<*const c_void> = v_blocks
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+
         // Copy block_table to device
         let bt_size = block_table.len() * std::mem::size_of::<i32>();
         let mut bt_dev: *mut c_void = std::ptr::null_mut();
@@ -448,24 +458,24 @@ impl Backend for CudaBackend {
             CUDA_MEMCPY_HOST_TO_DEVICE
         ));
 
-        // Copy K block pointers to device
-        let kbp_size = k_block_ptrs.len() * std::mem::size_of::<*const c_void>();
+        // Copy K block pointer array to device
+        let kbp_size = k_ptrs.len() * std::mem::size_of::<*const c_void>();
         let mut kbp_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut kbp_dev, kbp_size));
         cuda_check!(cudaMemcpy(
             kbp_dev,
-            k_block_ptrs.as_ptr() as *const c_void,
+            k_ptrs.as_ptr() as *const c_void,
             kbp_size,
             CUDA_MEMCPY_HOST_TO_DEVICE
         ));
 
-        // Copy V block pointers to device
-        let vbp_size = v_block_ptrs.len() * std::mem::size_of::<*const c_void>();
+        // Copy V block pointer array to device
+        let vbp_size = v_ptrs.len() * std::mem::size_of::<*const c_void>();
         let mut vbp_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut vbp_dev, vbp_size));
         cuda_check!(cudaMemcpy(
             vbp_dev,
-            v_block_ptrs.as_ptr() as *const c_void,
+            v_ptrs.as_ptr() as *const c_void,
             vbp_size,
             CUDA_MEMCPY_HOST_TO_DEVICE
         ));

@@ -1,8 +1,63 @@
 use crate::kv_cache::{CacheHandle, KvCacheManager};
 use crate::node::{NodeConfig, NodeInput, NodeOutput};
+use crate::paged_kv_cache::PagedKvCacheManager;
 use fracture_core::{Backend, DType, DeviceTensor, ForwardProfile, FractureError, LayerProfile, Result};
 use fracture_gguf::WeightStore;
 use std::ops::Range;
+
+/// Runtime-selected KV cache implementation.
+pub enum KvCacheBackend {
+    Contiguous(KvCacheManager),
+    Paged(PagedKvCacheManager),
+}
+
+impl KvCacheBackend {
+    pub fn alloc_contiguous<B: Backend>(&mut self, backend: &B) -> Result<CacheHandle> {
+        match self {
+            Self::Contiguous(c) => c.alloc(backend),
+            Self::Paged(_) => Err(FractureError::KvCache(
+                "alloc_contiguous called on paged cache".into(),
+            )),
+        }
+    }
+
+    pub fn alloc_paged(&mut self) -> Result<CacheHandle> {
+        match self {
+            Self::Paged(p) => p.alloc(),
+            Self::Contiguous(_) => Err(FractureError::KvCache(
+                "alloc_paged called on contiguous cache".into(),
+            )),
+        }
+    }
+
+    pub fn alloc<B: Backend>(&mut self, backend: &B) -> Result<CacheHandle> {
+        match self {
+            Self::Contiguous(c) => c.alloc(backend),
+            Self::Paged(p) => p.alloc(),
+        }
+    }
+
+    pub fn seq_len(&self, handle: CacheHandle) -> Result<usize> {
+        match self {
+            Self::Contiguous(c) => c.seq_len(handle),
+            Self::Paged(p) => p.seq_len(handle),
+        }
+    }
+
+    pub fn free<B: Backend>(&mut self, handle: CacheHandle, backend: &B) -> Result<()> {
+        match self {
+            Self::Contiguous(c) => c.free(handle, backend),
+            Self::Paged(p) => {
+                p.free(handle)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(_))
+    }
+}
 
 /// Time a single operation if profiling is active.
 ///
@@ -410,6 +465,285 @@ impl<B: Backend> Engine<B> {
         } else {
             // Non-tail: return hidden_state as activations for the next node.
             // Do NOT free hidden_state — it is the output.
+            self.backend.free(&normed)?;
+            self.backend.free(&q_flat)?;
+            self.backend.free(&k_flat)?;
+            self.backend.free(&v_flat)?;
+            self.backend.free(&attn_out_mh)?;
+            self.backend.free(&projected)?;
+            self.backend.free(&gate)?;
+            self.backend.free(&up)?;
+            self.backend.free(&ffn_mid)?;
+            self.backend.free(&ffn_out)?;
+
+            Ok(NodeOutput::Activations(hidden_state))
+        }
+    }
+
+    /// Paged KV cache forward pass: token_ids → logits.
+    ///
+    /// Same as `forward()` but uses paged attention with block tables.
+    pub fn forward_paged(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        cache: &mut PagedKvCacheManager,
+        cache_handle: CacheHandle,
+    ) -> Result<Vec<f32>> {
+        let node_config = NodeConfig::new(
+            self.layer_range.clone(),
+            self.weights.config.num_layers,
+        )?;
+        let input = NodeInput::TokenIds {
+            ids: token_ids.to_vec(),
+            positions: positions.to_vec(),
+        };
+        match self.forward_node_paged(input, &node_config, cache, cache_handle)? {
+            NodeOutput::Logits(logits) => Ok(logits),
+            NodeOutput::Activations(_) => Err(FractureError::Pipeline(
+                "full forward expected Logits but got Activations".into(),
+            )),
+        }
+    }
+
+    /// Paged KV cache variant of forward_node.
+    ///
+    /// Identical to forward_node except:
+    /// - KV cache write uses paged append_kv instead of copy_rows into contiguous tensors
+    /// - Attention uses attention_paged with block tables instead of contiguous k/v cache
+    pub fn forward_node_paged(
+        &self,
+        input: NodeInput,
+        node_config: &NodeConfig,
+        cache: &mut PagedKvCacheManager,
+        cache_handle: CacheHandle,
+    ) -> Result<NodeOutput> {
+        let cfg = &self.weights.config;
+        let hidden = cfg.hidden_size;
+        let num_q_heads = cfg.num_q_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+
+        // 1. Resolve input (identical to contiguous path)
+        let (hidden_state, positions, seq_len, owns_hidden) = match input {
+            NodeInput::TokenIds { ids, positions } => {
+                if !node_config.is_head() {
+                    return Err(FractureError::Pipeline(
+                        "non-head node received TokenIds input".into(),
+                    ));
+                }
+                if ids.is_empty() {
+                    return Err(FractureError::InvalidShape(
+                        "token_ids must not be empty".into(),
+                    ));
+                }
+                let seq_len = ids.len();
+                let hidden_state = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+                self.backend
+                    .embedding(&ids, &self.weights.token_embedding, &hidden_state)?;
+                (hidden_state, positions, seq_len, true)
+            }
+            NodeInput::Activations {
+                hidden_states,
+                positions,
+            } => {
+                if node_config.is_head() {
+                    return Err(FractureError::Pipeline(
+                        "head node received Activations input".into(),
+                    ));
+                }
+                let seq_len = positions.len();
+                (hidden_states, positions, seq_len, false)
+            }
+        };
+
+        // Position bounds check
+        if let Some(&max_pos) = positions.iter().max() {
+            if max_pos as usize >= cfg.max_seq_len {
+                return Err(FractureError::InvalidShape(format!(
+                    "position {} exceeds max_seq_len {}",
+                    max_pos, cfg.max_seq_len,
+                )));
+            }
+        }
+
+        // Pre-allocate scratch tensors (identical to contiguous path)
+        let normed = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+        let q_flat = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+        let k_flat = self
+            .backend
+            .alloc(&[seq_len, num_kv_heads * head_dim], DType::FP16)?;
+        let v_flat = self
+            .backend
+            .alloc(&[seq_len, num_kv_heads * head_dim], DType::FP16)?;
+        let attn_out_mh = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+        let projected = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+        let gate = self
+            .backend
+            .alloc(&[seq_len, intermediate], DType::FP16)?;
+        let up = self
+            .backend
+            .alloc(&[seq_len, intermediate], DType::FP16)?;
+        let ffn_mid = self
+            .backend
+            .alloc(&[seq_len, intermediate], DType::FP16)?;
+        let ffn_out = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
+
+        let start_pos = cache.seq_len(cache_handle)?;
+
+        // 2. Transformer layers
+        let exec_range = &node_config.layer_range;
+        for layer_idx in exec_range.clone() {
+            let weight_idx = layer_idx - self.layer_range.start;
+            let cache_idx = layer_idx - exec_range.start;
+            self.backend.marker_push(&format!("layer_{}", layer_idx));
+
+            let w = &self.weights.layers[weight_idx];
+
+            // 2a. Pre-attention RMSNorm
+            self.backend
+                .rmsnorm(&hidden_state, &w.attn_norm, cfg.rms_norm_eps, &normed)?;
+
+            // 2b. QKV projections
+            self.backend.matmul(&normed, &w.q_proj, &q_flat)?;
+            self.backend.matmul(&normed, &w.k_proj, &k_flat)?;
+            self.backend.matmul(&normed, &w.v_proj, &v_flat)?;
+
+            // 2c. Reshape for multi-head
+            let q_mh = DeviceTensor::new(
+                q_flat.id,
+                vec![seq_len, num_q_heads, head_dim],
+                DType::FP16,
+            );
+            let k_mh = DeviceTensor::new(
+                k_flat.id,
+                vec![seq_len, num_kv_heads, head_dim],
+                DType::FP16,
+            );
+            let v_mh = DeviceTensor::new(
+                v_flat.id,
+                vec![seq_len, num_kv_heads, head_dim],
+                DType::FP16,
+            );
+
+            // 2d. Apply RoPE
+            self.backend
+                .rope(&q_mh, &k_mh, &positions, cfg.rope_theta, head_dim)?;
+
+            // 2e. KV cache update — PAGED: append into block pool
+            cache.append_kv(cache_handle, cache_idx, &k_mh, &v_mh, &self.backend)?;
+
+            let new_seq_len = start_pos + seq_len;
+
+            // 2f. Paged attention — reads from block table
+            let block_table = cache.block_table(cache_handle)?;
+            let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+
+            // Collect block K/V DeviceTensors for this layer
+            let pool = cache.pool();
+            let k_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
+                .map(|bid| pool.k_tensor(bid, cache_idx))
+                .collect();
+            let v_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
+                .map(|bid| pool.v_tensor(bid, cache_idx))
+                .collect();
+
+            let attn_out = DeviceTensor::new(
+                attn_out_mh.id,
+                vec![seq_len, num_q_heads, head_dim],
+                DType::FP16,
+            );
+
+            self.backend.attention_paged(
+                &q_mh,
+                &block_table_i32,
+                &k_blocks,
+                &v_blocks,
+                num_kv_heads,
+                new_seq_len,
+                start_pos,
+                &attn_out,
+            )?;
+
+            // 2g. Output projection (identical to contiguous)
+            let attn_out_flat = DeviceTensor::new(
+                attn_out_mh.id,
+                vec![seq_len, hidden],
+                DType::FP16,
+            );
+            self.backend
+                .matmul(&attn_out_flat, &w.o_proj, &projected)?;
+
+            // 2h. Residual
+            self.backend
+                .add(&hidden_state, &projected, &hidden_state)?;
+
+            // 2i-2k. FFN (identical to contiguous)
+            self.backend
+                .rmsnorm(&hidden_state, &w.ffn_norm, cfg.rms_norm_eps, &normed)?;
+            self.backend.matmul(&normed, &w.gate_proj, &gate)?;
+            self.backend.matmul(&normed, &w.up_proj, &up)?;
+            self.backend.silu_mul(&gate, &up, &ffn_mid)?;
+            self.backend.matmul(&ffn_mid, &w.down_proj, &ffn_out)?;
+            self.backend
+                .add(&hidden_state, &ffn_out, &hidden_state)?;
+
+            self.backend.marker_pop();
+        }
+
+        // 3. Output phase (identical to contiguous)
+        if node_config.is_tail() {
+            self.backend
+                .rmsnorm(&hidden_state, &self.weights.output_norm, cfg.rms_norm_eps, &normed)?;
+
+            let last_hidden = if seq_len > 1 {
+                let last = self.backend.alloc(&[1, hidden], DType::FP16)?;
+                self.backend
+                    .copy_rows(&normed, &last, seq_len - 1, 0, 1)?;
+                last
+            } else {
+                DeviceTensor::new(normed.id, vec![1, hidden], DType::FP16)
+            };
+
+            let logits_tensor = self
+                .backend
+                .alloc(&[1, cfg.vocab_size], DType::FP16)?;
+            self.backend
+                .matmul(&last_hidden, &self.weights.lm_head, &logits_tensor)?;
+
+            let mut logits_fp16 = vec![0u8; cfg.vocab_size * 2];
+            self.backend.copy_to_host(&logits_tensor, &mut logits_fp16)?;
+            self.backend.synchronize()?;
+
+            let logits: Vec<f32> = logits_fp16
+                .chunks_exact(2)
+                .map(|bytes| {
+                    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    half::f16::from_bits(bits).to_f32()
+                })
+                .collect();
+
+            if owns_hidden {
+                self.backend.free(&hidden_state)?;
+            }
+            self.backend.free(&normed)?;
+            self.backend.free(&q_flat)?;
+            self.backend.free(&k_flat)?;
+            self.backend.free(&v_flat)?;
+            self.backend.free(&attn_out_mh)?;
+            self.backend.free(&projected)?;
+            self.backend.free(&gate)?;
+            self.backend.free(&up)?;
+            self.backend.free(&ffn_mid)?;
+            self.backend.free(&ffn_out)?;
+            self.backend.free(&logits_tensor)?;
+            if seq_len > 1 {
+                self.backend.free(&last_hidden)?;
+            }
+
+            Ok(NodeOutput::Logits(logits))
+        } else {
             self.backend.free(&normed)?;
             self.backend.free(&q_flat)?;
             self.backend.free(&k_flat)?;
