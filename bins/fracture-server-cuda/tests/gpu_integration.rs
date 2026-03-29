@@ -8,13 +8,15 @@
 use fracture_core::{Backend, DType, ModelConfig};
 use fracture_cuda::CudaBackend;
 use fracture_engine::{
-    batched_forward, CacheHandle, Engine, KvCacheManager, NodeConfig,
-    PagedKvCacheManager, SequenceSlice,
+    batched_forward, CacheHandle, Engine, GenerationEvent, KvCacheManager, NodeConfig,
+    PagedKvCacheManager, PendingRequest, SequenceSlice,
 };
 use fracture_generate::{GenerationConfig, GenerationLoop};
 use fracture_gguf::{LayerWeights, WeightStore};
+use fracture_server::{start_scheduler_loop, SchedulerLoopConfig};
 use half::f16;
 use rand::Rng;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Tiny model configuration for integration tests.
@@ -969,4 +971,141 @@ fn test_batched_vs_sequential_prefill() {
     assert!(max_diff_b < 0.05, "seq B logits diverge: max_diff={max_diff_b:.6}");
     assert_eq!(greedy_a_seq, greedy_a_bat, "seq A greedy token mismatch");
     assert_eq!(greedy_b_seq, greedy_b_bat, "seq B greedy token mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Test: Concurrent requests through the batched scheduler produce correct results
+// ---------------------------------------------------------------------------
+//
+// Phase 4 Step 3e validation. Starts the scheduler loop, submits 3 requests
+// concurrently, collects their outputs, and verifies each sequence's greedy
+// tokens match what it would produce when run alone.
+
+/// Run greedy generation for a prompt through forward_paged (sequential, reference).
+fn greedy_sequential(
+    engine: &Engine<CudaBackend>,
+    cfg: &ModelConfig,
+    prompt: &[u32],
+    max_tokens: usize,
+) -> Vec<u32> {
+    let mut cache = PagedKvCacheManager::new(
+        128, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    )
+    .expect("cache");
+    let handle = cache.alloc().expect("alloc");
+
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    let mut logits = engine
+        .forward_paged(prompt, &positions, &mut cache, handle)
+        .expect("prefill");
+
+    let mut tokens = Vec::new();
+    for step in 0..max_tokens {
+        let token = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        tokens.push(token);
+        let pos = (prompt.len() + step) as u32;
+        logits = engine
+            .forward_paged(&[token], &[pos], &mut cache, handle)
+            .expect("decode");
+    }
+
+    cache.free(handle).expect("free");
+    cache.destroy(engine.backend()).expect("destroy");
+    tokens
+}
+
+#[tokio::test]
+async fn test_scheduler_concurrent_requests() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+    let engine = Arc::new(engine);
+    let max_tokens = 5;
+
+    // --- Reference: run each prompt individually ---
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![1, 2, 3, 4, 5],
+        vec![10, 20, 30],
+        vec![100, 101, 102, 103],
+    ];
+
+    let mut reference_tokens = Vec::new();
+    for prompt in &prompts {
+        reference_tokens.push(greedy_sequential(&engine, &cfg, prompt, max_tokens));
+    }
+
+    // --- Batched: submit all through the scheduler loop ---
+    let cache = PagedKvCacheManager::new(
+        256, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    )
+    .expect("paged cache");
+
+    let scheduler_config = SchedulerLoopConfig {
+        max_batch_size: 64,
+        max_batch_tokens: 4096,
+        max_prefill_tokens: 512,
+        block_pool_reserve: 0.1,
+    };
+
+    let handle = start_scheduler_loop(Arc::clone(&engine), cache, scheduler_config);
+
+    // Submit all requests and collect receivers.
+    let mut receivers = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = PendingRequest {
+            seq_id: i as u64,
+            prompt_tokens: prompt.clone(),
+            max_tokens,
+            temperature: 0.0, // greedy
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            stop_tokens: vec![], // no stop tokens — generate exactly max_tokens
+            event_tx: tx,
+        };
+        handle.submit(req).expect("submit");
+        receivers.push(rx);
+    }
+
+    // Collect tokens from each receiver.
+    let mut batched_tokens: Vec<Vec<u32>> = Vec::new();
+    for mut rx in receivers {
+        let mut tokens = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                GenerationEvent::Token(t) => tokens.push(t),
+                GenerationEvent::Finished { .. } => break,
+                GenerationEvent::Error(e) => panic!("generation error: {e}"),
+            }
+        }
+        batched_tokens.push(tokens);
+    }
+
+    // --- Compare ---
+    assert_eq!(batched_tokens.len(), prompts.len());
+
+    for (i, (ref_tokens, bat_tokens)) in reference_tokens
+        .iter()
+        .zip(batched_tokens.iter())
+        .enumerate()
+    {
+        eprintln!(
+            "Seq {i}: ref={ref_tokens:?} batched={bat_tokens:?} match={}",
+            ref_tokens == bat_tokens
+        );
+        assert_eq!(
+            ref_tokens, bat_tokens,
+            "seq {i} tokens diverge:\n  reference: {ref_tokens:?}\n  batched:   {bat_tokens:?}"
+        );
+    }
+
+    eprintln!(
+        "Scheduler concurrent test: {} sequences, {} tokens each, all match reference",
+        prompts.len(),
+        max_tokens
+    );
 }
