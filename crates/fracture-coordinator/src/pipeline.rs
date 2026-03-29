@@ -84,6 +84,8 @@ impl DistributedPipeline {
     /// Send CacheAlloc to all workers for a new sequence.
     ///
     /// Returns an error if the sequence already has an active cache allocation.
+    /// If allocation fails on any worker, successfully-allocated caches on other
+    /// workers are freed (rollback) to prevent memory leaks.
     pub async fn alloc_cache(
         &self,
         registry: &mut PeerRegistry,
@@ -100,14 +102,67 @@ impl DistributedPipeline {
         }
 
         let payload = CacheAllocPayload { max_seq_len };
+        let mut succeeded: Vec<String> = Vec::new();
+
+        let result = self
+            .try_alloc_all(registry, seq_id, &payload, &mut succeeded)
+            .await;
+
+        if result.is_err() {
+            // Rollback: free caches on workers that already succeeded
+            for succeeded_id in &succeeded {
+                if let Some(ok_entry) = registry.get_mut(succeeded_id) {
+                    let _ = ok_entry
+                        .connection
+                        .send_empty(MessageType::CacheFree, seq_id)
+                        .await;
+                }
+            }
+            return result;
+        }
+
+        self.allocated_seqs.lock().unwrap().insert(seq_id);
+        Ok(())
+    }
+
+    /// Attempt to send CacheAlloc to all workers and collect acks.
+    /// On any failure, returns the error (caller handles rollback).
+    async fn try_alloc_all(
+        &self,
+        registry: &mut PeerRegistry,
+        seq_id: u64,
+        payload: &CacheAllocPayload,
+        succeeded: &mut Vec<String>,
+    ) -> Result<()> {
         for node_id in &self.pipeline_order {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
             })?;
-            entry.connection.send(MessageType::CacheAlloc, seq_id, &payload).await?;
-        }
+            entry
+                .connection
+                .send(MessageType::CacheAlloc, seq_id, payload)
+                .await?;
 
-        self.allocated_seqs.lock().unwrap().insert(seq_id);
+            // Wait for CacheAllocAck or Error from the worker
+            let (header, resp_payload) = entry.connection.recv().await?;
+
+            if header.msg_type == MessageType::Error {
+                let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
+                return Err(FractureError::Pipeline(format!(
+                    "worker '{}' failed CacheAlloc: {} (code {:?})",
+                    node_id, err.message, err.error_code
+                )));
+            }
+
+            if header.msg_type != MessageType::CacheAllocAck {
+                return Err(FractureError::Protocol(format!(
+                    "expected CacheAllocAck from '{}', got {:?}",
+                    node_id, header.msg_type
+                )));
+            }
+
+            succeeded.push(node_id.clone());
+        }
         Ok(())
     }
 

@@ -1039,4 +1039,116 @@ mod tests {
             NodeOutput::Activations(_) => panic!("full node should return Logits"),
         }
     }
+
+    // ── AllocCountingMockBackend ─────────────────────────────────
+
+    /// A mock backend that counts alloc() calls to verify scratch tensor reuse.
+    struct AllocCountingMockBackend {
+        next_id: AtomicU64,
+        alloc_count: AtomicU64,
+    }
+
+    impl AllocCountingMockBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1000),
+                alloc_count: AtomicU64::new(0),
+            }
+        }
+
+        fn alloc_count(&self) -> u64 {
+            self.alloc_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Backend for AllocCountingMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            self.alloc_count.fetch_add(1, Ordering::Relaxed);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _tensor: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, dst: &mut [u8]) -> Result<()> {
+            dst.fill(0);
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, _src: &DeviceTensor, _dst: &DeviceTensor, _src_offset: usize, _dst_offset: usize, _count: usize) -> Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "alloc-counting-mock" }
+        fn total_memory(&self) -> usize { 1_000_000_000 }
+        fn available_memory(&self) -> usize { 1_000_000_000 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _timer: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _timer: &DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    // ── Scratch tensor reuse test ────────────────────────────────
+
+    /// Verify that scratch tensors are allocated once before the layer loop and reused
+    /// across all layers. The alloc count should NOT scale with num_layers — only
+    /// weight and KV cache tensors scale with layer count.
+    ///
+    /// Strategy: run forward passes with 2-layer and 4-layer configs. The difference
+    /// in alloc counts should be exactly the KV cache allocs that scale with layers
+    /// (2 per layer for K and V caches), NOT scratch tensors.
+    #[test]
+    fn test_scratch_tensor_reuse_across_layers() {
+        // Helper: run a forward pass with N layers and return the alloc count.
+        fn run_forward_and_count_allocs(num_layers: usize) -> u64 {
+            let mut cfg = test_config();
+            cfg.num_layers = num_layers;
+            let backend = AllocCountingMockBackend::new();
+            let weights = mock_weights(&cfg);
+            let engine = Engine::new(backend, weights, 0..num_layers);
+            let mut cache = KvCacheManager::new(
+                num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+            );
+            let handle = cache.alloc(engine.backend()).unwrap();
+
+            engine.forward(&[1], &[0], &mut cache, handle, None).unwrap();
+            engine.backend().alloc_count()
+        }
+
+        let allocs_2_layers = run_forward_and_count_allocs(2);
+        let allocs_4_layers = run_forward_and_count_allocs(4);
+
+        // The difference in allocs between 4-layer and 2-layer should come only from
+        // KV cache allocation (2 allocs per extra layer: K cache + V cache).
+        // KV cache allocates 2 tensors per layer, so delta for 2 extra layers = 4.
+        let delta = allocs_4_layers - allocs_2_layers;
+        let expected_cache_delta = 2 * 2; // 2 extra layers * 2 (K + V) per layer
+
+        assert_eq!(
+            delta, expected_cache_delta,
+            "alloc count should only scale with KV cache tensors (2 per layer), \
+             not scratch tensors. 2-layer allocs: {}, 4-layer allocs: {}, delta: {} \
+             (expected {} for cache-only scaling)",
+            allocs_2_layers, allocs_4_layers, delta, expected_cache_delta
+        );
+
+        // Sanity check: scratch tensors should be a fixed count.
+        // For a full (head+tail) forward pass with seq_len=1:
+        // - 1 embedding (hidden_state)
+        // - 10 scratch tensors (normed, q_flat, k_flat, v_flat, attn_out_mh,
+        //   projected, gate, up, ffn_mid, ffn_out)
+        // - 1 logits_tensor
+        // Total fixed allocs = 12
+        // Per-layer allocs = 2 (K cache + V cache) from KvCacheManager::alloc
+        // So 2-layer total = 12 + 2*2 = 16
+        let expected_2_layer = 12 + 2 * 2;
+        assert_eq!(
+            allocs_2_layers, expected_2_layer,
+            "2-layer alloc count mismatch: expected {} (12 fixed + 4 cache), got {}",
+            expected_2_layer, allocs_2_layers
+        );
+    }
 }

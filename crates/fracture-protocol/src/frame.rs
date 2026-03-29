@@ -44,6 +44,7 @@ pub enum MessageType {
     CacheFree = 0x08,
     Shutdown = 0x09,
     Error = 0x0A,
+    CacheAllocAck = 0x0B,
 }
 
 impl MessageType {
@@ -59,6 +60,7 @@ impl MessageType {
             0x08 => Ok(Self::CacheFree),
             0x09 => Ok(Self::Shutdown),
             0x0A => Ok(Self::Error),
+            0x0B => Ok(Self::CacheAllocAck),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -160,6 +162,7 @@ mod tests {
             MessageType::CacheFree,
             MessageType::Shutdown,
             MessageType::Error,
+            MessageType::CacheAllocAck,
         ];
         for mt in types {
             let v = mt as u8;
@@ -171,7 +174,7 @@ mod tests {
     #[test]
     fn test_message_type_unknown() {
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x0B).is_err());
+        assert!(MessageType::from_u8(0x0C).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 

@@ -41,8 +41,14 @@ async fn spawn_mock_worker(
             };
 
             match header.msg_type {
-                MessageType::CacheAlloc | MessageType::CacheFree => {
-                    // No response needed for these
+                MessageType::CacheAlloc => {
+                    // Respond with CacheAllocAck
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {
+                    // No response needed
                 }
                 MessageType::Forward => {
                     let _req: ForwardPayload =
@@ -438,7 +444,12 @@ async fn spawn_error_worker(listener: TcpListener) -> tokio::task::JoinHandle<()
                 Err(_) => break,
             };
             match header.msg_type {
-                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
                 MessageType::Forward => {
                     let err = ErrorPayload {
                         error_code: ErrorCode::OutOfMemory,
@@ -472,7 +483,12 @@ async fn spawn_wrong_output_worker(
                 Err(_) => break,
             };
             match header.msg_type {
-                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
                 MessageType::Forward => {
                     let result = if return_logits {
                         let data: Vec<u8> = (0..vocab_size)
@@ -671,7 +687,12 @@ async fn spawn_protocol_worker(listener: TcpListener) -> tokio::task::JoinHandle
             };
 
             match header.msg_type {
-                MessageType::CacheAlloc => { cache_count += 1; }
+                MessageType::CacheAlloc => {
+                    cache_count += 1;
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
                 MessageType::CacheFree => { cache_count = cache_count.saturating_sub(1); }
                 MessageType::Heartbeat => {
                     let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
@@ -706,6 +727,8 @@ async fn test_worker_cache_alloc_free_via_protocol() {
     // Alloc 3 caches
     for seq_id in 1..=3u64 {
         conn.send(MessageType::CacheAlloc, seq_id, &CacheAllocPayload { max_seq_len: 4096 }).await.unwrap();
+        let (ack_header, _) = conn.recv().await.unwrap();
+        assert_eq!(ack_header.msg_type, MessageType::CacheAllocAck);
     }
 
     // Heartbeat to verify count
@@ -895,7 +918,12 @@ async fn spawn_unexpected_response_worker(listener: TcpListener) -> tokio::task:
                 Err(_) => break,
             };
             match header.msg_type {
-                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
                 MessageType::Forward => {
                     // Send Heartbeat instead of ForwardResult (wrong!)
                     let hb = HeartbeatPayload { timestamp_ns: 0, nonce: 0 };
@@ -954,7 +982,12 @@ async fn spawn_wrong_shape_worker(
                 Err(_) => break,
             };
             match header.msg_type {
-                MessageType::CacheAlloc | MessageType::CacheFree => {}
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
                 MessageType::Forward => {
                     let data_len = wrong_hidden_size * 2;
                     let result = ForwardResultPayload {
@@ -1301,4 +1334,236 @@ async fn test_multiple_sequence_isolation() {
     assert!(result.is_err());
 
     pipeline.free_cache(&mut registry, seq_b).await.unwrap();
+}
+
+// ── Partial cache alloc rollback test ──────────────────────────────────
+
+/// Spawn a mock worker that fails CacheAlloc with an OOM error.
+async fn spawn_oom_alloc_worker(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    // Respond with Error (OOM)
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::OutOfMemory,
+                        message: "GPU OOM during cache allocation".into(),
+                    };
+                    conn.send(MessageType::Error, header.seq_id, &err)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Spawn a mock worker that tracks CacheAlloc/CacheFree via a channel,
+/// so the test can verify rollback (CacheFree sent after partial failure).
+async fn spawn_tracking_worker(
+    listener: TcpListener,
+    event_tx: tokio::sync::mpsc::UnboundedSender<(MessageType, u64)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    let _ = event_tx.send((MessageType::CacheAlloc, header.seq_id));
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {
+                    let _ = event_tx.send((MessageType::CacheFree, header.seq_id));
+                }
+                MessageType::Forward => {
+                    // Return logits (acts as tail)
+                    let data: Vec<u8> = (0..128256u32)
+                        .flat_map(|i| (i as f32).to_le_bytes())
+                        .collect();
+                    let result = ForwardResultPayload {
+                        output: ForwardOutputWire::Logits { data },
+                    };
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_partial_cache_alloc_rollback() {
+    // Set up two workers: head (tracking) succeeds, tail (OOM) fails.
+    // The coordinator should rollback by sending CacheFree to head.
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let _head_task = spawn_tracking_worker(head_listener, event_tx).await;
+    let _tail_task = spawn_oom_alloc_worker(tail_listener).await;
+
+    let head_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(head_addr).await.unwrap(),
+    );
+    let tail_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(tail_addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("head"), head_conn).unwrap();
+    registry.register(make_caps("tail"), tail_conn).unwrap();
+
+    let assignments = vec![
+        LayerAssignment {
+            node_id: "head".into(),
+            layer_range: 0..16,
+            role: NodeRole::Head,
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        },
+        LayerAssignment {
+            node_id: "tail".into(),
+            layer_range: 16..32,
+            role: NodeRole::Tail,
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        },
+    ];
+    for a in &assignments {
+        registry.assign(&a.node_id, a.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
+    let seq_id = 42;
+
+    // alloc_cache should fail because the tail worker returns OOM
+    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("GPU OOM") || err_msg.contains("OutOfMemory"),
+        "expected OOM error: {err_msg}"
+    );
+
+    // Verify the sequence was NOT marked as allocated
+    assert!(
+        !pipeline.is_allocated(seq_id),
+        "seq should not be marked allocated after partial failure"
+    );
+
+    // Verify events: head received CacheAlloc, then CacheFree (rollback)
+    // Allow time for the rollback CacheFree to be delivered and processed.
+    let mut events = Vec::new();
+    for _ in 0..10 {
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        if events.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(events.len(), 2, "expected 2 events (alloc + rollback free), got: {events:?}");
+    assert_eq!(events[0], (MessageType::CacheAlloc, seq_id));
+    assert_eq!(events[1], (MessageType::CacheFree, seq_id));
+}
+
+#[tokio::test]
+async fn test_partial_cache_alloc_rollback_three_nodes() {
+    // Three workers: head and mid succeed, tail fails.
+    // Rollback should free caches on head and mid.
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mid_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let mid_addr = mid_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let (head_tx, mut head_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mid_tx, mut mid_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let _head = spawn_tracking_worker(head_listener, head_tx).await;
+    let _mid = spawn_tracking_worker(mid_listener, mid_tx).await;
+    let _tail = spawn_oom_alloc_worker(tail_listener).await;
+
+    let head_conn = FramedConnection::new(tokio::net::TcpStream::connect(head_addr).await.unwrap());
+    let mid_conn = FramedConnection::new(tokio::net::TcpStream::connect(mid_addr).await.unwrap());
+    let tail_conn = FramedConnection::new(tokio::net::TcpStream::connect(tail_addr).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("head"), head_conn).unwrap();
+    registry.register(make_caps("mid"), mid_conn).unwrap();
+    registry.register(make_caps("tail"), tail_conn).unwrap();
+
+    let assignments = vec![
+        LayerAssignment {
+            node_id: "head".into(), layer_range: 0..10, role: NodeRole::Head,
+            expected_decode_ms: 10.0, weight_memory_gb: 4.0, cache_memory_gb: 0.5,
+        },
+        LayerAssignment {
+            node_id: "mid".into(), layer_range: 10..20, role: NodeRole::Middle,
+            expected_decode_ms: 10.0, weight_memory_gb: 4.0, cache_memory_gb: 0.5,
+        },
+        LayerAssignment {
+            node_id: "tail".into(), layer_range: 20..32, role: NodeRole::Tail,
+            expected_decode_ms: 12.0, weight_memory_gb: 5.0, cache_memory_gb: 0.6,
+        },
+    ];
+    for a in &assignments {
+        registry.assign(&a.node_id, a.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
+    let seq_id = 77;
+
+    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    assert!(result.is_err());
+    assert!(!pipeline.is_allocated(seq_id));
+
+    // Both head and mid should have received CacheAlloc then CacheFree (rollback).
+    // Allow time for the rollback CacheFree to be delivered and processed.
+    let mut head_events = Vec::new();
+    let mut mid_events = Vec::new();
+    for _ in 0..10 {
+        while let Ok(e) = head_rx.try_recv() { head_events.push(e); }
+        while let Ok(e) = mid_rx.try_recv() { mid_events.push(e); }
+        if head_events.len() >= 2 && mid_events.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(head_events.len(), 2, "head: expected alloc+free, got: {head_events:?}");
+    assert_eq!(head_events[0].0, MessageType::CacheAlloc);
+    assert_eq!(head_events[1].0, MessageType::CacheFree);
+
+    assert_eq!(mid_events.len(), 2, "mid: expected alloc+free, got: {mid_events:?}");
+    assert_eq!(mid_events[0].0, MessageType::CacheAlloc);
+    assert_eq!(mid_events[1].0, MessageType::CacheFree);
 }

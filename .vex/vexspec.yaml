@@ -184,7 +184,7 @@ sections:
           fewer layers or reading invalid tensor names.
 
       - name: bf16-weight-conversion
-        status: not-implemented
+        status: implemented
         description: |
           BF16 tensors in GGUF files are converted to FP16 on the host
           before GPU upload, similar to F32 norm weight conversion. The
@@ -354,7 +354,7 @@ sections:
           computation to ensure grouping produces identical results.
 
       - name: attention-causal-mask-correctness
-        status: not-implemented
+        status: implemented
         description: |
           The causal mask is validated independently: position i must have zero
           attention weight on positions j > i during prefill. Verified by
@@ -460,7 +460,7 @@ sections:
           cache-bounds behavior depends on.
 
       - name: alloc-oom
-        status: not-implemented
+        status: implemented
         description: |
           Allocating a tensor when GPU memory is exhausted returns an error
           rather than crashing or invoking undefined behavior.
@@ -694,11 +694,13 @@ sections:
           test_gpu_prefill_decode_consistency in GPU integration tests.
 
       - name: scratch-tensor-reuse
-        status: not-implemented
+        status: implemented
         description: |
           The engine reuses scratch tensors across layers rather than
           allocating new GPU memory per layer. Peak GPU memory during a
-          32-layer forward pass is O(1) scratch buffers, not O(num_layers).
+          multi-layer forward pass is O(1) scratch buffers, not O(num_layers).
+          Tested by test_scratch_tensor_reuse_across_layers which verifies
+          alloc counts are constant across 2-layer vs 4-layer models.
 
       - name: forward-node-input-type-validation
         status: implemented
@@ -1280,7 +1282,7 @@ sections:
           on these counts being exact.
 
       - name: concurrent-requests
-        status: not-implemented
+        status: implemented
         description: |
           Multiple simultaneous generation requests are handled correctly,
           each with independent KV cache and generation state. One request
@@ -1753,7 +1755,7 @@ sections:
           details. Unexpected message types also produce Protocol errors.
 
       - name: partial-cache-alloc-rollback
-        status: not-implemented
+        status: implemented
         description: |
           When alloc_cache() sends CacheAlloc to all pipeline workers and
           allocation fails on one worker (e.g., GPU OOM) but succeeds on
@@ -2074,6 +2076,9 @@ sections:
         reason: scheduler correctness is tested in the Scheduler section; e2e validation doesn't need to re-test the algorithm
       - suggestion: streaming-distributed-generation
         reason: coordinator streaming not implemented
+    covered:
+      - behavior: http-api-distributed-generation
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_inference_pipeline exercises /health, /v1/models, /v1/completions with usage stats)
     behaviors:
       - name: cross-machine-inference
         status: implemented
@@ -2125,7 +2130,7 @@ sections:
           or incorrect KV cache isolation.
 
       - name: http-api-distributed-generation
-        status: not-implemented
+        status: implemented
         description: |
           An OpenAI-compatible HTTP request (e.g., /v1/completions) submitted
           to the coordinator is routed through the distributed pipeline and

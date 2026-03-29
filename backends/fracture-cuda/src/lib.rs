@@ -690,6 +690,19 @@ mod tests {
     }
 
     #[test]
+    fn test_alloc_oom() {
+        let b = make_backend();
+        // Try to allocate more memory than any GPU has (1 TB)
+        let result = b.alloc(&[1024 * 1024 * 1024, 256], DType::FP16);
+        assert!(result.is_err(), "allocating 1TB should fail with OOM");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("CUDA error"),
+            "expected CUDA error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_copy_rows() {
         let b = make_backend();
         // src: 4 rows of 2 elements
