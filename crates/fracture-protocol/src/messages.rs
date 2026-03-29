@@ -58,6 +58,46 @@ pub enum ForwardInputWire {
     },
 }
 
+// ── 0x03 BatchedForward (Coordinator → Worker) — uses same MessageType ──
+
+/// Per-sequence metadata within a batched forward request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceMetadataWire {
+    pub seq_id: u64,
+    /// Number of tokens for this sequence in this batch.
+    pub num_tokens: usize,
+    /// Absolute positions for RoPE.
+    pub positions: Vec<u32>,
+    /// Block table for paged attention (physical block IDs).
+    pub block_table: Vec<u32>,
+    /// Total KV cache length (for attention masking).
+    pub cache_seq_len: usize,
+    /// Valid tokens in last block.
+    pub last_block_tokens: usize,
+}
+
+/// Batched forward pass request. Contains multiple sequences'
+/// token IDs concatenated together, plus per-sequence metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchedForwardPayload {
+    pub is_prefill: bool,
+    pub sequences: Vec<SequenceMetadataWire>,
+    pub input: ForwardInputWire,
+}
+
+/// Batched forward result with per-sequence logit offsets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchedForwardResultPayload {
+    /// Per-sequence output. For intermediate workers, a single concatenated
+    /// activation tensor. For the tail worker, per-sequence logits.
+    pub output: ForwardOutputWire,
+    /// Number of sequences in the batch.
+    pub num_sequences: usize,
+    /// Byte offsets into the logits data for each sequence (tail only).
+    /// For activations, this is empty (single concatenated tensor).
+    pub logit_offsets: Vec<usize>,
+}
+
 // ── 0x04 ForwardResult (Worker → Coordinator) ───────────────────────────
 
 /// Forward pass result. Tail nodes return logits; head/middle nodes
@@ -98,6 +138,10 @@ pub struct HeartbeatAckPayload {
     pub nonce_echo: u64,
     pub gpu_memory_used: u64,
     pub active_sequences: u32,
+    /// Free blocks in this worker's paged KV cache pool.
+    /// 0 if paged mode is not active.
+    #[serde(default)]
+    pub free_blocks: u32,
 }
 
 // ── 0x07 CacheAlloc (Coordinator → Worker) ──────────────────────────────
@@ -276,6 +320,7 @@ mod tests {
             nonce_echo: 42,
             gpu_memory_used: 15 * 1024 * 1024 * 1024,
             active_sequences: 3,
+            free_blocks: 0,
         };
         let decoded: HeartbeatAckPayload = bincode_roundtrip(&payload);
         assert_eq!(decoded.nonce_echo, 42);

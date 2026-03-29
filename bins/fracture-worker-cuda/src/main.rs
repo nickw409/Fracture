@@ -256,6 +256,7 @@ async fn main() -> Result<()> {
                     gpu_memory_used: node.engine().backend().total_memory() as u64
                         - node.engine().backend().available_memory() as u64,
                     active_sequences: handles.len() as u32,
+                    free_blocks: 0,
                 };
                 conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
             }

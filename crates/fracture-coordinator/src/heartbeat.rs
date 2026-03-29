@@ -203,6 +203,7 @@ mod tests {
             nonce_echo: nonce,
             gpu_memory_used: 0,
             active_sequences: 0,
+            free_blocks: 0,
         }
     }
 

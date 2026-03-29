@@ -45,6 +45,8 @@ pub enum MessageType {
     Shutdown = 0x09,
     Error = 0x0A,
     CacheAllocAck = 0x0B,
+    BatchedForward = 0x0C,
+    BatchedForwardResult = 0x0D,
 }
 
 impl MessageType {
@@ -61,6 +63,8 @@ impl MessageType {
             0x09 => Ok(Self::Shutdown),
             0x0A => Ok(Self::Error),
             0x0B => Ok(Self::CacheAllocAck),
+            0x0C => Ok(Self::BatchedForward),
+            0x0D => Ok(Self::BatchedForwardResult),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -163,6 +167,8 @@ mod tests {
             MessageType::Shutdown,
             MessageType::Error,
             MessageType::CacheAllocAck,
+            MessageType::BatchedForward,
+            MessageType::BatchedForwardResult,
         ];
         for mt in types {
             let v = mt as u8;
@@ -174,7 +180,7 @@ mod tests {
     #[test]
     fn test_message_type_unknown() {
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x0C).is_err());
+        assert!(MessageType::from_u8(0x0E).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 

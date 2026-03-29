@@ -645,6 +645,7 @@ async fn test_heartbeat_round_trip() {
             nonce_echo: hb.nonce,
             gpu_memory_used: 8_000_000_000,
             active_sequences: 2,
+            free_blocks: 0,
         };
         conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
     });
@@ -699,6 +700,7 @@ async fn spawn_protocol_worker(listener: TcpListener) -> tokio::task::JoinHandle
                     let ack = HeartbeatAckPayload {
                         timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
                         gpu_memory_used: 0, active_sequences: cache_count,
+                        free_blocks: 0,
                     };
                     conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
                 }
@@ -800,6 +802,7 @@ async fn test_send_heartbeats_and_check_timeout() {
             nonce_echo: hb.nonce,
             gpu_memory_used: 0,
             active_sequences: 0,
+            free_blocks: 0,
         };
         conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
     });
