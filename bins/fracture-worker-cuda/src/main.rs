@@ -269,6 +269,18 @@ async fn main() -> Result<()> {
                 break;
             }
 
+            MessageType::BatchedForward => {
+                // Phase 4: batched forward with paged KV cache.
+                // TODO: implement worker-side batched forward with paged block pool.
+                // Requires: PagedKvCacheManager setup at startup, batched_forward() call,
+                // return BatchedForwardResultPayload.
+                let err = ErrorPayload {
+                    error_code: ErrorCode::Internal,
+                    message: "BatchedForward not yet supported by this worker".into(),
+                };
+                conn.send(MessageType::Error, header.seq_id, &err).await?;
+            }
+
             other => {
                 tracing::warn!("unexpected message type: {other:?}");
                 let err = ErrorPayload {
