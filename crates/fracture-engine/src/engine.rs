@@ -948,4 +948,85 @@ mod tests {
             NodeOutput::Activations(_) => panic!("tail node should return Logits, not Activations"),
         }
     }
+
+    /// Sending TokenIds to a non-head node (tail) should return a Pipeline error.
+    #[test]
+    fn test_token_ids_to_non_head_returns_error() {
+        let mut cfg = test_config();
+        cfg.num_layers = 2;
+        let backend = MockBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..2);
+        let mut cache = KvCacheManager::new(2, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        // Create a tail NodeConfig (not head)
+        let node_config = NodeConfig::new(1..2, 2).unwrap();
+        assert!(!node_config.is_head());
+
+        let input = NodeInput::TokenIds {
+            ids: vec![1],
+            positions: vec![0],
+        };
+        let result = engine.forward_node(input, &node_config, &mut cache, handle, None);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for TokenIds to non-head"),
+        };
+        assert!(err.to_string().contains("non-head"));
+    }
+
+    /// Sending Activations to a head node should return a Pipeline error.
+    #[test]
+    fn test_activations_to_head_returns_error() {
+        let mut cfg = test_config();
+        cfg.num_layers = 2;
+        let backend = MockBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..2);
+        let mut cache = KvCacheManager::new(2, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let node_config = NodeConfig::new(0..1, 2).unwrap();
+        assert!(node_config.is_head());
+
+        let fake_hidden = engine.backend().alloc(&[1, cfg.hidden_size], DType::FP16).unwrap();
+        let input = NodeInput::Activations {
+            hidden_states: fake_hidden,
+            positions: vec![0],
+        };
+        let result = engine.forward_node(input, &node_config, &mut cache, handle, None);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for Activations to head"),
+        };
+        assert!(err.to_string().contains("head"));
+    }
+
+    /// Full node (is_head + is_tail) returns Logits from TokenIds.
+    #[test]
+    fn test_full_node_forward_returns_logits() {
+        let cfg = test_config();
+        let backend = MockBackend::new();
+        let weights = mock_weights(&cfg);
+        let engine = Engine::new(backend, weights, 0..cfg.num_layers);
+        let mut cache = KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len);
+        let handle = cache.alloc(engine.backend()).unwrap();
+
+        let node_config = NodeConfig::new(0..cfg.num_layers, cfg.num_layers).unwrap();
+        assert!(node_config.is_full());
+
+        let input = NodeInput::TokenIds {
+            ids: vec![1],
+            positions: vec![0],
+        };
+        let result = engine.forward_node(input, &node_config, &mut cache, handle, None);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            NodeOutput::Logits(logits) => {
+                assert_eq!(logits.len(), cfg.vocab_size);
+            }
+            NodeOutput::Activations(_) => panic!("full node should return Logits"),
+        }
+    }
 }

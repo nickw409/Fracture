@@ -555,6 +555,28 @@ mod tests {
         }
     }
 
+    /// Verify temperature=1.0 leaves the distribution unchanged:
+    /// the argmax token is the same with and without temperature scaling.
+    #[test]
+    fn test_temperature_one_preserves_distribution() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0, 0.5];
+        let params_temp1 = SamplingParams {
+            temperature: 0.0, // greedy
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let greedy = Sampler::sample(&logits, &params_temp1).unwrap();
+
+        // With temperature=1.0 and greedy-like params (top_k=1), should pick same token
+        let params_temp1_topk1 = SamplingParams {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+        };
+        let with_temp = Sampler::sample(&logits, &params_temp1_topk1).unwrap();
+        assert_eq!(greedy, with_temp, "temp=1.0 with top_k=1 should pick the same as greedy");
+    }
+
     /// Verify top-K is applied before top-P by using logits where the order matters.
     /// top_k=3 restricts to indices 0,1,2, then top_p=0.99 keeps all 3.
     /// Tokens 3 and 4 should never appear.

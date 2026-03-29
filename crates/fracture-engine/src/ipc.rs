@@ -585,4 +585,74 @@ mod tests {
         backend.copy_to_host(&restored, &mut host).unwrap();
         assert_eq!(host, data);
     }
+
+    #[test]
+    fn test_info_request_response_roundtrip() {
+        let msg = IpcMessage::InfoRequest;
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let decoded = read_message(&mut buf.as_slice()).unwrap();
+        assert!(matches!(decoded, IpcMessage::InfoRequest));
+
+        let resp = IpcMessage::InfoResponse {
+            node_id: "test-node".into(),
+            layer_start: 0,
+            layer_end: 16,
+            is_head: true,
+            is_tail: false,
+            gpu_memory_total: 24_000_000_000,
+            gpu_memory_used: 12_000_000_000,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        let decoded = read_message(&mut buf.as_slice()).unwrap();
+        match decoded {
+            IpcMessage::InfoResponse {
+                node_id,
+                layer_start,
+                layer_end,
+                is_head,
+                is_tail,
+                gpu_memory_total,
+                gpu_memory_used,
+            } => {
+                assert_eq!(node_id, "test-node");
+                assert_eq!(layer_start, 0);
+                assert_eq!(layer_end, 16);
+                assert!(is_head);
+                assert!(!is_tail);
+                assert_eq!(gpu_memory_total, 24_000_000_000);
+                assert_eq!(gpu_memory_used, 12_000_000_000);
+            }
+            _ => panic!("expected InfoResponse"),
+        }
+    }
+
+    #[test]
+    fn test_activation_response_roundtrip() {
+        // ForwardResponse with is_logits=false (activation tensor payload)
+        let tensor_data = vec![0xAB; 64];
+        let msg = IpcMessage::ForwardResponse {
+            seq_id: 99,
+            is_logits: false,
+            payload: tensor_data.clone(),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+
+        let decoded = read_message(&mut buf.as_slice()).unwrap();
+        match decoded {
+            IpcMessage::ForwardResponse {
+                seq_id,
+                is_logits,
+                payload,
+            } => {
+                assert_eq!(seq_id, 99);
+                assert!(!is_logits);
+                assert_eq!(payload, tensor_data);
+            }
+            _ => panic!("expected ForwardResponse"),
+        }
+    }
 }
