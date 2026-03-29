@@ -2311,3 +2311,209 @@ sections:
           Paged and contiguous forward paths produce identical greedy
           token sequences on the same input. Validated with GPU tests:
           prefill and 5 decode steps both produce max_diff=0.000000.
+
+  # ============================================================
+  # BATCHED FORWARD PASS (Phase 4)
+  # ============================================================
+  - name: Batched Forward Pass
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Processes multiple sequences in a single forward pass. Per-token
+      operations (matmul, RMSNorm, RoPE, FFN) are concatenated into one
+      large tensor for GPU efficiency. Attention is dispatched per-sequence
+      since each has its own paged block table.
+    shared: [numerical-correctness, error-handling, backend-agnostic]
+    behaviors:
+      - name: batched-forward-concatenation
+        status: implemented
+        description: |
+          All sequences' tokens are concatenated into a single
+          [total_tokens, hidden] tensor for embedding, QKV projection,
+          RoPE, output projection, and FFN. Larger batches produce
+          larger matmuls for better GPU utilization.
+
+      - name: batched-forward-per-sequence-attention
+        status: implemented
+        description: |
+          Attention is dispatched per-sequence within the batch. Each
+          sequence's Q slice is extracted via copy_rows, passed to
+          attention_paged with its own block table, and the result is
+          copied back into the batched attention output buffer.
+
+      - name: batched-forward-per-sequence-cache-append
+        status: implemented
+        description: |
+          Each sequence's K/V data is sliced from the concatenated
+          projection tensors and appended to its own paged cache via
+          append_kv. Sequences with different token counts (prefill vs
+          decode) are handled correctly within the same batch.
+
+      - name: batched-forward-per-sequence-logits
+        status: implemented
+        description: |
+          After the layer loop, only the last token's logits are
+          extracted per sequence (not all tokens). Each sequence gets
+          its own logit vector for independent sampling.
+
+      - name: batched-forward-sequential-equivalence
+        status: implemented
+        description: |
+          Running N sequences through batched_forward produces identical
+          per-sequence logits to running each sequence individually
+          through forward_paged. Validated on GPU: two sequences with
+          different prompt lengths, max_diff=0.000000 for both.
+
+      - name: batched-forward-empty-batch
+        status: implemented
+        description: |
+          An empty batch (no sequences) returns an empty BatchedOutput
+          without error.
+
+      - name: batched-forward-mixed-lengths
+        status: implemented
+        description: |
+          A batch containing sequences with different token counts
+          (e.g., a 5-token prefill and a 1-token decode) processes
+          correctly. Each sequence's positions and cache state are
+          independent.
+
+  # ============================================================
+  # BATCH SCHEDULER (Phase 4)
+  # ============================================================
+  - name: Batch Scheduler
+    path: crates/fracture-engine/src
+    status: not-implemented
+    description: |
+      Iteration-level batch scheduler that decides which sequences to
+      include in each forward pass. Manages the prefill queue and active
+      decode sequences. Runs as a dedicated async loop.
+    shared: [error-handling]
+    behaviors:
+      - name: scheduler-decode-priority
+        status: not-implemented
+        description: |
+          All active decode sequences are included in every batch before
+          any new prefills are admitted. Decodes are cheap (1 token each)
+          and latency-sensitive.
+
+      - name: scheduler-prefill-admission
+        status: not-implemented
+        description: |
+          New requests from the prefill queue are admitted when batch
+          capacity (max_batch_tokens, max_batch_size) and memory
+          (free blocks in pool) allow. Admission checks block pool
+          reserve to prevent starving active decodes.
+
+      - name: scheduler-prefill-chunking
+        status: not-implemented
+        description: |
+          Prompts longer than max_prefill_tokens (configurable, default
+          512) are split into chunks. Each chunk is processed in a
+          separate iteration. The sequence accumulates KV cache across
+          chunks and enters decode after the final chunk.
+
+      - name: scheduler-batch-construction
+        status: not-implemented
+        description: |
+          The scheduler builds a SchedulerDecision containing prefill
+          and decode jobs. Total tokens across all jobs respects
+          max_batch_tokens. The decision is converted to SequenceSlice
+          entries for batched_forward.
+
+      - name: scheduler-sequence-completion
+        status: not-implemented
+        description: |
+          After sampling, sequences that hit a stop token or max_tokens
+          are removed from active_sequences. Their cache blocks are
+          freed. Their token channel receives GenerationEvent::Finished
+          with the stop reason.
+
+      - name: scheduler-block-pool-reserve
+        status: not-implemented
+        description: |
+          A configurable fraction (default 10%) of the block pool is
+          reserved for active sequence growth. New sequences are only
+          admitted if free_blocks - needed_blocks > reserved_blocks.
+
+  # ============================================================
+  # ASYNC REQUEST HANDLING (Phase 4)
+  # ============================================================
+  - name: Async Request Handling
+    path: crates/fracture-server/src
+    status: not-implemented
+    description: |
+      HTTP handlers enqueue requests and return immediately with a
+      streaming connection. A dedicated scheduler loop processes all
+      requests in batches and sends tokens back through channels.
+    shared: [error-handling]
+    behaviors:
+      - name: async-request-enqueue
+        status: not-implemented
+        description: |
+          The HTTP handler validates the request, tokenizes the prompt,
+          creates a token channel, and enqueues an InFlightRequest in
+          the prefill queue. It does not block on generation.
+
+      - name: async-streaming-response
+        status: not-implemented
+        description: |
+          SSE streaming reads from the GenerationEvent channel. Each
+          Token event becomes an SSE data chunk. Finished triggers the
+          final chunk with finish_reason and usage stats. Error sends
+          an error event.
+
+      - name: async-non-streaming-response
+        status: not-implemented
+        description: |
+          Non-streaming requests use a oneshot channel. The scheduler
+          collects all tokens and sends the complete response when the
+          sequence finishes. The HTTP handler awaits the oneshot.
+
+      - name: async-cancellation-on-disconnect
+        status: not-implemented
+        description: |
+          When a client disconnects (token_tx receiver dropped), the
+          scheduler detects the closed channel on the next send and
+          marks the sequence for cleanup. Cache blocks are freed.
+
+  # ============================================================
+  # SCHEDULER LOOP (Phase 4)
+  # ============================================================
+  - name: Scheduler Loop
+    path: crates/fracture-server/src
+    status: not-implemented
+    description: |
+      Dedicated tokio task that runs the batch scheduler every iteration.
+      It is the sole consumer of the inference pipeline — no Mutex on
+      the cache or engine.
+    shared: [error-handling]
+    behaviors:
+      - name: scheduler-loop-iteration
+        status: not-implemented
+        description: |
+          Each iteration: build batch via scheduler, run batched_forward,
+          sample per-sequence tokens, send tokens to channels, check
+          stop conditions, free completed sequences.
+
+      - name: scheduler-loop-sampling
+        status: not-implemented
+        description: |
+          After batched_forward returns per-sequence logits, the scheduler
+          samples a token for each sequence using its individual
+          SamplingParams (temperature, top_k, top_p, seed). Sampling
+          runs on CPU (same as Phase 1-3).
+
+      - name: scheduler-loop-token-streaming
+        status: not-implemented
+        description: |
+          Each sampled token is immediately sent through the sequence's
+          token_tx channel as GenerationEvent::Token. Tokens are not
+          buffered — they stream to clients as generated.
+
+      - name: scheduler-loop-concurrent-correctness
+        status: not-implemented
+        description: |
+          Multiple concurrent HTTP requests produce correct, independent
+          results. Each sequence's output matches what it would produce
+          if run alone.
