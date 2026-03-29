@@ -254,6 +254,36 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_three_node_middle_passes_activations() {
+        // 3-node pipeline: head(0..2) -> middle(2..6) -> tail(6..8)
+        // Middle node accepts Activations and returns Activations.
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 2, 8, false)),  // head: returns activations
+            Box::new(MockNode::new(2, 6, 8, false)),  // middle: returns activations
+            Box::new(MockNode::new(6, 8, 8, true)),   // tail: returns logits
+        ];
+        let pipeline = PipelineCoordinator::new(nodes).unwrap();
+        assert_eq!(pipeline.num_nodes(), 3);
+
+        let mut cache1 = KvCacheManager::new(2, 8, 128, 128);
+        let mut cache2 = KvCacheManager::new(4, 8, 128, 128);
+        let mut cache3 = KvCacheManager::new(2, 8, 128, 128);
+        let h1 = CacheHandle(1);
+        let h2 = CacheHandle(2);
+        let h3 = CacheHandle(3);
+
+        let result = pipeline.forward(
+            &[1, 2, 3],
+            &[0, 1, 2],
+            &mut [&mut cache1, &mut cache2, &mut cache3],
+            &[h1, h2, h3],
+        );
+        assert!(result.is_ok(), "3-node pipeline should succeed: {:?}", result.err());
+        let logits = result.unwrap();
+        assert_eq!(logits.len(), 10, "logits should come from tail node");
+    }
+
+    #[test]
     fn test_pipeline_non_head_first_rejected() {
         let nodes: Vec<Box<dyn ComputeNode>> = vec![
             Box::new(MockNode::new(1, 4, 4, true)), // doesn't start at 0

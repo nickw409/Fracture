@@ -1067,9 +1067,10 @@ async fn test_free_cache_unknown_worker_is_error() {
     };
     let pipeline = DistributedPipeline::new(&[assignment, missing_assignment], 4096).unwrap();
 
+    // free_cache for a never-allocated seq_id returns "not allocated" error
     let result = pipeline.free_cache(&mut registry, 1).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("ghost"));
+    assert!(result.unwrap_err().to_string().contains("not allocated"));
 }
 
 #[tokio::test]
@@ -1093,7 +1094,211 @@ async fn test_forward_unknown_worker_is_error() {
     };
     let pipeline = DistributedPipeline::new(&[assignment, missing], 4096).unwrap();
 
-    // Forward will succeed on first node but fail looking up second
+    // Forward without alloc_cache now fails with cache-not-allocated error
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
-    assert!(result.is_err(), "should fail when worker is missing from registry");
+    assert!(result.is_err(), "should fail when cache is not allocated");
+    assert!(result.unwrap_err().to_string().contains("cache not allocated"));
+}
+
+// ── Pipeline cache tracking and single-worker tests ────────────────────
+
+/// Helper: set up a single-worker pipeline (head+tail) with a mock worker.
+async fn setup_single_node_pipeline() -> (DistributedPipeline, PeerRegistry) {
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Single worker acts as tail (returns logits)
+    let _task = spawn_mock_worker(listener, true, hidden_size, vocab_size).await;
+
+    let conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("solo"), conn).unwrap();
+
+    let assignment = LayerAssignment {
+        node_id: "solo".into(),
+        layer_range: 0..32,
+        role: NodeRole::Head,
+        expected_decode_ms: 32.0,
+        weight_memory_gb: 12.0,
+        cache_memory_gb: 2.0,
+    };
+    registry.assign("solo", assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
+    (pipeline, registry)
+}
+
+#[tokio::test]
+async fn test_single_worker_forward_returns_logits() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+    let seq_id = 1;
+
+    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+
+    // Prefill
+    let logits = pipeline
+        .forward(&mut registry, seq_id, &[128000, 791, 1401], &[0, 1, 2], true)
+        .await
+        .unwrap();
+    assert_eq!(logits.len(), 128256);
+    assert!((logits[0] - 0.0).abs() < 1e-6);
+    assert!((logits[42] - 42.0).abs() < 1e-6);
+
+    // Decode step
+    let logits = pipeline
+        .forward(&mut registry, seq_id, &[42], &[3], false)
+        .await
+        .unwrap();
+    assert_eq!(logits.len(), 128256);
+
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_forward_without_cache_is_error() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+
+    // Forward without alloc_cache
+    let result = pipeline.forward(&mut registry, 99, &[1, 2], &[0, 1], true).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("cache not allocated"),
+        "expected cache-not-allocated error: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_duplicate_cache_alloc_is_error() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+    let seq_id = 10;
+
+    // First alloc succeeds
+    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+
+    // Second alloc for same seq_id fails
+    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("duplicate") || err_msg.contains("already allocated"),
+        "expected duplicate-alloc error: {err_msg}"
+    );
+
+    // Cleanup
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_free_unknown_sequence_is_error() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+
+    // Free a seq_id that was never allocated
+    let result = pipeline.free_cache(&mut registry, 999).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not allocated") || err_msg.contains("already freed"),
+        "expected not-allocated error: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_double_free_is_error() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+    let seq_id = 20;
+
+    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+
+    // Second free fails
+    let result = pipeline.free_cache(&mut registry, seq_id).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not allocated") || err_msg.contains("already freed"),
+        "expected already-freed error: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_reuse_after_free() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+    let seq_id = 30;
+
+    // Alloc, use, free
+    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    let logits = pipeline
+        .forward(&mut registry, seq_id, &[1], &[0], false)
+        .await
+        .unwrap();
+    assert_eq!(logits.len(), 128256);
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+
+    // Re-alloc same seq_id succeeds
+    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    let logits = pipeline
+        .forward(&mut registry, seq_id, &[2], &[0], false)
+        .await
+        .unwrap();
+    assert_eq!(logits.len(), 128256);
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multiple_sequence_isolation() {
+    let (pipeline, mut registry) = setup_single_node_pipeline().await;
+    let seq_a = 100;
+    let seq_b = 200;
+
+    // Allocate both sequences
+    pipeline.alloc_cache(&mut registry, seq_a, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_b, 4096).await.unwrap();
+
+    // Forward sequence A
+    let logits_a = pipeline
+        .forward(&mut registry, seq_a, &[1, 2, 3], &[0, 1, 2], true)
+        .await
+        .unwrap();
+    assert_eq!(logits_a.len(), 128256);
+
+    // Forward sequence B (independent)
+    let logits_b = pipeline
+        .forward(&mut registry, seq_b, &[10, 20], &[0, 1], true)
+        .await
+        .unwrap();
+    assert_eq!(logits_b.len(), 128256);
+
+    // Interleaved decode steps
+    let logits_a2 = pipeline
+        .forward(&mut registry, seq_a, &[4], &[3], false)
+        .await
+        .unwrap();
+    assert_eq!(logits_a2.len(), 128256);
+
+    let logits_b2 = pipeline
+        .forward(&mut registry, seq_b, &[30], &[2], false)
+        .await
+        .unwrap();
+    assert_eq!(logits_b2.len(), 128256);
+
+    // Free A, B should still work
+    pipeline.free_cache(&mut registry, seq_a).await.unwrap();
+    let logits_b3 = pipeline
+        .forward(&mut registry, seq_b, &[40], &[3], false)
+        .await
+        .unwrap();
+    assert_eq!(logits_b3.len(), 128256);
+
+    // A is freed, forward should fail
+    let result = pipeline.forward(&mut registry, seq_a, &[5], &[4], false).await;
+    assert!(result.is_err());
+
+    pipeline.free_cache(&mut registry, seq_b).await.unwrap();
 }

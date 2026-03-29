@@ -134,13 +134,14 @@ fn test_gpu_generation_basic() {
         top_k: 0,
         top_p: 1.0,
         stop_tokens: vec![], // no stop tokens — we want all 5
+        seed: None,
     };
 
     let result = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx);
-    let tokens = result.expect("generation failed");
+    let gen_result = result.expect("generation failed");
 
-    assert!(!tokens.is_empty(), "generation should produce at least one token");
-    assert!(tokens.len() <= 5, "should produce at most max_tokens");
+    assert!(!gen_result.tokens.is_empty(), "generation should produce at least one token");
+    assert!(gen_result.tokens.len() <= 5, "should produce at most max_tokens");
 
     // Verify tokens were sent through the channel
     drop(tx);
@@ -148,7 +149,7 @@ fn test_gpu_generation_basic() {
     while let Ok(t) = rx.try_recv() {
         streamed.push(t);
     }
-    assert_eq!(streamed, tokens, "streamed tokens should match returned tokens");
+    assert_eq!(streamed, gen_result.tokens, "streamed tokens should match returned tokens");
 }
 
 // ---------------------------------------------------------------------------
@@ -165,15 +166,16 @@ fn test_gpu_generation_stop_on_max_tokens() {
         top_k: 0,
         top_p: 1.0,
         stop_tokens: vec![], // no stop tokens
+        seed: None,
     };
 
-    let tokens = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx)
+    let gen_result = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx)
         .expect("generation failed");
 
     assert!(
-        tokens.len() <= 3,
+        gen_result.tokens.len() <= 3,
         "should produce at most 3 tokens, got {}",
-        tokens.len()
+        gen_result.tokens.len()
     );
 }
 
@@ -191,9 +193,10 @@ fn test_gpu_generation_streaming() {
         top_k: 0,
         top_p: 1.0,
         stop_tokens: vec![],
+        seed: None,
     };
 
-    let tokens = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx)
+    let gen_result = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx)
         .expect("generation failed");
 
     // Drop the sender so the channel closes
@@ -207,10 +210,10 @@ fn test_gpu_generation_streaming() {
 
     assert_eq!(
         streamed.len(),
-        tokens.len(),
+        gen_result.tokens.len(),
         "channel should have exactly as many tokens as returned"
     );
-    assert_eq!(streamed, tokens, "streamed order should match return order");
+    assert_eq!(streamed, gen_result.tokens, "streamed order should match return order");
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +358,7 @@ fn test_gpu_cache_freed_after_generation() {
             top_k: 0,
             top_p: 1.0,
             stop_tokens: vec![],
+            seed: None,
         };
         let _ = GenerationLoop::generate(&engine, &[1], &warmup_config, &mut cache, &tx)
             .expect("warmup generation failed");
@@ -372,6 +376,7 @@ fn test_gpu_cache_freed_after_generation() {
             top_k: 0,
             top_p: 1.0,
             stop_tokens: vec![],
+            seed: None,
         };
         let _ = GenerationLoop::generate(&engine, &[1, 2, 3], &gen_config, &mut cache, &tx)
             .expect("generation failed");

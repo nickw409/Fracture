@@ -1,4 +1,6 @@
 use fracture_core::{FractureError, Result};
+use rand::Rng;
+use rand::SeedableRng;
 
 /// Sampling parameters for token selection.
 #[derive(Debug, Clone)]
@@ -6,6 +8,9 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Optional seed for deterministic sampling. When set, the sampler uses
+    /// a seeded RNG (`StdRng::seed_from_u64`) instead of `thread_rng()`.
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingParams {
@@ -14,6 +19,7 @@ impl Default for SamplingParams {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
         }
     }
 }
@@ -41,9 +47,12 @@ impl Sampler {
             return Err(FractureError::Generation("empty logits".into()));
         }
 
-        // Check for NaN logits
+        // Check for NaN or Inf logits
         if logits.iter().any(|l| l.is_nan()) {
             return Err(FractureError::Generation("NaN in logits".into()));
+        }
+        if logits.iter().any(|l| l.is_infinite()) {
+            return Err(FractureError::Generation("Inf in logits".into()));
         }
 
         if params.temperature == 0.0 || params.top_k == 1 {
@@ -91,7 +100,12 @@ impl Sampler {
 
         // Re-normalize and sample
         let filtered_sum: f32 = filtered.iter().map(|&i| probs[i]).sum();
-        let r: f32 = rand::random::<f32>() * filtered_sum;
+        let r: f32 = if let Some(seed) = params.seed {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            rng.random::<f32>()
+        } else {
+            rand::random::<f32>()
+        } * filtered_sum;
         let mut acc = 0.0;
         for &i in &filtered {
             acc += probs[i];
@@ -120,6 +134,8 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..20 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -134,6 +150,8 @@ mod tests {
             temperature: 1.0,
             top_k: 1,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..20 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -172,6 +190,8 @@ mod tests {
             temperature: 1.0,
             top_k: 2,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..100 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -186,6 +206,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 0.01,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..50 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -201,6 +223,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let token = Sampler::sample(&logits, &params).unwrap();
         assert!(token <= 2, "should produce a valid token index");
@@ -213,6 +237,8 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let first = Sampler::sample(&logits, &params).unwrap();
         for _ in 0..99 {
@@ -226,6 +252,7 @@ mod tests {
         assert_eq!(params.temperature, 1.0);
         assert_eq!(params.top_k, 0);
         assert_eq!(params.top_p, 1.0);
+        assert!(params.seed.is_none());
     }
 
     #[test]
@@ -237,6 +264,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -257,6 +286,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -277,6 +308,8 @@ mod tests {
             temperature: 1.0,
             top_k: 5,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -297,6 +330,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let mut counts = [0u32; 5];
         for _ in 0..1000 {
@@ -333,6 +368,8 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 0.5,
+            seed: None,
+            ..Default::default()
         };
         let valid_tokens: Vec<u32> = vec![0, 1, 2]; // the top-3 by logit value
         for _ in 0..100 {
@@ -391,6 +428,8 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let result = Sampler::sample(&logits, &params_greedy);
         assert!(result.is_err());
@@ -405,6 +444,8 @@ mod tests {
             temperature: -1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
 
         // With negative temperature, logits are divided by -1.0:
@@ -433,6 +474,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 0.0,
+            seed: None,
+            ..Default::default()
         };
         // Since top_p < 1.0 and cumulative > 0.0 on the very first token,
         // cutoff = 1, so only the top token (index 1, logit 3.0) should be selected.
@@ -479,26 +522,61 @@ mod tests {
         assert_eq!(max_prob_idx, 1, "index 1 (logit=3.0) should have highest prob");
     }
 
-    /// Note: seeded reproducibility for sampling requires a seed parameter to be
-    /// added to SamplingParams so that the RNG can be deterministically initialized.
-    /// This is not yet implemented. Once a `seed: Option<u64>` field is added,
-    /// `Sampler::sample` should create a `StdRng::seed_from_u64(seed)` and use it
-    /// instead of `rand::random()` for the categorical draw. Until then, only
-    /// greedy (temperature=0.0 or top_k=1) sampling is deterministic.
     #[test]
-    fn test_seeded_note() {
-        // Placeholder test documenting that seeded reproducibility is not yet available.
-        // Greedy sampling is deterministic regardless of seed.
-        let logits = vec![1.0, 3.0, 2.0];
+    fn test_seeded_reproducibility() {
+        // With temperature > 0 and a seed, two samples should produce identical results.
+        let logits = vec![1.0, 2.0, 3.0, 2.5, 1.5];
+        let seed = 42u64;
         let params = SamplingParams {
-            temperature: 0.0,
+            temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: Some(seed),
         };
+
+        // Same seed always produces the same token
         let first = Sampler::sample(&logits, &params).unwrap();
-        for _ in 0..10 {
-            assert_eq!(Sampler::sample(&logits, &params).unwrap(), first);
+        for _ in 0..100 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            assert_eq!(
+                token, first,
+                "same seed should produce identical results"
+            );
         }
+
+        // Different seed may produce a different token (run enough times to see)
+        let params_other = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: Some(9999),
+        };
+        let other = Sampler::sample(&logits, &params_other).unwrap();
+        // We can't guarantee different seeds produce different tokens,
+        // but we can verify both calls succeed.
+        assert!((other as usize) < logits.len());
+    }
+
+    #[test]
+    fn test_seed_none_is_nondeterministic() {
+        // Without a seed, sampling with temperature > 0 should be non-deterministic
+        // (over many trials, we should see at least 2 distinct tokens).
+        let logits = vec![1.0, 1.0, 1.0, 1.0, 1.0]; // uniform
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(Sampler::sample(&logits, &params).unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "unseeded sampling on uniform logits should produce multiple tokens, got {:?}",
+            seen
+        );
     }
 
     #[test]
@@ -516,6 +594,8 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 0.3,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..100 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -536,6 +616,8 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
 
         let mut counts = vec![0u32; n];
@@ -564,6 +646,8 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 0,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let greedy = Sampler::sample(&logits, &params_temp1).unwrap();
 
@@ -572,6 +656,8 @@ mod tests {
             temperature: 1.0,
             top_k: 1,
             top_p: 1.0,
+            seed: None,
+            ..Default::default()
         };
         let with_temp = Sampler::sample(&logits, &params_temp1_topk1).unwrap();
         assert_eq!(greedy, with_temp, "temp=1.0 with top_k=1 should pick the same as greedy");
@@ -587,6 +673,8 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 0.99,
+            seed: None,
+            ..Default::default()
         };
         for _ in 0..200 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -595,5 +683,89 @@ mod tests {
                 "token {token} should be in top-3 (0,1,2)"
             );
         }
+    }
+
+    #[test]
+    fn test_inf_logits_returns_error() {
+        let params = SamplingParams::default();
+
+        // Positive infinity
+        let logits = vec![1.0, f32::INFINITY, 2.0];
+        let result = Sampler::sample(&logits, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Inf"));
+
+        // Negative infinity
+        let logits = vec![1.0, f32::NEG_INFINITY, 2.0];
+        let result = Sampler::sample(&logits, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Inf"));
+
+        // Also test greedy path
+        let params_greedy = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            ..Default::default()
+        };
+        let logits = vec![f32::INFINITY, 1.0];
+        let result = Sampler::sample(&logits, &params_greedy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_logit_vocab() {
+        let logits = vec![42.0];
+
+        // Greedy (temp=0)
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
+
+        // top_k=1
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            seed: None,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
+
+        // Standard sampling with temperature
+        let params = SamplingParams {
+            temperature: 0.5,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
+
+        // With top_p filtering
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.5,
+            seed: None,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
+
+        // With both top_k and top_p
+        let params = SamplingParams {
+            temperature: 2.0,
+            top_k: 10,
+            top_p: 0.1,
+            seed: None,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
     }
 }

@@ -202,9 +202,33 @@ async fn main() -> Result<()> {
 
             MessageType::CacheAlloc => {
                 let seq_id = header.seq_id;
-                let h = cache.alloc(node.engine().backend())?;
-                handles.insert(seq_id, h);
-                tracing::debug!("allocated cache for seq {seq_id}");
+                if handles.contains_key(&seq_id) {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::InvalidSequence,
+                        message: format!(
+                            "CacheAlloc for seq {seq_id}: cache already allocated"
+                        ),
+                    };
+                    tracing::warn!("duplicate CacheAlloc for seq {seq_id}");
+                    conn.send(MessageType::Error, seq_id, &err).await?;
+                } else {
+                    match cache.alloc(node.engine().backend()) {
+                        Ok(h) => {
+                            handles.insert(seq_id, h);
+                            tracing::debug!("allocated cache for seq {seq_id}");
+                        }
+                        Err(e) => {
+                            let err = ErrorPayload {
+                                error_code: ErrorCode::OutOfMemory,
+                                message: format!(
+                                    "CacheAlloc for seq {seq_id} failed: {e}"
+                                ),
+                            };
+                            tracing::error!("cache alloc OOM for seq {seq_id}: {e}");
+                            conn.send(MessageType::Error, seq_id, &err).await?;
+                        }
+                    }
+                }
             }
 
             MessageType::CacheFree => {
@@ -212,6 +236,15 @@ async fn main() -> Result<()> {
                 if let Some(h) = handles.remove(&seq_id) {
                     cache.free(h, node.engine().backend())?;
                     tracing::debug!("freed cache for seq {seq_id}");
+                } else {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::InvalidSequence,
+                        message: format!(
+                            "CacheFree for seq {seq_id}: no cache allocated"
+                        ),
+                    };
+                    tracing::warn!("CacheFree for unknown seq {seq_id}");
+                    conn.send(MessageType::Error, seq_id, &err).await?;
                 }
             }
 
@@ -261,13 +294,13 @@ fn handle_forward(
     let req: ForwardPayload = FramedConnection::deserialize_payload(payload)?;
     let seq_id = header.seq_id;
 
-    // Get or create cache handle
+    // Get cache handle — require prior CacheAlloc
     let handle = if let Some(&h) = handles.get(&seq_id) {
         h
     } else {
-        let h = cache.alloc(node.engine().backend())?;
-        handles.insert(seq_id, h);
-        h
+        return Err(fracture_core::FractureError::Pipeline(format!(
+            "Forward for seq {seq_id}: no cache allocated (missing CacheAlloc)"
+        )));
     };
 
     // Build NodeInput

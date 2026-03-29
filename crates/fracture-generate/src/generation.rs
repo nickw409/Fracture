@@ -1,10 +1,28 @@
 use fracture_core::{Backend, FractureError, RequestMetrics, Result};
 use fracture_engine::{CacheHandle, Engine, KvCacheManager};
 use rand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::sampling::{Sampler, SamplingParams};
+
+/// Why generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Hit an EOS/stop token.
+    Stop,
+    /// Reached max_tokens limit.
+    Length,
+}
+
+/// Result of a generation request, including tokens and stop reason.
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    pub tokens: Vec<u32>,
+    pub stop_reason: StopReason,
+}
 
 /// Configuration for a generation request.
 #[derive(Debug, Clone)]
@@ -14,6 +32,8 @@ pub struct GenerationConfig {
     pub top_k: usize,
     pub top_p: f32,
     pub stop_tokens: Vec<u32>,
+    /// Optional seed for deterministic sampling.
+    pub seed: Option<u64>,
 }
 
 impl Default for GenerationConfig {
@@ -24,32 +44,41 @@ impl Default for GenerationConfig {
             top_k: 0,
             top_p: 1.0,
             stop_tokens: vec![128001, 128008, 128009], // Llama 3 EOS tokens
+            seed: None,
         }
     }
 }
 
 /// Orchestrates tokenization, prefill, decode loop, and streaming.
-///
-/// # Future Work (Phase 2+)
-///
-/// - **Generation cancellation**: Allow callers to cancel an in-progress generation
-///   via a `CancellationToken` or similar mechanism, causing the decode loop to exit
-///   early and free resources.
-/// - **Stream cancellation**: Detect when the streaming channel receiver is dropped
-///   (e.g., client disconnect) and stop generation to avoid wasted GPU cycles.
 pub struct GenerationLoop;
 
 impl GenerationLoop {
     /// Generate tokens from already-tokenized input, streaming results through the channel.
     ///
-    /// Returns the full list of generated token IDs (excluding the prompt).
+    /// Returns the generated tokens and the reason generation stopped.
+    /// If `cancel` is provided and set to `true`, the decode loop exits early.
     pub fn generate<B: Backend>(
         engine: &Engine<B>,
         prompt_tokens: &[u32],
         config: &GenerationConfig,
         cache: &mut KvCacheManager,
         tx: &mpsc::UnboundedSender<u32>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<GenerationResult> {
+        Self::generate_with_cancel(engine, prompt_tokens, config, cache, tx, None)
+    }
+
+    /// Generate with optional cooperative cancellation.
+    ///
+    /// When `cancel` is set to `true`, the decode loop exits early and the KV cache
+    /// is freed. The returned `StopReason` will be `Stop`.
+    pub fn generate_with_cancel<B: Backend>(
+        engine: &Engine<B>,
+        prompt_tokens: &[u32],
+        config: &GenerationConfig,
+        cache: &mut KvCacheManager,
+        tx: &mpsc::UnboundedSender<u32>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<GenerationResult> {
         if prompt_tokens.is_empty() {
             return Err(FractureError::Generation("empty prompt".into()));
         }
@@ -63,7 +92,8 @@ impl GenerationLoop {
 
         let cache_handle = cache.alloc(engine.backend())?;
 
-        let result = Self::generate_inner(engine, prompt_tokens, config, cache, cache_handle, tx);
+        let result =
+            Self::generate_inner(engine, prompt_tokens, config, cache, cache_handle, tx, &cancel);
 
         // Always free the cache, even on error
         if let Err(e) = cache.free(cache_handle, engine.backend()) {
@@ -80,12 +110,14 @@ impl GenerationLoop {
         cache: &mut KvCacheManager,
         cache_handle: CacheHandle,
         tx: &mpsc::UnboundedSender<u32>,
-    ) -> Result<Vec<u32>> {
+        cancel: &Option<Arc<AtomicBool>>,
+    ) -> Result<GenerationResult> {
         let request_start = Instant::now();
         let sampling_params = SamplingParams {
             temperature: config.temperature,
             top_k: config.top_k,
             top_p: config.top_p,
+            seed: config.seed,
         };
 
         // Prefill: process all prompt tokens at once
@@ -100,16 +132,24 @@ impl GenerationLoop {
         // Check for immediate stop
         if config.stop_tokens.contains(&next_token) {
             Self::emit_metrics(engine, prompt_tokens.len(), 0, ttft, request_start, &[], cache, cache_handle);
-            return Ok(Vec::new());
+            return Ok(GenerationResult { tokens: Vec::new(), stop_reason: StopReason::Stop });
         }
 
         let _ = tx.send(next_token);
         let mut generated = vec![next_token];
         let mut pos = prompt_tokens.len() as u32;
         let mut decode_times = Vec::new();
+        let mut stop_reason = StopReason::Length;
 
         // Decode loop
         for _ in 1..config.max_tokens {
+            // Check for cooperative cancellation
+            if let Some(flag) = cancel {
+                if flag.load(Ordering::Relaxed) {
+                    stop_reason = StopReason::Stop;
+                    break;
+                }
+            }
             let decode_start = Instant::now();
             let logits = engine.forward(&[next_token], &[pos], cache, cache_handle, None)?;
             decode_times.push(decode_start.elapsed().as_secs_f64() * 1000.0);
@@ -117,6 +157,7 @@ impl GenerationLoop {
             next_token = Sampler::sample(&logits, &sampling_params)?;
 
             if config.stop_tokens.contains(&next_token) {
+                stop_reason = StopReason::Stop;
                 break;
             }
 
@@ -127,7 +168,7 @@ impl GenerationLoop {
 
         Self::emit_metrics(engine, prompt_tokens.len(), generated.len(), ttft, request_start, &decode_times, cache, cache_handle);
 
-        Ok(generated)
+        Ok(GenerationResult { tokens: generated, stop_reason })
     }
 
     fn emit_metrics<B: Backend>(
@@ -451,6 +492,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             stop_tokens: vec![128001, 128008, 128009],
+            seed: None,
         }
     }
 
@@ -691,7 +733,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
 
         let config = greedy_config(100);
-        let tokens = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap().tokens;
         // Prefill gets token 42, first decode gets 128008 (EOS) → stops
         assert_eq!(tokens, vec![42]);
     }
@@ -706,7 +748,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
 
         let config = greedy_config(100);
-        let tokens = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap().tokens;
         assert_eq!(tokens, vec![42, 42]);
     }
 
@@ -723,7 +765,7 @@ mod tests {
 
         let config = greedy_config(5);
         let prompt = vec![1, 2, 3];
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         assert_eq!(tokens.len(), 5);
         assert!(tokens.iter().all(|&t| t == 42));
@@ -751,7 +793,7 @@ mod tests {
 
         let config = greedy_config(100); // high max so EOS is the real stop
         let prompt = vec![1, 2, 3];
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         // Prefill consumes index 0 (token 42), decode steps get indices 1 (42), 2 (42), 3 (128001=EOS)
         // So output is [42, 42, 42] — the EOS stops but is not included.
@@ -770,9 +812,69 @@ mod tests {
 
         let config = greedy_config(5);
         let prompt = vec![1];
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         assert_eq!(tokens.len(), 5, "should produce exactly max_tokens tokens");
+    }
+
+    /// Verify stop reason is Length when max_tokens is reached.
+    #[test]
+    fn test_stop_reason_length() {
+        let cfg = tiny_config();
+        let backend = MockBackend::always(42, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(3);
+        let result = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert_eq!(result.tokens.len(), 3);
+    }
+
+    /// Verify stop reason is Stop when EOS token is hit.
+    #[test]
+    fn test_stop_reason_stop() {
+        let cfg = tiny_config();
+        let backend = MockBackend::cycling(vec![42, 128001], cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(100);
+        let result = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert_eq!(result.tokens, vec![42]);
+    }
+
+    /// Verify stop reason is Stop when first sampled token is EOS (immediate stop).
+    #[test]
+    fn test_stop_reason_immediate_eos() {
+        let cfg = tiny_config();
+        let backend = MockBackend::always(128001, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(100);
+        let result = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert!(result.tokens.is_empty());
+    }
+
+    /// Verify max_tokens=1 produces exactly one token with stop_reason Length.
+    #[test]
+    fn test_max_tokens_one() {
+        let cfg = tiny_config();
+        let backend = MockBackend::always(42, cfg.vocab_size);
+        let engine = make_engine(backend, &cfg);
+        let mut cache = make_cache(&cfg);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let config = greedy_config(1);
+        let result = GenerationLoop::generate(&engine, &[1], &config, &mut cache, &tx).unwrap();
+        assert_eq!(result.tokens, vec![42]);
+        assert_eq!(result.stop_reason, StopReason::Length);
     }
 
     /// Verify that the KV cache is freed after successful generation completes.
@@ -832,7 +934,7 @@ mod tests {
 
         let config = greedy_config(5);
         let prompt = vec![1];
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         // Collect everything from the channel
         drop(tx);
@@ -859,7 +961,7 @@ mod tests {
 
         let config = greedy_config(100);
         let prompt = vec![1, 2, 3];
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         assert!(tokens.is_empty(), "should return empty vec when first token is EOS");
 
@@ -881,7 +983,7 @@ mod tests {
 
         let config = greedy_config(5);
         let prompt = vec![1, 2, 3]; // 3 tokens
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
 
         // 1 prefill forward + 5 decode forwards = 6 total logit readbacks
         // We verify indirectly: got exactly 5 tokens (all 42, no EOS)
@@ -925,7 +1027,7 @@ mod tests {
         let prompt = vec![1, 2];
         // We can't easily capture stderr in a unit test, but we can verify
         // generate succeeds and returns the expected tokens.
-        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap();
+        let tokens = GenerationLoop::generate(&engine, &prompt, &config, &mut cache, &tx).unwrap().tokens;
         assert_eq!(tokens.len(), 3);
         // Metrics are emitted via eprintln! — verifying the JSON format
         // is covered by test_request_metrics_format. This test confirms

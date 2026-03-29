@@ -154,6 +154,16 @@ impl<B: Backend> Engine<B> {
             }
         };
 
+        // Validate positions are within max_seq_len bounds (RoPE table size).
+        if let Some(&max_pos) = positions.iter().max() {
+            if max_pos as usize >= cfg.max_seq_len {
+                return Err(FractureError::InvalidShape(format!(
+                    "position {} exceeds max_seq_len {}",
+                    max_pos, cfg.max_seq_len,
+                )));
+            }
+        }
+
         // Pre-allocate reusable scratch tensors for the forward pass.
         let normed = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;
         let q_flat = self.backend.alloc(&[seq_len, hidden], DType::FP16)?;

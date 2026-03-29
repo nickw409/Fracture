@@ -458,6 +458,7 @@ async fn distributed_generate(
         temperature,
         top_k,
         top_p,
+        seed: None,
     };
 
     // Create sequence and allocate cache on all workers

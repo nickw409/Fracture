@@ -96,13 +96,29 @@ impl PeerRegistry {
     }
 
     /// Assign layers to a worker and mark it Ready.
+    ///
+    /// Returns an error if the worker is not found or is Dead.
+    /// If the worker already has an assignment (is Ready), the
+    /// assignment is overwritten (layer reassignment).
     pub fn assign(&mut self, node_id: &str, assignment: LayerAssignment) -> Result<()> {
         let entry = self.workers.get_mut(node_id).ok_or_else(|| {
             FractureError::Protocol(format!("worker '{node_id}' not found"))
         })?;
+        if entry.status == WorkerStatus::Dead {
+            return Err(FractureError::Protocol(format!(
+                "cannot assign layers to dead worker '{node_id}'"
+            )));
+        }
         entry.assignment = Some(assignment);
         entry.status = WorkerStatus::Ready;
         Ok(())
+    }
+
+    /// Look up a worker entry, returning an error if not found.
+    pub fn lookup(&self, node_id: &str) -> Result<&WorkerEntry> {
+        self.workers.get(node_id).ok_or_else(|| {
+            FractureError::Protocol(format!("worker '{node_id}' not found"))
+        })
     }
 
     /// Mark a worker as dead.
@@ -322,6 +338,78 @@ mod tests {
 
         reg.mark_dead("w1");
         assert_eq!(reg.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_assign_dead_worker_rejected() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.mark_dead("w1");
+
+        let result = reg.assign(
+            "w1",
+            LayerAssignment {
+                node_id: "w1".into(),
+                layer_range: 0..32,
+                role: NodeRole::Head,
+                expected_decode_ms: 32.0,
+                weight_memory_gb: 12.0,
+                cache_memory_gb: 2.0,
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dead"));
+    }
+
+    #[tokio::test]
+    async fn test_lookup_returns_error_for_unknown() {
+        let reg = PeerRegistry::new();
+        assert!(reg.lookup("nonexistent").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_lookup_returns_entry() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        let entry = reg.lookup("w1").unwrap();
+        assert_eq!(entry.status, WorkerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_layer_reassignment_overwrites() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+
+        // First assignment
+        reg.assign(
+            "w1",
+            LayerAssignment {
+                node_id: "w1".into(),
+                layer_range: 0..16,
+                role: NodeRole::Head,
+                expected_decode_ms: 16.0,
+                weight_memory_gb: 6.0,
+                cache_memory_gb: 1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(reg.get("w1").unwrap().assignment.as_ref().unwrap().layer_range, 0..16);
+
+        // Reassignment overwrites
+        reg.assign(
+            "w1",
+            LayerAssignment {
+                node_id: "w1".into(),
+                layer_range: 0..32,
+                role: NodeRole::Head,
+                expected_decode_ms: 32.0,
+                weight_memory_gb: 12.0,
+                cache_memory_gb: 2.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(reg.get("w1").unwrap().assignment.as_ref().unwrap().layer_range, 0..32);
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Ready);
     }
 
     #[tokio::test]

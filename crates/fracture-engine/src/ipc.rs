@@ -629,6 +629,62 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_client_connect_nonexistent_path() {
+        use fracture_core::{DeviceTimer, TensorId};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct DummyBackend {
+            next_id: AtomicU64,
+        }
+        impl DummyBackend {
+            fn new() -> Self {
+                Self { next_id: AtomicU64::new(1) }
+            }
+        }
+        impl Backend for DummyBackend {
+            fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+            }
+            fn free(&self, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn copy_to_device(&self, _: &DeviceTensor, _: &[u8]) -> Result<()> { Ok(()) }
+            fn copy_to_host(&self, _: &DeviceTensor, _: &mut [u8]) -> Result<()> { Ok(()) }
+            fn matmul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn rmsnorm(&self, _: &DeviceTensor, _: &DeviceTensor, _: f64, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn rope(&self, _: &DeviceTensor, _: &DeviceTensor, _: &[u32], _: f64, _: usize) -> Result<()> { Ok(()) }
+            fn attention(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn silu_mul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> Result<()> { Ok(()) }
+            fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> Result<()> { Ok(()) }
+            fn device_name(&self) -> &str { "dummy" }
+            fn total_memory(&self) -> usize { 1 << 30 }
+            fn available_memory(&self) -> usize { 1 << 30 }
+            fn synchronize(&self) -> Result<()> { Ok(()) }
+            fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+            fn start_timer(&self, _: &DeviceTimer) -> Result<()> { Ok(()) }
+            fn stop_timer(&self, _: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+            fn destroy_timer(&self, _: &DeviceTimer) -> Result<()> { Ok(()) }
+        }
+
+        let backend = DummyBackend::new();
+        let node_config = crate::node::NodeConfig::new(0..4, 4).unwrap();
+        let result = IpcNodeClient::connect(
+            "/tmp/fracture_nonexistent_socket_path_12345.sock",
+            backend,
+            node_config,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("connecting to nonexistent socket should fail"),
+        };
+        assert!(
+            matches!(err, FractureError::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_activation_response_roundtrip() {
         // ForwardResponse with is_logits=false (activation tensor payload)
         let tensor_data = vec![0xAB; 64];

@@ -106,6 +106,12 @@ impl KvCacheManager {
             .caches
             .get(&handle.0)
             .ok_or_else(|| FractureError::KvCache(format!("invalid handle: {}", handle.0)))?;
+        if layer >= cache.layers.len() {
+            return Err(FractureError::KvCache(format!(
+                "layer index {} out of bounds (num_layers={})",
+                layer, cache.layers.len()
+            )));
+        }
         Ok(&cache.layers[layer].k)
     }
 
@@ -115,6 +121,12 @@ impl KvCacheManager {
             .caches
             .get(&handle.0)
             .ok_or_else(|| FractureError::KvCache(format!("invalid handle: {}", handle.0)))?;
+        if layer >= cache.layers.len() {
+            return Err(FractureError::KvCache(format!(
+                "layer index {} out of bounds (num_layers={})",
+                layer, cache.layers.len()
+            )));
+        }
         Ok(&cache.layers[layer].v)
     }
 
@@ -491,6 +503,78 @@ mod tests {
         assert!(
             matches!(err, FractureError::Backend(_)),
             "expected Backend error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_kv_cache_layer_bounds_check() {
+        let backend = MockBackend::new();
+        let num_layers = 4;
+        let mut mgr = KvCacheManager::new(num_layers, 2, 16, 256);
+
+        let handle = mgr.alloc(&backend).unwrap();
+
+        // Accessing layer at num_layers should fail
+        let err = mgr.k_cache(handle, num_layers).unwrap_err();
+        assert!(matches!(err, FractureError::KvCache(_)));
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected 'out of bounds' in: {err}"
+        );
+
+        let err = mgr.v_cache(handle, num_layers).unwrap_err();
+        assert!(matches!(err, FractureError::KvCache(_)));
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected 'out of bounds' in: {err}"
+        );
+
+        // Accessing layer well beyond num_layers should also fail
+        let err = mgr.k_cache(handle, 100).unwrap_err();
+        assert!(matches!(err, FractureError::KvCache(_)));
+
+        let err = mgr.v_cache(handle, 100).unwrap_err();
+        assert!(matches!(err, FractureError::KvCache(_)));
+
+        // Valid layer indices should still work
+        for layer in 0..num_layers {
+            assert!(mgr.k_cache(handle, layer).is_ok());
+            assert!(mgr.v_cache(handle, layer).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_kv_cache_prefill_plus_decode_seq_len_tracking() {
+        let backend = MockBackend::new();
+        let mut mgr = KvCacheManager::new(2, 2, 16, 512);
+
+        let handle = mgr.alloc(&backend).unwrap();
+
+        // Initially 0
+        assert_eq!(mgr.seq_len(handle).unwrap(), 0);
+
+        // Simulate prefill: append N=10 tokens
+        let n = 10;
+        mgr.set_seq_len(handle, n).unwrap();
+        assert_eq!(mgr.seq_len(handle).unwrap(), n);
+
+        // Simulate K=5 decode steps, each appending 1 token
+        let k = 5;
+        for step in 1..=k {
+            mgr.set_seq_len(handle, n + step).unwrap();
+            assert_eq!(
+                mgr.seq_len(handle).unwrap(),
+                n + step,
+                "after prefill({n}) + {step} decode steps"
+            );
+        }
+
+        // Final seq_len should be N+K
+        assert_eq!(
+            mgr.seq_len(handle).unwrap(),
+            n + k,
+            "final seq_len should be N+K = {}",
+            n + k
         );
     }
 

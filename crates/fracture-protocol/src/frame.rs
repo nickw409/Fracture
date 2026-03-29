@@ -322,4 +322,62 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("DEADBEEF"), "should show expected CRC: {msg}");
     }
+
+    #[test]
+    fn test_cache_free_empty_payload() {
+        let seq_id = 0x00000000_0000002A; // cache sequence identifier
+        let header = FrameHeader {
+            msg_type: MessageType::CacheFree,
+            seq_id,
+            payload_len: 0,
+        };
+        let frame = encode_frame(&header, &[]);
+        assert_eq!(frame.len(), HEADER_SIZE + CRC_SIZE);
+
+        // Decode and verify header fields
+        let hdr_buf: [u8; HEADER_SIZE] = frame[..HEADER_SIZE].try_into().unwrap();
+        let decoded = decode_header(&hdr_buf).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::CacheFree);
+        assert_eq!(decoded.seq_id, seq_id);
+        assert_eq!(decoded.payload_len, 0);
+
+        // Verify message type byte is 0x08
+        assert_eq!(frame[3], 0x08);
+
+        // Verify CRC
+        let crc_bytes: [u8; 4] = frame[HEADER_SIZE..HEADER_SIZE + CRC_SIZE]
+            .try_into()
+            .unwrap();
+        let expected_crc = u32::from_be_bytes(crc_bytes);
+        verify_crc(&frame[..HEADER_SIZE], expected_crc).unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_empty_payload() {
+        let seq_id = 0;
+        let header = FrameHeader {
+            msg_type: MessageType::Shutdown,
+            seq_id,
+            payload_len: 0,
+        };
+        let frame = encode_frame(&header, &[]);
+        assert_eq!(frame.len(), HEADER_SIZE + CRC_SIZE);
+
+        // Decode and verify header fields
+        let hdr_buf: [u8; HEADER_SIZE] = frame[..HEADER_SIZE].try_into().unwrap();
+        let decoded = decode_header(&hdr_buf).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::Shutdown);
+        assert_eq!(decoded.seq_id, seq_id);
+        assert_eq!(decoded.payload_len, 0);
+
+        // Verify message type byte is 0x09
+        assert_eq!(frame[3], 0x09);
+
+        // Verify CRC
+        let crc_bytes: [u8; 4] = frame[HEADER_SIZE..HEADER_SIZE + CRC_SIZE]
+            .try_into()
+            .unwrap();
+        let expected_crc = u32::from_be_bytes(crc_bytes);
+        verify_crc(&frame[..HEADER_SIZE], expected_crc).unwrap();
+    }
 }

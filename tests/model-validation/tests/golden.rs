@@ -57,7 +57,7 @@ fn test_golden_generation(prompt_index: usize) {
         config.num_layers,
         config.num_kv_heads,
         config.head_dim,
-        config.max_seq_len,
+        2048, // small max_seq_len to avoid OOM (full 128K would use ~16GB for KV cache)
     );
 
     let gen_config = GenerationConfig {
@@ -66,6 +66,7 @@ fn test_golden_generation(prompt_index: usize) {
         top_k: 0,
         top_p: 1.0,
         stop_tokens: vec![], // Don't stop early — we want exactly 50 tokens
+        seed: None,
     };
 
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -80,7 +81,7 @@ fn test_golden_generation(prompt_index: usize) {
 
     // Build full sequence: prompt + generated (matching golden format)
     let mut engine_full: Vec<u32> = meta.prompt_token_ids.clone();
-    engine_full.extend_from_slice(&generated);
+    engine_full.extend_from_slice(&generated.tokens);
 
     // Compare against golden
     let result = compare_token_sequences(&engine_full, &golden_tokens);

@@ -365,6 +365,19 @@ fn schedule_manual(
     let per_layer_total =
         weight_memory_per_layer(&input.model_config) + cache_memory_per_layer(&input.model_config, input.max_seq_len);
 
+    // Validate no duplicate node IDs
+    {
+        let mut seen = std::collections::HashSet::new();
+        for a in assignments {
+            if !seen.insert(&a.node_id) {
+                return Err(FractureError::Pipeline(format!(
+                    "manual assignment has duplicate node_id '{}'",
+                    a.node_id
+                )));
+            }
+        }
+    }
+
     // Validate coverage: assignments must cover [0, num_layers) exactly
     let mut covered = vec![false; num_layers];
     for a in assignments {
@@ -1395,6 +1408,233 @@ mod tests {
         };
         let result = schedule(&input).unwrap();
         assert_eq!(result.assignments[0].layer_range, 0..32);
+    }
+
+    #[test]
+    fn test_manual_duplicate_node_ids() {
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("a", 22.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Manual(vec![
+                ManualAssignment {
+                    node_id: "a".into(),
+                    layer_range: 0..16,
+                },
+                ManualAssignment {
+                    node_id: "a".into(),
+                    layer_range: 16..32,
+                },
+            ]),
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let err = schedule(&input).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate"),
+            "error should mention duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn test_zero_workers_all_modes() {
+        // Auto mode
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
+
+        // EqualSplit mode
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
+
+        // Manual mode
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![],
+            coordinator_compute: None,
+            mode: SchedulingMode::Manual(vec![]),
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
+    }
+
+    #[test]
+    fn test_auto_mode_invalid_metrics_rejected_by_scheduler() {
+        // Negative decode_ms_per_layer
+        let mut w = worker("bad", 22.0, 1.0);
+        w.decode_ms_per_layer = -1.0;
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![w],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
+
+        // Zero decode_ms_per_layer
+        let mut w = worker("bad", 22.0, 1.0);
+        w.decode_ms_per_layer = 0.0;
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("good", 22.0, 1.0), w],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        assert!(schedule(&input).is_err());
+    }
+
+    #[test]
+    fn test_scheduler_single_node_all_modes() {
+        // Auto mode: single node gets all layers, no pruning
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("solo", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].layer_range, 0..32);
+        assert!(result.excluded_nodes.is_empty(), "Auto should not prune the only node");
+
+        // EqualSplit mode: single node gets all layers
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("solo", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].layer_range, 0..32);
+
+        // Manual mode: single node gets all layers
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("solo", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::Manual(vec![ManualAssignment {
+                node_id: "solo".into(),
+                layer_range: 0..32,
+            }]),
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].layer_range, 0..32);
+    }
+
+    #[test]
+    fn test_scheduler_contiguous_layer_ranges_auto_and_equal() {
+        // Auto mode: 3 heterogeneous workers
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("a", 30.0, 0.7),
+                worker("b", 22.0, 1.3),
+                worker("c", 25.0, 1.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::Auto,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        // Verify sorted, adjacent, no gaps
+        let mut expected_start = 0;
+        for a in &result.assignments {
+            assert_eq!(
+                a.layer_range.start, expected_start,
+                "Auto: gap detected at layer {} (expected {})",
+                a.layer_range.start, expected_start
+            );
+            assert!(
+                a.layer_range.start < a.layer_range.end,
+                "Auto: empty range for node {}",
+                a.node_id
+            );
+            expected_start = a.layer_range.end;
+        }
+        assert_eq!(expected_start, 32, "Auto: ranges must cover all 32 layers");
+
+        // EqualSplit mode: 3 equal workers
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![
+                worker("a", 22.0, 1.0),
+                worker("b", 22.0, 1.0),
+                worker("c", 22.0, 1.0),
+            ],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input).unwrap();
+
+        let mut expected_start = 0;
+        for a in &result.assignments {
+            assert_eq!(
+                a.layer_range.start, expected_start,
+                "EqualSplit: gap detected at layer {} (expected {})",
+                a.layer_range.start, expected_start
+            );
+            assert!(
+                a.layer_range.start < a.layer_range.end,
+                "EqualSplit: empty range for node {}",
+                a.node_id
+            );
+            expected_start = a.layer_range.end;
+        }
+        assert_eq!(expected_start, 32, "EqualSplit: ranges must cover all 32 layers");
+    }
+
+    #[test]
+    fn test_scheduler_equal_split_node_overflow_returns_error() {
+        let per_layer = weight_memory_per_layer(&llama_8b_config())
+            + cache_memory_per_layer(&llama_8b_config(), 4096);
+        // Node "small" can hold only 5 layers but equal split of 32/2 = 16 per node
+        let tiny_mem = (per_layer * 5 + head_overhead(&llama_8b_config())) as f64 / 1e9;
+
+        let input = SchedulerInput {
+            model_config: llama_8b_config(),
+            workers: vec![worker("small", tiny_mem, 1.0), worker("big", 30.0, 1.0)],
+            coordinator_compute: None,
+            mode: SchedulingMode::EqualSplit,
+            max_seq_len: 4096,
+            hop_latency_ms: 2.0,
+        };
+        let result = schedule(&input);
+        assert!(result.is_err(), "EqualSplit should fail when a node cannot hold its share");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot hold"),
+            "error should mention 'cannot hold': {err_msg}"
+        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ fn run_prefill(
         config.num_layers,
         config.num_kv_heads,
         config.head_dim,
-        config.max_seq_len,
+        2048, // small max_seq_len to avoid OOM (full 128K would use ~16GB for KV cache)
     );
     let handle = cache.alloc(engine.backend()).expect("cache alloc failed");
     let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
@@ -185,7 +185,7 @@ fn test_decode_step_0() {
         config.num_layers,
         config.num_kv_heads,
         config.head_dim,
-        config.max_seq_len,
+        2048, // small max_seq_len to avoid OOM (full 128K would use ~16GB for KV cache)
     );
     let handle = cache.alloc(engine.backend()).expect("cache alloc failed");
 

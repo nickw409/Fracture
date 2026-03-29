@@ -103,18 +103,32 @@ impl SequenceStateManager {
         Ok(())
     }
 
-    /// Mark sequence as complete.
+    /// Mark sequence as complete. Only valid from Decoding state.
     pub fn complete(&mut self, seq_id: u64) -> Result<()> {
         let seq = self.get_mut(seq_id)?;
+        if seq.status != SequenceStatus::Decoding {
+            return Err(FractureError::Pipeline(format!(
+                "seq {seq_id}: cannot complete from {:?} (must be Decoding)",
+                seq.status
+            )));
+        }
         seq.status = SequenceStatus::Complete;
         Ok(())
     }
 
-    /// Mark sequence as errored.
+    /// Mark sequence as errored. Only valid from Prefilling or Decoding state.
     pub fn mark_error(&mut self, seq_id: u64) -> Result<()> {
         let seq = self.get_mut(seq_id)?;
-        seq.status = SequenceStatus::Error;
-        Ok(())
+        match seq.status {
+            SequenceStatus::Prefilling | SequenceStatus::Decoding => {
+                seq.status = SequenceStatus::Error;
+                Ok(())
+            }
+            _ => Err(FractureError::Pipeline(format!(
+                "seq {seq_id}: cannot mark error from {:?} (must be Prefilling or Decoding)",
+                seq.status
+            ))),
+        }
     }
 
     /// Remove a sequence (after cache is freed on all workers).
@@ -287,6 +301,64 @@ mod tests {
         let id = mgr.create(10, 100, vec![]);
         mgr.begin_decoding(id).unwrap();
         assert!(mgr.begin_decoding(id).is_err());
+    }
+
+    #[test]
+    fn test_complete_only_from_decoding() {
+        let mut mgr = SequenceStateManager::new();
+
+        // Cannot complete from Prefilling
+        let id = mgr.create(10, 100, vec![]);
+        assert!(mgr.complete(id).is_err());
+
+        // Can complete from Decoding
+        mgr.begin_decoding(id).unwrap();
+        assert!(mgr.complete(id).is_ok());
+
+        // Cannot complete from Complete
+        assert!(mgr.complete(id).is_err());
+    }
+
+    #[test]
+    fn test_complete_from_error_rejected() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.mark_error(id).unwrap();
+        assert!(mgr.complete(id).is_err());
+    }
+
+    #[test]
+    fn test_mark_error_rejects_complete_state() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.begin_decoding(id).unwrap();
+        mgr.complete(id).unwrap();
+        assert!(mgr.mark_error(id).is_err());
+    }
+
+    #[test]
+    fn test_mark_error_rejects_error_state() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.mark_error(id).unwrap();
+        assert!(mgr.mark_error(id).is_err());
+    }
+
+    #[test]
+    fn test_mark_error_from_prefilling() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        assert!(mgr.mark_error(id).is_ok());
+        assert_eq!(mgr.get(id).unwrap().status, SequenceStatus::Error);
+    }
+
+    #[test]
+    fn test_mark_error_from_decoding() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        mgr.begin_decoding(id).unwrap();
+        assert!(mgr.mark_error(id).is_ok());
+        assert_eq!(mgr.get(id).unwrap().status, SequenceStatus::Error);
     }
 
     #[test]

@@ -239,8 +239,15 @@ impl Backend for CudaBackend {
     }
 
     fn matmul(&self, a: &DeviceTensor, b: &DeviceTensor, out: &DeviceTensor) -> Result<()> {
-        nvtx::range_push("matmul");
         // C = A @ B^T  where A is [M, K], B is [N, K], C is [M, N].
+        // Validate inner dimensions match.
+        if a.shape[1] != b.shape[1] {
+            return Err(FractureError::InvalidShape(format!(
+                "matmul: A inner dim {} != B inner dim {} (A is {:?}, B is {:?})",
+                a.shape[1], b.shape[1], a.shape, b.shape
+            )));
+        }
+        nvtx::range_push("matmul");
         // GGUF weight matrices are stored as [N, K] (output features × input features),
         // matching PyTorch nn.Linear convention: y = x @ W^T.
         //
@@ -417,6 +424,12 @@ impl Backend for CudaBackend {
         up: &DeviceTensor,
         out: &DeviceTensor,
     ) -> Result<()> {
+        if gate.shape != up.shape {
+            return Err(FractureError::InvalidShape(format!(
+                "silu_mul: gate shape {:?} != up shape {:?}",
+                gate.shape, up.shape
+            )));
+        }
         nvtx::range_push("silu_mul");
         let n = gate.numel() as c_int;
         let gate_ptr = self.get_ptr(gate.id)?;
@@ -486,6 +499,12 @@ impl Backend for CudaBackend {
     }
 
     fn add(&self, a: &DeviceTensor, b: &DeviceTensor, out: &DeviceTensor) -> Result<()> {
+        if a.shape != b.shape {
+            return Err(FractureError::InvalidShape(format!(
+                "add: a shape {:?} != b shape {:?}",
+                a.shape, b.shape
+            )));
+        }
         nvtx::range_push("add");
         let n = a.numel() as c_int;
         let a_ptr = self.get_ptr(a.id)?;
@@ -524,6 +543,18 @@ impl Backend for CudaBackend {
             return Err(FractureError::InvalidShape(format!(
                 "copy_rows: dst_offset({}) + count({}) = {} exceeds dst rows({})",
                 dst_offset, count, dst_offset + count, dst.shape[0]
+            )));
+        }
+        if src.shape[1..] != dst.shape[1..] {
+            return Err(FractureError::InvalidShape(format!(
+                "copy_rows: src column shape {:?} != dst column shape {:?}",
+                &src.shape[1..], &dst.shape[1..]
+            )));
+        }
+        if src.dtype != dst.dtype {
+            return Err(FractureError::InvalidShape(format!(
+                "copy_rows: src dtype {:?} != dst dtype {:?}",
+                src.dtype, dst.dtype
             )));
         }
 
@@ -1825,9 +1856,10 @@ mod tests {
         ];
         for (m, k, n) in shapes {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
-            let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.1).collect();
+            let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.1).collect();
             let a = alloc_with_data(&b, &[m, k], &a_data);
-            let bt = alloc_with_data(&b, &[k, n], &b_data);
+            // B is [N, K] for C = A @ B^T convention
+            let bt = alloc_with_data(&b, &[n, k], &b_data);
             let out = b.alloc(&[m, n], DType::FP16).unwrap();
 
             b.matmul(&a, &bt, &out).unwrap();
@@ -1850,9 +1882,11 @@ mod tests {
     #[test]
     fn test_matmul_invalid_tensor() {
         let b = make_backend();
+        // Use matching inner dimensions so the dimension check passes,
+        // but an invalid TensorId so we get TensorNotFound.
         let fake = DeviceTensor::new(TensorId(999999), vec![2, 3], DType::FP16);
-        let bt = alloc_with_data(&b, &[3, 2], &[1.0; 6]);
-        let out = b.alloc(&[2, 2], DType::FP16).unwrap();
+        let bt = alloc_with_data(&b, &[4, 3], &[1.0; 12]);
+        let out = b.alloc(&[2, 4], DType::FP16).unwrap();
         let err = b.matmul(&fake, &bt, &out).unwrap_err();
         assert!(matches!(err, FractureError::TensorNotFound(_)));
         b.free(&bt).unwrap();
@@ -2490,11 +2524,12 @@ mod tests {
         let k = 256;
         let n = 1;
         let a_data: Vec<f32> = vec![1.0; k]; // [1, 256] all ones
-        let b_data: Vec<f32> = vec![256.0; k]; // [256, 1] all 256.0
+        let b_data: Vec<f32> = vec![256.0; k]; // [1, 256] all 256.0
         // Expected: sum of 256 * 256 = 65536 > 65504 (FP16 max)
 
         let a = alloc_with_data(&b, &[m, k], &a_data);
-        let bt = alloc_with_data(&b, &[k, n], &b_data);
+        // B is [N, K] for C = A @ B^T convention
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
         let out = b.alloc(&[m, n], DType::FP16).unwrap();
 
         b.matmul(&a, &bt, &out).unwrap();
@@ -3487,5 +3522,90 @@ mod tests {
         }
 
         b.free(&a).unwrap(); b.free(&bt).unwrap(); b.free(&c).unwrap();
+    }
+
+    // ── Shape validation tests ────────────────────────────────────
+
+    #[test]
+    fn test_silu_mul_shape_mismatch() {
+        let b = make_backend();
+        let gate = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
+        let up = alloc_with_data(&b, &[2, 3], &vec![1.0; 6]);
+        let out = b.alloc(&[2, 4], DType::FP16).unwrap();
+
+        let err = b.silu_mul(&gate, &up, &out);
+        assert!(err.is_err(), "silu_mul should fail on shape mismatch");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("silu_mul"), "error should mention silu_mul: {msg}");
+
+        b.free(&gate).unwrap();
+        b.free(&up).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_add_shape_mismatch() {
+        let b = make_backend();
+        let a = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
+        let bt = alloc_with_data(&b, &[3, 4], &vec![1.0; 12]);
+        let out = b.alloc(&[2, 4], DType::FP16).unwrap();
+
+        let err = b.add(&a, &bt, &out);
+        assert!(err.is_err(), "add should fail on shape mismatch");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("add"), "error should mention add: {msg}");
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_gemm_dimension_mismatch() {
+        let b = make_backend();
+        // A is [2, 4], B is [3, 5] -> K mismatch (4 != 5)
+        let a = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
+        let bt = alloc_with_data(&b, &[3, 5], &vec![1.0; 15]);
+        let out = b.alloc(&[2, 3], DType::FP16).unwrap();
+
+        let err = b.matmul(&a, &bt, &out);
+        assert!(err.is_err(), "matmul should fail on K dimension mismatch");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("matmul"), "error should mention matmul: {msg}");
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_copy_rows_shape_compatibility() {
+        let b = make_backend();
+        // src has 3 columns, dst has 4 columns -> mismatch
+        let src = alloc_with_data(&b, &[4, 3], &vec![1.0; 12]);
+        let dst = b.alloc(&[4, 4], DType::FP16).unwrap();
+
+        let err = b.copy_rows(&src, &dst, 0, 0, 2);
+        assert!(err.is_err(), "copy_rows should fail on column width mismatch");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("copy_rows"), "error should mention copy_rows: {msg}");
+
+        b.free(&src).unwrap();
+        b.free(&dst).unwrap();
+    }
+
+    #[test]
+    fn test_copy_rows_dtype_mismatch() {
+        let b = make_backend();
+        let src = alloc_with_data(&b, &[4, 3], &vec![1.0; 12]);
+        let dst = b.alloc(&[4, 3], DType::FP32).unwrap();
+
+        let err = b.copy_rows(&src, &dst, 0, 0, 2);
+        assert!(err.is_err(), "copy_rows should fail on dtype mismatch");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("dtype"), "error should mention dtype: {msg}");
+
+        b.free(&src).unwrap();
+        b.free(&dst).unwrap();
     }
 }

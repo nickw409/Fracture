@@ -1,4 +1,4 @@
-use crate::DType;
+use crate::{DType, FractureError};
 
 /// Opaque identifier for a tensor stored on a device.
 /// Only the backend knows how to resolve this to actual device memory.
@@ -22,6 +22,28 @@ impl DeviceTensor {
         Self { id, shape, dtype }
     }
 
+    /// Validated constructor that rejects invalid shapes.
+    /// Returns error for empty shape vectors or shapes with zero-sized dimensions.
+    pub fn try_new(
+        id: TensorId,
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Result<Self, FractureError> {
+        if shape.is_empty() {
+            return Err(FractureError::InvalidShape(
+                "shape must have at least one dimension".into(),
+            ));
+        }
+        for (i, &dim) in shape.iter().enumerate() {
+            if dim == 0 {
+                return Err(FractureError::InvalidShape(format!(
+                    "dimension {i} is zero in shape {shape:?}"
+                )));
+            }
+        }
+        Ok(Self { id, shape, dtype })
+    }
+
     /// Total number of elements in the tensor.
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
@@ -36,11 +58,85 @@ impl DeviceTensor {
             self.numel() * self.dtype.size_bytes()
         }
     }
+
+    /// Reshape this tensor to a new shape, validating that the total element
+    /// count is preserved. Returns error if numel differs.
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, FractureError> {
+        let new_numel: usize = new_shape.iter().product();
+        if new_numel != self.numel() {
+            return Err(FractureError::InvalidShape(format!(
+                "cannot reshape tensor with {} elements to shape {:?} ({} elements)",
+                self.numel(),
+                new_shape,
+                new_numel,
+            )));
+        }
+        Ok(Self {
+            id: self.id,
+            shape: new_shape,
+            dtype: self.dtype,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FractureError;
+
+    #[test]
+    fn test_try_new_valid_shapes() {
+        assert!(DeviceTensor::try_new(TensorId(0), vec![10], DType::FP32).is_ok());
+        assert!(DeviceTensor::try_new(TensorId(0), vec![3, 4], DType::FP16).is_ok());
+        assert!(DeviceTensor::try_new(TensorId(0), vec![2, 3, 4], DType::BF16).is_ok());
+    }
+
+    #[test]
+    fn test_try_new_empty_shape() {
+        let err = DeviceTensor::try_new(TensorId(0), vec![], DType::FP32).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        assert!(err.to_string().contains("at least one dimension"));
+    }
+
+    #[test]
+    fn test_try_new_zero_dimension() {
+        let err = DeviceTensor::try_new(TensorId(0), vec![4096, 0], DType::FP16).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        assert!(err.to_string().contains("dimension 1 is zero"));
+    }
+
+    #[test]
+    fn test_try_new_zero_first_dimension() {
+        let err = DeviceTensor::try_new(TensorId(0), vec![0, 128], DType::FP16).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        assert!(err.to_string().contains("dimension 0 is zero"));
+    }
+
+    #[test]
+    fn test_reshape_valid() {
+        let t = DeviceTensor::new(TensorId(0), vec![3, 4], DType::FP16);
+        let reshaped = t.reshape(vec![12]).unwrap();
+        assert_eq!(reshaped.shape, vec![12]);
+        assert_eq!(reshaped.dtype, DType::FP16);
+        assert_eq!(reshaped.id, TensorId(0));
+    }
+
+    #[test]
+    fn test_reshape_numel_mismatch() {
+        let t = DeviceTensor::new(TensorId(0), vec![4096], DType::FP16);
+        let err = t.reshape(vec![64, 65]).unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)));
+        assert!(err.to_string().contains("4096 elements"));
+        assert!(err.to_string().contains("4160 elements"));
+    }
+
+    #[test]
+    fn test_reshape_preserves_dtype() {
+        let t = DeviceTensor::new(TensorId(5), vec![2, 3, 4], DType::INT8);
+        let reshaped = t.reshape(vec![6, 4]).unwrap();
+        assert_eq!(reshaped.dtype, DType::INT8);
+        assert_eq!(reshaped.numel(), 24);
+    }
 
     #[test]
     fn test_numel_1d() {

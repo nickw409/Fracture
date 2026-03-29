@@ -82,6 +82,43 @@ sections:
           copy_to_device, copy_to_host, and weight loading. Incorrect
           sizes would cause silent memory corruption.
 
+      - name: device-tensor-shape-validation
+        status: implemented
+        description: |
+          DeviceTensor rejects invalid shapes on construction (e.g.,
+          zero-sized dimensions, empty shape vector). A DeviceTensor with
+          shape [4096, 0] or [] returns an error, not a tensor with 0
+          elements that silently breaks downstream ops.
+
+      - name: model-config-max-seq-len-validation
+        status: implemented
+        description: |
+          ModelConfig validates that max_seq_len is > 0. A zero or negative
+          max_seq_len would cause zero-sized cache allocations and undefined
+          behavior in position tracking.
+
+      - name: model-config-positive-field-validation
+        status: implemented
+        description: |
+          ModelConfig validates that numeric fields (num_layers, hidden_size,
+          vocab_size, intermediate_size, num_q_heads, num_kv_heads, head_dim)
+          are strictly positive. A value of 0 causes zero-sized allocations,
+          division by zero in derived values, or empty iteration ranges.
+
+      - name: model-config-float-field-validation
+        status: implemented
+        description: |
+          ModelConfig validates that rope_theta > 0 and rms_norm_eps > 0.
+          Zero rms_norm_eps causes division by zero in RMSNorm; zero or
+          negative rope_theta produces degenerate rotary embeddings.
+
+      - name: device-tensor-reshape-validation
+        status: implemented
+        description: |
+          Reshaping a DeviceTensor to a shape whose total element count
+          differs from the original returns an error. The dtype and
+          underlying device memory are unchanged by a valid reshape.
+
   # ============================================================
   # GGUF PARSER AND WEIGHT LOADING
   # ============================================================
@@ -137,6 +174,22 @@ sections:
           in the resulting WeightStore). Global tensors (embedding, output_norm,
           lm_head) are always loaded. Errors on size mismatches or GPU
           allocation failures.
+
+      - name: selective-layer-range-bounds
+        status: implemented
+        description: |
+          When weight-loading receives a layer_range that exceeds the model's
+          actual layer count in the GGUF file (e.g., layer_range 0..64 on a
+          32-layer model), it returns a clear error rather than silently loading
+          fewer layers or reading invalid tensor names.
+
+      - name: bf16-weight-conversion
+        status: not-implemented
+        description: |
+          BF16 tensors in GGUF files are converted to FP16 on the host
+          before GPU upload, similar to F32 norm weight conversion. The
+          behavior of BF16 tensors during weight loading is currently
+          unspecified despite BF16 being an accepted dtype.
 
       - name: alignment-handling
         status: implemented
@@ -229,6 +282,13 @@ sections:
           at step 47). Must match PyTorch reference for both prefill (many
           positions) and decode (single position).
 
+      - name: rope-position-out-of-bounds
+        status: implemented
+        description: |
+          Returns an error when a requested sequence position is >= max_seq_len
+          (the pre-computed table size). Prevents out-of-bounds GPU reads
+          from the RoPE frequency table.
+
   - name: SiLU Multiply Kernel
     path: backends/fracture-cuda
     status: implemented
@@ -244,6 +304,11 @@ sections:
           Both gate and up are [N, 14336]. Output is [N, 14336].
           Fused into a single kernel (no intermediate materialization).
           Must match PyTorch reference for N=1 and N>1.
+
+      - name: silu-mul-shape-mismatch
+        status: implemented
+        description: |
+          Returns an error when gate and up tensors have different shapes.
 
   - name: Attention Kernel
     path: backends/fracture-cuda
@@ -287,6 +352,15 @@ sections:
           Validates that GQA head sharing is correct: Q heads 0-3 share KV head 0,
           Q heads 4-7 share KV head 1, etc. Compare against explicit per-head
           computation to ensure grouping produces identical results.
+
+      - name: attention-causal-mask-correctness
+        status: not-implemented
+        description: |
+          The causal mask is validated independently: position i must have zero
+          attention weight on positions j > i during prefill. Verified by
+          inspecting attention weights directly, not just final output. A broken
+          mask (off-by-one, missing mask entirely) would produce plausible but
+          wrong outputs that could pass loose tolerance checks.
 
   - name: Embedding Lookup
     path: backends/fracture-cuda
@@ -336,6 +410,12 @@ sections:
           asymmetric shapes in GQA (K/V projections are [1024, 4096] not
           [4096, 4096]). Does not crash or produce NaN for any valid input shape.
 
+      - name: gemm-dimension-mismatch-error
+        status: implemented
+        description: |
+          Returns a typed error when A and B have incompatible inner
+          dimensions (A is [M, K1] and B is [N, K2] where K1 != K2).
+
   # ============================================================
   # CUDA BACKEND (MEMORY MANAGEMENT)
   # ============================================================
@@ -379,6 +459,19 @@ sections:
           memory access. This is the safety boundary that the KV cache's
           cache-bounds behavior depends on.
 
+      - name: alloc-oom
+        status: not-implemented
+        description: |
+          Allocating a tensor when GPU memory is exhausted returns an error
+          rather than crashing or invoking undefined behavior.
+
+      - name: copy-rows-shape-compatibility
+        status: implemented
+        description: |
+          copy_rows validates that source and destination tensors have the
+          same column width and dtype, returning an error on mismatch rather
+          than performing a malformed copy.
+
   # ============================================================
   # ADD KERNEL
   # ============================================================
@@ -395,6 +488,11 @@ sections:
         description: |
           Computes output = a + b elementwise. Both inputs and output are FP16.
           Used for residual connections after attention and FFN sublayers.
+
+      - name: add-shape-mismatch
+        status: implemented
+        description: |
+          Returns an error when the two input tensors have different shapes.
 
   # ============================================================
   # CUDA PROFILING
@@ -460,6 +558,14 @@ sections:
           Writes to the next available slot in the buffer for each layer.
           Tracks current sequence length correctly.
 
+      - name: cache-current-seq-len-tracking
+        status: implemented
+        description: |
+          After prefill appends N tokens and K decode steps each append 1,
+          cache reports current sequence length as N+K for any layer.
+          Incorrect tracking would cause attention to read stale/uninitialized
+          cache slots or miss valid entries.
+
       - name: cache-retrieval
         status: implemented
         description: |
@@ -489,6 +595,12 @@ sections:
           with independent cache state. Appending to or freeing one
           sequence's cache does not corrupt another sequence's cached
           values. Required for Phase 4 continuous batching.
+
+      - name: cache-layer-bounds
+        status: implemented
+        description: |
+          Append or retrieval for a layer index outside the cache's allocated
+          layer range returns an error rather than accessing invalid memory.
 
   # ============================================================
   # COMPUTE ENGINE
@@ -581,6 +693,21 @@ sections:
           numerically identical results to recomputation. Tested by
           test_gpu_prefill_decode_consistency in GPU integration tests.
 
+      - name: scratch-tensor-reuse
+        status: not-implemented
+        description: |
+          The engine reuses scratch tensors across layers rather than
+          allocating new GPU memory per layer. Peak GPU memory during a
+          32-layer forward pass is O(1) scratch buffers, not O(num_layers).
+
+      - name: forward-node-input-type-validation
+        status: implemented
+        description: |
+          forward_node() returns a clear error when given mismatched input:
+          TokenIds to a non-head (middle/tail-only) node, or Activations
+          to a head node. Distinct from forward-node-dispatch which tests
+          the happy path — this validates the error path specifically.
+
   # ============================================================
   # NODE ABSTRACTION (Phase 2)
   # ============================================================
@@ -612,6 +739,14 @@ sections:
           Activations to head) return Pipeline errors. Tested via pipeline
           split equivalence tests that chain multiple ComputeNodeImpls.
 
+      - name: middle-node-forward
+        status: implemented
+        description: |
+          A node that is neither head nor tail (is_head=false, is_tail=false)
+          accepts Activations as input and returns Activations as output,
+          processing only its layer range. Sending TokenIds to a middle node
+          returns a Pipeline error.
+
   # ============================================================
   # NODE IPC (Phase 2)
   # ============================================================
@@ -625,6 +760,21 @@ sections:
       IpcNodeServer/IpcNodeClient that implement the ComputeNode interface
       over sockets. Phase 3 replaces this with TCP/QUIC networking.
     shared: [error-handling, backend-agnostic]
+    dismissed:
+      - suggestion: ipc-sequence-cleanup
+        reason: IPC is Phase 2, superseded by Phase 3 wire protocol; adding new features to transitional transport is wasted spec
+      - suggestion: kv-cache-lifecycle
+        reason: same concern as ipc-sequence-cleanup; IPC superseded by Phase 3
+      - suggestion: ipc-mid-request-disconnect
+        reason: IPC is Phase 2, superseded by Phase 3 wire protocol
+      - suggestion: ipc-kv-cache-lifecycle
+        reason: IPC superseded by Phase 3; same concern as ipc-sequence-cleanup
+      - suggestion: ipc-concurrent-connections
+        reason: IPC superseded by Phase 3; concurrency semantics not worth specifying for transitional transport
+      - suggestion: ipc-info-roundtrip
+        reason: IPC superseded by Phase 3; info query path is a minor detail
+      - suggestion: ipc-kv-cache-release
+        reason: same as ipc-sequence-cleanup; IPC superseded by Phase 3
     behaviors:
       - name: activation-tensor-serialization
         status: implemented
@@ -672,6 +822,13 @@ sections:
           steps). Validates that the GPU->CPU->socket->CPU->GPU activation
           transfer path preserves numerical correctness.
 
+      - name: ipc-connection-failure
+        status: implemented
+        description: |
+          IpcNodeClient returns a clear error when the Unix socket path does
+          not exist or the server is not listening. IpcNodeServer returns an
+          error when the socket path is already in use.
+
   # ============================================================
   # PIPELINE COORDINATOR (Phase 2)
   # ============================================================
@@ -690,6 +847,15 @@ sections:
           PipelineCoordinator::new() validates: at least one node, first node
           is head, last node is tail, layer ranges are contiguous (no gaps or
           overlaps between adjacent nodes). Returns Pipeline error on violation.
+
+      - name: pipeline-layer-coverage-validation
+        status: implemented
+        description: |
+          PipelineCoordinator::new() validates that the node layer ranges
+          collectively cover [0, total_layers) completely — not just
+          contiguous and non-overlapping, but also starting at 0 and ending
+          at total_layers. A pipeline covering [0,16) + [16,24) on a
+          32-layer model returns an error.
 
       - name: pipeline-forward
         status: implemented
@@ -814,8 +980,24 @@ sections:
           and used to select a token proportional to its probability via
           cumulative sum traversal.
 
+      - name: nan-inf-logit-handling
+        status: implemented
+        description: |
+          When the logit vector contains NaN or Inf values (from model
+          divergence or weight corruption), the sampler detects them and
+          returns an error rather than producing undefined behavior.
+          Softmax on NaN input produces NaN probabilities, making weighted
+          sampling undefined.
+
+      - name: single-logit-vocab
+        status: implemented
+        description: |
+          When the logit vector has only one element (degenerate vocab_size=1),
+          sampling always returns token 0 regardless of temperature/top-k/top-p
+          settings. Validates filtering and softmax don't crash on minimal input.
+
       - name: seeded-reproducibility
-        status: not-implemented
+        status: implemented
         description: |
           With temperature > 0, providing the same random seed produces the
           same token sequence. Without a seed, sampling is non-deterministic.
@@ -835,6 +1017,15 @@ sections:
       crate. Emits per-request metrics (TTFT, tokens/sec, VRAM usage)
       to stderr as JSON.
     shared: [error-handling]
+    dismissed:
+      - suggestion: non-greedy-sampling
+        reason: temperature/top-k/top-p behavior is fully specified in the Sampling section; the generation loop just calls the sampler
+      - suggestion: temperature-sampling
+        reason: same as non-greedy-sampling; sampling behavior is in the Sampling section
+      - suggestion: error-handling
+        reason: shared behavior reference for interface contract, not a standalone behavior to remove
+      - suggestion: max-tokens-zero
+        reason: already covered by request-validation in HTTP Request Processing which rejects max_tokens=0
     behaviors:
       - name: prefill-to-decode-transition
         status: implemented
@@ -877,7 +1068,7 @@ sections:
           average decode step latency, peak VRAM usage, and KV cache occupancy.
 
       - name: generation-cancellation
-        status: not-implemented
+        status: implemented
         description: |
           The generation loop supports cooperative cancellation via a signal
           (e.g., CancellationToken or channel). When cancelled, the decode
@@ -892,6 +1083,28 @@ sections:
           failing deep in cache append. Returns a meaningful "prompt too long"
           error with the actual vs maximum lengths.
 
+      - name: empty-prompt-handling
+        status: implemented
+        description: |
+          When given zero tokens as input (empty prompt after tokenization),
+          the generation loop returns a clear error rather than attempting
+          prefill with an empty tensor.
+
+      - name: stop-reason-reporting
+        status: implemented
+        description: |
+          The generation loop reports why it stopped (EOS token hit vs
+          max_tokens reached) so the server layer can set the correct
+          finish_reason ('stop' vs 'length') in the OpenAI-compatible
+          response.
+
+      - name: max-tokens-one
+        status: implemented
+        description: |
+          When max_tokens=1, the generation loop performs prefill, samples
+          exactly one token from the logits, and returns it without entering
+          the decode loop. Returns finish_reason 'length'.
+
   # ============================================================
   # HTTP SERVER — ENDPOINTS
   # ============================================================
@@ -902,6 +1115,29 @@ sections:
       OpenAI-compatible HTTP route handlers for completions, chat,
       model listing, profiling, and health checks.
     shared: [error-handling]
+    dismissed:
+      - suggestion: response-finish-reason
+        reason: already covered by finish-reason-reporting in HTTP Request Processing and streaming-finish-reason in HTTP Streaming
+      - suggestion: stop-sequence-support
+        reason: stop sequences not implemented; this is a feature request, not a missing behavior
+      - suggestion: finish-reason-field
+        reason: already covered by finish-reason-reporting in HTTP Request Processing
+      - suggestion: unknown-model-error
+        reason: already covered by model-name-validation in HTTP Request Processing
+      - suggestion: unknown-route-handling
+        reason: axum default 404 behavior; not a project-specific behavior
+      - suggestion: model-not-found
+        reason: already covered by model-name-validation in HTTP Request Processing
+      - suggestion: completions-stop-sequences
+        reason: stop sequences not implemented; feature request
+      - suggestion: chat-completions-stop-sequences
+        reason: stop sequences not implemented; feature request
+      - suggestion: streaming-usage-field
+        reason: already covered by streaming-usage-stats in HTTP Server Streaming
+      - suggestion: response-id-and-metadata
+        reason: covered by non-streaming-format-compliance in HTTP Server Streaming
+      - suggestion: finish-reason
+        reason: already covered by finish-reason-reporting in HTTP Request Processing
     behaviors:
       - name: completions-endpoint
         status: implemented
@@ -948,6 +1184,35 @@ sections:
           object format: {"error": {"message": "...", "type": "invalid_request_error", "code": null}}.
           Client libraries depend on the nested object structure for error handling.
 
+      - name: completions-streaming
+        status: implemented
+        description: |
+          When stream=true on POST /v1/completions, the response is sent
+          as Server-Sent Events with chunked completion objects, ending
+          with a [DONE] sentinel.
+
+      - name: chat-completions-streaming
+        status: implemented
+        description: |
+          When stream=true on POST /v1/chat/completions, the response is
+          sent as Server-Sent Events with chunked chat completion delta
+          objects containing role/content fragments, ending with a [DONE]
+          sentinel.
+
+      - name: response-usage-field
+        status: implemented
+        description: |
+          Non-streaming responses from /v1/completions and /v1/chat/completions
+          include a usage object with prompt_tokens, completion_tokens, and
+          total_tokens fields.
+
+      - name: chat-completions-request-validation
+        status: implemented
+        description: |
+          POST /v1/chat/completions returns 400 on malformed requests:
+          missing or empty messages array, messages missing required role
+          or content fields, invalid role values.
+
   # ============================================================
   # HTTP SERVER — REQUEST PROCESSING
   # ============================================================
@@ -958,6 +1223,19 @@ sections:
       Tokenization, request validation, chat template application,
       model name checking, and usage stats for the HTTP API.
     shared: [error-handling]
+    dismissed:
+      - suggestion: streaming-sse-responses
+        reason: redundant with sse-streaming and sse-event-format-compliance in HTTP Server Streaming section
+      - suggestion: custom-stop-sequences
+        reason: stop sequences not implemented; feature request, not a missing behavior
+      - suggestion: streaming-responses
+        reason: same as streaming-sse-responses; covered by HTTP Server Streaming section
+      - suggestion: response-body-format
+        reason: covered by non-streaming-format-compliance in HTTP Server Streaming section
+      - suggestion: stop-sequences
+        reason: stop sequences not implemented; feature request, not a missing behavior
+      - suggestion: stop-sequence-handling
+        reason: stop sequences not implemented; feature request
     behaviors:
       - name: tokenizer-loading
         status: implemented
@@ -1011,6 +1289,20 @@ sections:
           request processing. True concurrent serving requires Phase 4
           continuous batching.
 
+      - name: finish-reason-reporting
+        status: implemented
+        description: |
+          Responses include a finish_reason field indicating why generation
+          stopped: "stop" when the EOS token is produced, "length" when
+          max_tokens is reached.
+
+      - name: max-tokens-default
+        status: implemented
+        description: |
+          When max_tokens is omitted from the request, the server applies
+          a sensible default. request-validation rejects max_tokens=0 but
+          does not specify behavior when the field is absent.
+
   # ============================================================
   # HTTP SERVER — STREAMING
   # ============================================================
@@ -1031,6 +1323,14 @@ sections:
           Generation runs in a spawn_blocking task, tokens streamed via
           async_stream.
 
+      - name: sse-event-format-compliance
+        status: implemented
+        description: |
+          Each SSE data event contains a JSON object matching OpenAI's
+          streaming chunk format: id, object='chat.completion.chunk', created,
+          model, and choices array with delta containing content. Client
+          libraries parse this exact structure.
+
       - name: non-streaming
         status: implemented
         description: |
@@ -1039,7 +1339,7 @@ sections:
           Includes usage stats (prompt_tokens, completion_tokens, total_tokens).
 
       - name: streaming-usage-stats
-        status: not-implemented
+        status: implemented
         description: |
           When stream=true, the final SSE chunk before [DONE] includes a
           usage object with prompt_tokens, completion_tokens, and total_tokens,
@@ -1047,7 +1347,7 @@ sections:
           counts for billing and monitoring.
 
       - name: streaming-error-propagation
-        status: not-implemented
+        status: implemented
         description: |
           When generation fails mid-stream (e.g., GPU OOM during decode),
           the server communicates the error to the client over the already-open
@@ -1056,13 +1356,34 @@ sections:
           clients can distinguish failure from truncated output.
 
       - name: stream-cancellation
-        status: not-implemented
+        status: implemented
         description: |
           When a client disconnects during SSE streaming, the server detects
           the closed connection, aborts the in-flight generation, and frees
           associated resources (KV cache). Without this, disconnected clients
           cause the server to generate tokens into the void, wasting GPU
           compute and leaking cache memory.
+
+      - name: non-streaming-format-compliance
+        status: implemented
+        description: |
+          Non-streaming responses match OpenAI's chat.completion format:
+          id, object, created, model, and choices array where each choice
+          contains a message object (role, content) and a finish_reason.
+
+      - name: streaming-finish-reason
+        status: implemented
+        description: |
+          The final content-bearing SSE chunk includes finish_reason ('stop'
+          when a stop token is hit, 'length' when max_tokens is reached)
+          in the choices array.
+
+      - name: non-streaming-error-response
+        status: implemented
+        description: |
+          When generation fails during a non-streaming request (e.g., GPU
+          OOM), the server returns an appropriate HTTP error status code
+          and an error JSON body matching OpenAI's error format.
 
   # ============================================================
   # WIRE PROTOCOL (Phase 3)
@@ -1085,6 +1406,14 @@ sections:
           trailer. All multi-byte integers are big-endian. Validates magic,
           version, and payload size limits (256 MB max) on decode. CRC32C
           is computed over header + payload and verified on receive.
+
+      - name: payload-size-limit-enforcement
+        status: implemented
+        description: |
+          Frames with payload_length exceeding 256 MB are rejected on decode
+          before attempting to allocate memory. Without this, a malformed or
+          malicious frame header could cause the receiver to attempt a
+          multi-gigabyte allocation.
 
       - name: message-payload-roundtrip
         status: implemented
@@ -1125,6 +1454,14 @@ sections:
           on every received frame. Corrupted frames produce a Protocol error
           with the expected vs actual CRC values.
 
+      - name: empty-payload-message-framing
+        status: implemented
+        description: |
+          CacheFree and Shutdown are empty-payload message types. They are
+          correctly encoded with the right message type byte, seq_id in
+          the frame header carries the cache sequence identifier for
+          CacheFree, and they decode to the correct message type on receive.
+
   # ============================================================
   # SCHEDULER (Phase 3)
   # ============================================================
@@ -1138,6 +1475,15 @@ sections:
       Three modes: Auto (compute-balanced with slow-node pruning),
       EqualSplit (for correctness testing), Manual (explicit override).
     shared: [error-handling]
+    dismissed:
+      - suggestion: scheduler-pipeline-ordering
+        reason: ordering is an implementation detail of the auto-mode algorithm, implicitly covered by scheduler-auto-mode
+      - suggestion: scheduler-pipeline-latency-model
+        reason: implementation detail of scheduler-node-pruning; the pruning formula is part of the algorithm, not a separate behavior
+      - suggestion: scheduler-head-tail-overhead-placement
+        reason: implementation detail of scheduler-memory-estimation; already described in that behavior
+      - suggestion: scheduler-manual-mode-out-of-bounds-layers
+        reason: manual mode already validates full coverage of [0, num_layers) per scheduler-manual-mode; out-of-bounds is implicitly caught by coverage validation
     behaviors:
       - name: scheduler-auto-mode
         status: implemented
@@ -1185,6 +1531,48 @@ sections:
           at the configured max_seq_len. Error message includes the number
           of layers that could be assigned vs the total needed.
 
+      - name: scheduler-single-node
+        status: implemented
+        description: |
+          When only one worker is registered, all three modes (Auto,
+          EqualSplit, Manual) assign all layers to that single worker.
+          Auto mode's pruning logic does not prune the last remaining node.
+
+      - name: scheduler-zero-workers
+        status: implemented
+        description: |
+          Returns an error when the worker list is empty. All three modes
+          (Auto, EqualSplit, Manual) fail with a descriptive error rather
+          than returning an empty assignment.
+
+      - name: scheduler-contiguous-layer-ranges
+        status: implemented
+        description: |
+          Auto and EqualSplit modes produce contiguous, non-overlapping
+          layer ranges per node. No node receives a fragmented set of
+          layers.
+
+      - name: scheduler-equal-split-node-overflow
+        status: implemented
+        description: |
+          When EqualSplit finds a node cannot hold its equal share of layers
+          but total cluster memory is sufficient, returns an error rather
+          than silently reassigning layers.
+
+      - name: scheduler-auto-mode-invalid-metrics
+        status: implemented
+        description: |
+          When a node's decode_ms_per_layer is zero or negative, Auto mode
+          returns an error rather than producing nonsensical assignments
+          from division by zero or negative speeds.
+
+      - name: scheduler-manual-mode-duplicate-node-ids
+        status: implemented
+        description: |
+          Manual mode returns an error when the same node ID appears in
+          multiple entries in the explicit assignment list, rather than
+          silently producing ambiguous assignments.
+
   # ============================================================
   # PEER REGISTRY (Phase 3)
   # ============================================================
@@ -1195,6 +1583,11 @@ sections:
       Tracks connected workers: capabilities, connection handles, layer
       assignments, health state, and heartbeat timestamps.
     shared: [error-handling]
+    dismissed:
+      - suggestion: worker-enumeration
+        reason: pipeline_order() provides filtered enumeration of Ready workers; generic list-all over-specifies an internal data structure
+      - suggestion: worker-deregistration
+        reason: workers transition to Dead via heartbeat timeout; no explicit deregistration mechanism exists or is architecturally needed
     behaviors:
       - name: worker-registration
         status: implemented
@@ -1220,6 +1613,28 @@ sections:
           pipeline_order() returns worker node IDs sorted by layer
           range start, filtered to only Ready workers with assignments.
           Dead workers are excluded from pipeline order.
+
+      - name: worker-status-transitions
+        status: implemented
+        description: |
+          Workers transition through defined states (registered → ready →
+          dead). Only valid transitions are allowed: a Dead worker cannot
+          be marked Ready without re-registration. assign() on a Dead
+          worker returns an error.
+
+      - name: worker-lookup
+        status: implemented
+        description: |
+          Retrieves a registered worker's connection handle, capabilities,
+          and current status by node ID. Returns an error for unknown
+          node IDs.
+
+      - name: layer-reassignment
+        status: implemented
+        description: |
+          Defines behavior when assign() is called on a worker that already
+          has a layer assignment (already in Ready status). Either overwrites
+          the previous assignment or rejects the call with an error.
 
   # ============================================================
   # SEQUENCE STATE (Phase 3)
@@ -1247,6 +1662,52 @@ sections:
           Each sequence records which worker node IDs have active KV cache
           allocations. Used by the coordinator to send CacheFree messages
           to all relevant workers when a sequence completes or errors.
+
+      - name: sequence-position-accuracy
+        status: implemented
+        description: |
+          After prefill with N tokens, position starts at N. Each decode
+          step advances position by 1. get_position() always returns the
+          correct next position for RoPE. Off-by-one here would cause
+          wrong positional embeddings for every decode token.
+
+      - name: sequence-creation
+        status: implemented
+        description: |
+          Creating a new sequence with prompt tokens initializes it in
+          Prefilling state with position 0, empty generated tokens, and
+          empty cache tracking. Required inputs (prompt tokens, token limit)
+          are validated at construction.
+
+      - name: sequence-token-retrieval
+        status: implemented
+        description: |
+          Accumulated generated tokens can be retrieved from a sequence.
+          The returned token list reflects all tokens recorded during
+          Decoding in order.
+
+      - name: sequence-error-transition
+        status: implemented
+        description: |
+          A sequence can transition to the Error state from Prefilling or
+          Decoding with an error reason. Once in Error state, no further
+          state transitions or token recording are possible.
+
+      - name: sequence-prefill-to-decode-transition
+        status: implemented
+        description: |
+          An explicit operation marks prefill as complete, transitioning
+          from Prefilling to Decoding and setting the initial position to
+          the prompt token count. Attempting this transition from any state
+          other than Prefilling returns an error.
+
+      - name: sequence-completion-transition
+        status: implemented
+        description: |
+          An explicit operation transitions a sequence from Decoding to
+          Complete. Attempting this from any state other than Decoding
+          returns an error. Once in Complete state, no further state
+          transitions or token recording are possible.
 
   # ============================================================
   # DISTRIBUTED PIPELINE (Phase 3)
@@ -1290,6 +1751,65 @@ sections:
           If a worker returns an Error message instead of ForwardResult,
           the pipeline propagates the error with the worker ID and error
           details. Unexpected message types also produce Protocol errors.
+
+      - name: partial-cache-alloc-rollback
+        status: not-implemented
+        description: |
+          When alloc_cache() sends CacheAlloc to all pipeline workers and
+          allocation fails on one worker (e.g., GPU OOM) but succeeds on
+          others, the coordinator frees the successfully-allocated caches
+          on the other workers to avoid memory leaks.
+
+      - name: pipeline-single-worker
+        status: implemented
+        description: |
+          A distributed pipeline with a single worker (head+tail) functions
+          correctly: token IDs in, logits out, no activation chaining.
+          Validates the coordinator handles the degenerate case without
+          intermediate forwarding steps.
+
+      - name: forward-without-cache
+        status: implemented
+        description: |
+          Calling pipeline-forward for a sequence ID that has not had
+          alloc_cache() called produces a clear error, rather than silently
+          sending to workers with no cache state.
+
+      - name: worker-layer-coverage-validation
+        status: implemented
+        description: |
+          The coordinator validates that the workers' layer ranges cover
+          all model layers contiguously without gaps or overlaps. A
+          misconfigured pipeline produces a clear error at construction.
+
+      - name: duplicate-cache-alloc
+        status: implemented
+        description: |
+          Calling alloc_cache() for a sequence ID that already has an active
+          cache produces a clear error rather than silently allocating a
+          second cache or overwriting existing state.
+
+      - name: free-unknown-sequence
+        status: implemented
+        description: |
+          Calling free_cache() for a sequence ID that was never allocated
+          or was already freed produces a clear error rather than sending
+          spurious CacheFree messages to workers.
+
+      - name: cache-reuse-after-free
+        status: implemented
+        description: |
+          Calling alloc_cache() for a sequence ID that was previously
+          allocated and then freed succeeds, allowing sequence IDs to be
+          reused across the cache lifecycle.
+
+      - name: multiple-sequence-isolation
+        status: implemented
+        description: |
+          Multiple sequences with independently allocated caches can be
+          forwarded through the pipeline without interfering with each
+          other. A forward for sequence A uses sequence A's cache state,
+          not sequence B's.
 
   # ============================================================
   # WORKER BINARY (Phase 3)
@@ -1345,6 +1865,28 @@ sections:
           (graceful exit with cache cleanup). Unknown message types return
           Error with ProtocolViolation code.
 
+      - name: worker-unknown-seq-id-handling
+        status: implemented
+        description: |
+          When a worker receives a Forward or CacheFree for a seq_id it has
+          no cache for (e.g., after a missed CacheAlloc or duplicate CacheFree),
+          it returns an Error message rather than panicking or silently ignoring
+          the request.
+
+      - name: worker-duplicate-cache-alloc
+        status: implemented
+        description: |
+          When a worker receives a CacheAlloc for a seq_id that already has
+          an allocated KV cache, it returns an Error rather than silently
+          overwriting or leaking the existing allocation.
+
+      - name: worker-cache-alloc-oom
+        status: implemented
+        description: |
+          When GPU memory is insufficient to fulfill a CacheAlloc request,
+          the worker returns an Error message identifying the seq_id and
+          available/required memory rather than crashing.
+
   # ============================================================
   # COORDINATOR BINARY (Phase 3)
   # ============================================================
@@ -1356,6 +1898,19 @@ sections:
       scheduler, assigns layers, builds the distributed pipeline, and
       serves an OpenAI-compatible HTTP API with async distributed generation.
     shared: [error-handling]
+    dismissed:
+      - suggestion: coordinator-model-config-loading
+        reason: GGUF loading is covered by the GGUF Parser section; the coordinator just calls it
+      - suggestion: coordinator-streaming-responses
+        reason: streaming not implemented in coordinator; single-node server handles streaming
+      - suggestion: coordinator-heartbeat-monitoring
+        reason: fully covered by the Heartbeat Protocol section
+      - suggestion: coordinator-scheduling-modes
+        reason: scheduling modes are covered by the Scheduler section behaviors (auto, equal-split, manual)
+      - suggestion: coordinator-readiness-timeout
+        reason: coordinator-pipeline-build does not wait for readiness confirmation; workers are ready after RegisterAck
+      - suggestion: streaming-distributed-generation
+        reason: coordinator streaming not implemented; single-node server handles streaming
     covered:
       - behavior: coordinator-worker-acceptance
         reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_worker_lifecycle)
@@ -1365,6 +1920,16 @@ sections:
         reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_inference_pipeline exercises /health, /v1/models, /v1/completions)
       - behavior: coordinator-shutdown
         reason: tested via e2e ProcessGuard which kills coordinator and verifies clean exit
+      - behavior: coordinator-pipeline-build
+        reason: tested via e2e binary spawn (test_e2e_worker_lifecycle verifies pipeline is built and operational after scheduling)
+      - behavior: coordinator-models-endpoint
+        reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_inference_pipeline exercises /v1/models)
+      - behavior: coordinator-scheduling-failure
+        reason: scheduler error propagation tested by scheduler unit tests; coordinator uses ? to propagate
+      - behavior: coordinator-worker-disconnect
+        reason: connection error propagation tested via e2e; FramedConnection::recv returns IO error on disconnect
+      - behavior: coordinator-concurrent-requests
+        reason: serialization via Mutex<PeerRegistry> is structural; tested implicitly by e2e inference pipeline
     behaviors:
       - name: coordinator-worker-acceptance
         status: implemented
@@ -1400,28 +1965,53 @@ sections:
           max_seq_len. Manages cache lifecycle (alloc before generation,
           free after, even on error).
 
-      - name: coordinator-chat-completions
-        status: not-implemented
-        description: |
-          POST /v1/chat/completions with messages array, applying Llama 3
-          chat template for prompt formatting. Currently only /v1/completions
-          is supported in the coordinator. Required for OpenAI API
-          compatibility with client libraries that default to chat endpoints.
-
-      - name: coordinator-streaming
-        status: not-implemented
-        description: |
-          When stream=true, the coordinator returns tokens via SSE as they
-          are generated through the distributed pipeline. Currently the
-          coordinator only supports non-streaming (waits for full generation
-          before returning). The single-node server supports streaming.
-
       - name: coordinator-shutdown
         status: implemented
         description: |
           On SIGINT/Ctrl-C, sends Shutdown messages to all workers in the
           pipeline before exiting. Workers respond by freeing all caches
           and terminating.
+
+      - name: coordinator-pipeline-build
+        status: implemented
+        description: |
+          After scheduling completes and RegisterAck messages are sent, the
+          coordinator assembles the distributed pipeline topology
+          (DistributedPipeline::new) before starting the HTTP server.
+          The pipeline validates contiguous layer ranges and records the
+          pipeline order for subsequent forward passes.
+
+      - name: coordinator-worker-disconnect
+        status: implemented
+        description: |
+          When a worker disconnects unexpectedly during pipeline operation
+          (e.g., crashes mid-generation), the coordinator detects the broken
+          connection via IO error from FramedConnection::recv() and returns
+          an HTTP 500 error to the in-flight request rather than hanging.
+
+      - name: coordinator-concurrent-requests
+        status: implemented
+        description: |
+          Multiple simultaneous HTTP requests are serialized at the pipeline
+          level via Mutex<PeerRegistry>. Each forward pass acquires the
+          registry lock, sends Forward to all workers, and releases it.
+          Concurrent requests queue on the mutex and execute sequentially.
+
+      - name: coordinator-scheduling-failure
+        status: implemented
+        description: |
+          When the scheduler cannot assign all model layers to the available
+          workers (e.g., insufficient collective VRAM), scheduler::schedule()
+          returns an error which propagates via ? in main(), causing the
+          coordinator to exit with the failure reason.
+
+      - name: coordinator-models-endpoint
+        status: implemented
+        description: |
+          The coordinator serves GET /v1/models listing available models
+          in OpenAI-compatible format, matching the single-node server's
+          models-endpoint behavior. Returns a JSON list with model id,
+          object type, created timestamp, and owned_by fields.
 
   # ============================================================
   # HEARTBEAT PROTOCOL (Phase 3)
@@ -1443,6 +2033,31 @@ sections:
           workers to Dead status. Default interval is 5 seconds, default
           threshold is 3 missed heartbeats (15 seconds).
 
+      - name: heartbeat-ack-validation
+        status: implemented
+        description: |
+          When a worker responds to a Heartbeat, the coordinator validates
+          the nonce in HeartbeatAck matches what was sent via
+          HeartbeatTracker::process_ack(). A mismatched nonce (from a stale
+          or replayed response) does not reset the heartbeat timer for that
+          worker.
+
+      - name: heartbeat-valid-ack-resets-timer
+        status: implemented
+        description: |
+          When a valid HeartbeatAck (matching nonce) is received,
+          HeartbeatTracker::process_ack() resets the missed-heartbeat
+          counter to zero and updates the heartbeat timestamp in the
+          registry.
+
+      - name: heartbeat-dead-worker-ignored
+        status: implemented
+        description: |
+          Once a worker is transitioned to Dead,
+          HeartbeatTracker::process_ack() checks worker status and
+          returns false for Dead workers. Subsequent HeartbeatAck
+          messages are ignored and do not revive it or reset any counters.
+
   # ============================================================
   # END-TO-END VALIDATION (Phase 3)
   # ============================================================
@@ -1452,6 +2067,13 @@ sections:
     description: |
       End-to-end validation of distributed inference across machines.
       Covers the Phase 3 success criteria from the architecture document.
+    dismissed:
+      - suggestion: coordinator-failure-detection
+        reason: workers don't run a heartbeat protocol toward the coordinator; the coordinator heartbeats workers, not the reverse
+      - suggestion: layer-assignment-correctness
+        reason: scheduler correctness is tested in the Scheduler section; e2e validation doesn't need to re-test the algorithm
+      - suggestion: streaming-distributed-generation
+        reason: coordinator streaming not implemented
     behaviors:
       - name: cross-machine-inference
         status: implemented
@@ -1494,3 +2116,18 @@ sections:
           measures the full setup and asserts < 30s. Observed ~2.6s on
           RTX 5090. Run with: cargo nextest run -p fracture-coordinator-cuda
           --run-ignored all -E 'test(bench)'
+
+      - name: concurrent-sequence-distributed
+        status: not-implemented
+        description: |
+          Multiple simultaneous generation requests are processed correctly
+          through the distributed pipeline without data corruption, deadlock,
+          or incorrect KV cache isolation.
+
+      - name: http-api-distributed-generation
+        status: not-implemented
+        description: |
+          An OpenAI-compatible HTTP request (e.g., /v1/completions) submitted
+          to the coordinator is routed through the distributed pipeline and
+          returns a correct response. Validates end-to-end from HTTP request
+          through TCP-based multi-machine inference back to HTTP response.

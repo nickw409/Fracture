@@ -11,6 +11,8 @@ use crate::registry::PeerRegistry;
 use crate::scheduler::LayerAssignment;
 use fracture_core::{FractureError, Result};
 use fracture_protocol::{frame::MessageType, messages::*, FramedConnection};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 /// Orchestrates forward passes across distributed workers.
 ///
@@ -22,10 +24,27 @@ pub struct DistributedPipeline {
     pipeline_order: Vec<String>,
     /// Model hidden size for activation shape validation.
     hidden_size: usize,
+    /// Total model layers the pipeline must cover.
+    total_layers: usize,
+    /// Sequence IDs that currently have allocated caches.
+    allocated_seqs: Mutex<HashSet<u64>>,
+}
+
+impl std::fmt::Debug for DistributedPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedPipeline")
+            .field("pipeline_order", &self.pipeline_order)
+            .field("hidden_size", &self.hidden_size)
+            .field("total_layers", &self.total_layers)
+            .finish()
+    }
 }
 
 impl DistributedPipeline {
     /// Create a new distributed pipeline from scheduler assignments.
+    ///
+    /// Validates that layer ranges are contiguous starting from 0 and cover
+    /// all layers without gaps or overlaps.
     pub fn new(assignments: &[LayerAssignment], hidden_size: usize) -> Result<Self> {
         if assignments.is_empty() {
             return Err(FractureError::Pipeline(
@@ -33,7 +52,7 @@ impl DistributedPipeline {
             ));
         }
 
-        // Validate contiguous ranges
+        // Validate contiguous ranges starting from layer 0
         let mut expected_start = 0;
         for a in assignments {
             if a.layer_range.start != expected_start {
@@ -42,24 +61,44 @@ impl DistributedPipeline {
                     a.layer_range.start
                 )));
             }
+            if a.layer_range.end <= a.layer_range.start {
+                return Err(FractureError::Pipeline(format!(
+                    "empty layer range for '{}': {:?}",
+                    a.node_id, a.layer_range
+                )));
+            }
             expected_start = a.layer_range.end;
         }
 
+        let total_layers = expected_start;
         let pipeline_order = assignments.iter().map(|a| a.node_id.clone()).collect();
 
         Ok(Self {
             pipeline_order,
             hidden_size,
+            total_layers,
+            allocated_seqs: Mutex::new(HashSet::new()),
         })
     }
 
     /// Send CacheAlloc to all workers for a new sequence.
+    ///
+    /// Returns an error if the sequence already has an active cache allocation.
     pub async fn alloc_cache(
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
         max_seq_len: u32,
     ) -> Result<()> {
+        {
+            let seqs = self.allocated_seqs.lock().unwrap();
+            if seqs.contains(&seq_id) {
+                return Err(FractureError::Pipeline(format!(
+                    "duplicate alloc_cache for seq {seq_id}: cache already allocated"
+                )));
+            }
+        }
+
         let payload = CacheAllocPayload { max_seq_len };
         for node_id in &self.pipeline_order {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
@@ -67,15 +106,28 @@ impl DistributedPipeline {
             })?;
             entry.connection.send(MessageType::CacheAlloc, seq_id, &payload).await?;
         }
+
+        self.allocated_seqs.lock().unwrap().insert(seq_id);
         Ok(())
     }
 
     /// Send CacheFree to all workers for a completed sequence.
+    ///
+    /// Returns an error if the sequence was never allocated or was already freed.
     pub async fn free_cache(
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
     ) -> Result<()> {
+        {
+            let mut seqs = self.allocated_seqs.lock().unwrap();
+            if !seqs.remove(&seq_id) {
+                return Err(FractureError::Pipeline(format!(
+                    "free_cache for seq {seq_id}: not allocated or already freed"
+                )));
+            }
+        }
+
         for node_id in &self.pipeline_order {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
@@ -97,6 +149,12 @@ impl DistributedPipeline {
         positions: &[u32],
         is_prefill: bool,
     ) -> Result<Vec<f32>> {
+        if !self.allocated_seqs.lock().unwrap().contains(&seq_id) {
+            return Err(FractureError::Pipeline(format!(
+                "forward for seq {seq_id}: cache not allocated (call alloc_cache first)"
+            )));
+        }
+
         let n = self.pipeline_order.len();
 
         // First worker gets token IDs
@@ -195,6 +253,16 @@ impl DistributedPipeline {
     pub fn pipeline_order(&self) -> &[String] {
         &self.pipeline_order
     }
+
+    /// Get the total number of model layers this pipeline covers.
+    pub fn total_layers(&self) -> usize {
+        self.total_layers
+    }
+
+    /// Check whether a sequence ID has an active cache allocation.
+    pub fn is_allocated(&self, seq_id: u64) -> bool {
+        self.allocated_seqs.lock().unwrap().contains(&seq_id)
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +314,42 @@ mod tests {
             assignment("b", 15, 32, NodeRole::Tail), // gap at 10..15
         ];
         assert!(DistributedPipeline::new(&assignments, 4096).is_err());
+    }
+
+    #[test]
+    fn test_pipeline_single_worker() {
+        let assignments = vec![assignment("solo", 0, 32, NodeRole::Head)];
+        let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
+        assert_eq!(pipeline.pipeline_order(), &["solo"]);
+        assert_eq!(pipeline.total_layers(), 32);
+    }
+
+    #[test]
+    fn test_pipeline_layer_coverage_validation() {
+        // Valid: full contiguous coverage
+        let assignments = vec![
+            assignment("a", 0, 16, NodeRole::Head),
+            assignment("b", 16, 32, NodeRole::Tail),
+        ];
+        let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
+        assert_eq!(pipeline.total_layers(), 32);
+
+        // Invalid: gap between ranges
+        let gap = vec![
+            assignment("a", 0, 10, NodeRole::Head),
+            assignment("b", 12, 32, NodeRole::Tail),
+        ];
+        let err = DistributedPipeline::new(&gap, 4096).unwrap_err().to_string();
+        assert!(err.contains("non-contiguous"), "expected contiguity error: {err}");
+
+        // Invalid: doesn't start at 0
+        let no_zero = vec![assignment("a", 5, 32, NodeRole::Head)];
+        let err = DistributedPipeline::new(&no_zero, 4096).unwrap_err().to_string();
+        assert!(err.contains("non-contiguous") || err.contains("expected start 0"), "expected start-at-0 error: {err}");
+
+        // Invalid: empty range
+        let empty = vec![assignment("a", 0, 0, NodeRole::Head)];
+        let err = DistributedPipeline::new(&empty, 4096).unwrap_err().to_string();
+        assert!(err.contains("empty layer range"), "expected empty range error: {err}");
     }
 }

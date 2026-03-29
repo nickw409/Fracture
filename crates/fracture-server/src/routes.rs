@@ -6,8 +6,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use fracture_core::Backend;
 use fracture_engine::{Engine, KvCacheManager};
-use fracture_generate::{apply_chat_template, GenerationConfig, GenerationLoop};
+use fracture_generate::{apply_chat_template, GenerationConfig, GenerationLoop, StopReason};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -106,13 +107,17 @@ async fn completions_handler<B: Backend + 'static>(
     };
 
     match generated {
-        Ok(_) => {
+        Ok(result) => {
             drop(tx);
             let mut tokens = Vec::new();
             while let Some(t) = rx.recv().await {
                 tokens.push(t);
             }
             let text = decode_tokens(&state.tokenizer, &tokens);
+            let finish_reason = match result.stop_reason {
+                StopReason::Stop => "stop",
+                StopReason::Length => "length",
+            };
             let response = CompletionResponse {
                 id: gen_id(),
                 object: "text_completion".to_string(),
@@ -121,7 +126,7 @@ async fn completions_handler<B: Backend + 'static>(
                     index: 0,
                     text: Some(text),
                     message: None,
-                    finish_reason: Some("stop".to_string()),
+                    finish_reason: Some(finish_reason.to_string()),
                 }],
                 usage: Usage {
                     prompt_tokens: prompt_len,
@@ -193,13 +198,17 @@ async fn chat_completions_handler<B: Backend + 'static>(
     };
 
     match generated {
-        Ok(_) => {
+        Ok(result) => {
             drop(tx);
             let mut tokens = Vec::new();
             while let Some(t) = rx.recv().await {
                 tokens.push(t);
             }
             let text = decode_tokens(&state.tokenizer, &tokens);
+            let finish_reason = match result.stop_reason {
+                StopReason::Stop => "stop",
+                StopReason::Length => "length",
+            };
             let response = CompletionResponse {
                 id: gen_id(),
                 object: "chat.completion".to_string(),
@@ -211,7 +220,7 @@ async fn chat_completions_handler<B: Backend + 'static>(
                         role: "assistant".to_string(),
                         content: text,
                     }),
-                    finish_reason: Some("stop".to_string()),
+                    finish_reason: Some(finish_reason.to_string()),
                 }],
                 usage: Usage {
                     prompt_tokens: prompt_len,
@@ -236,57 +245,127 @@ fn handle_streaming<B: Backend + 'static>(
     is_completion: bool,
 ) -> Sse<impl futures_core::Stream<Item = std::result::Result<Event, Infallible>> + use<B>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_gen = Arc::clone(&cancel);
     let state_for_gen = Arc::clone(&state);
     let prompt_tokens_gen = prompt_tokens.clone();
+    let prompt_len = prompt_tokens.len();
     let config_gen = config.clone();
     let tokenizer_for_stream = state.tokenizer.clone();
 
     // Run generation in a blocking task since the engine is synchronous.
-    //
-    // Known limitation: streaming-error-propagation
-    // Generation errors from GenerationLoop::generate are currently silently dropped
-    // (`let _ = ...`). When generation fails mid-stream (e.g., GPU OOM during decode),
-    // the SSE stream simply ends without notifying the client of the error. This should
-    // be changed to emit an SSE error event with the failure details so clients can
-    // distinguish a generation failure from normal stream completion.
-    //
-    // Known limitation: stream-cancellation
-    // Client disconnect detection is not yet implemented. When a client disconnects
-    // during SSE streaming, the generation loop continues running to completion,
-    // wasting GPU compute and leaking KV cache memory. This requires a
-    // CancellationToken or similar mechanism to be threaded into GenerationLoop
-    // so that the decode loop can exit early on client disconnect.
+    // The cancel flag is checked each decode iteration; the SSE stream sets it
+    // on client disconnect (when the stream is dropped).
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.cache.lock().unwrap();
-        let _ = GenerationLoop::generate(
+        let result = GenerationLoop::generate_with_cancel(
             state_for_gen.engine.as_ref(),
             &prompt_tokens_gen,
             &config_gen,
             &mut cache,
             &tx,
+            Some(cancel_for_gen),
         );
+        let _ = result_tx.send(result);
     });
 
+    // When the stream is dropped (client disconnect), signal cancellation.
+    let cancel_on_drop = Arc::clone(&cancel);
+
     let stream = async_stream::stream! {
+        // Guard: sets cancel flag when stream is dropped (client disconnect).
+        struct CancelGuard(Arc<AtomicBool>);
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _cancel_guard = CancelGuard(cancel_on_drop);
+
         let id = gen_id();
+        let created = unix_timestamp();
+        let model = LOADED_MODEL_NAME;
         let object = if is_completion { "text_completion" } else { "chat.completion.chunk" };
+        let mut token_count = 0usize;
 
         while let Some(token_id) = rx.recv().await {
+            token_count += 1;
             let text = decode_tokens(&tokenizer_for_stream, &[token_id]);
             let delta = if is_completion {
                 serde_json::json!({
                     "id": id,
                     "object": object,
-                    "choices": [{"index": 0, "text": text}]
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "text": text, "finish_reason": null}]
                 })
             } else {
                 serde_json::json!({
                     "id": id,
                     "object": object,
-                    "choices": [{"index": 0, "delta": {"content": text}}]
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
                 })
             };
             yield Ok::<_, Infallible>(Event::default().data(delta.to_string()));
+        }
+
+        // Emit final chunk with finish_reason and usage stats
+        let gen_result = result_rx.recv().await;
+        let (finish_reason, error_msg) = match gen_result {
+            Some(Ok(result)) => {
+                let reason = match result.stop_reason {
+                    StopReason::Stop => "stop",
+                    StopReason::Length => "length",
+                };
+                (reason, None)
+            }
+            Some(Err(e)) => ("error", Some(e.to_string())),
+            None => ("error", Some("generation task dropped".to_string())),
+        };
+
+        // Emit error event if generation failed
+        if let Some(err_msg) = error_msg {
+            let error_event = serde_json::json!({
+                "error": {
+                    "message": format!("generation failed: {err_msg}"),
+                    "type": "server_error",
+                    "code": null,
+                }
+            });
+            yield Ok(Event::default().data(error_event.to_string()));
+        } else {
+            // Final chunk with finish_reason
+            let final_chunk = if is_completion {
+                serde_json::json!({
+                    "id": id,
+                    "object": object,
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "text": "", "finish_reason": finish_reason}],
+                    "usage": {
+                        "prompt_tokens": prompt_len,
+                        "completion_tokens": token_count,
+                        "total_tokens": prompt_len + token_count,
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "id": id,
+                    "object": object,
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                    "usage": {
+                        "prompt_tokens": prompt_len,
+                        "completion_tokens": token_count,
+                        "total_tokens": prompt_len + token_count,
+                    }
+                })
+            };
+            yield Ok(Event::default().data(final_chunk.to_string()));
         }
 
         yield Ok(Event::default().data("[DONE]"));
@@ -354,6 +433,25 @@ pub(crate) fn validate_chat_request(
             Json(error_body("messages must not be empty")),
         )
             .into_response());
+    }
+    for (i, msg) in req.messages.iter().enumerate() {
+        if msg.role.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(error_body(&format!("messages[{i}].role must not be empty"))),
+            )
+                .into_response());
+        }
+        if !matches!(msg.role.as_str(), "system" | "user" | "assistant") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(error_body(&format!(
+                    "messages[{i}].role must be 'system', 'user', or 'assistant', got '{}'",
+                    msg.role
+                ))),
+            )
+                .into_response());
+        }
     }
     validate_sampling_params(req.temperature, req.top_p, req.top_k, req.max_tokens)
 }
