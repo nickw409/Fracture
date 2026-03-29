@@ -7,7 +7,7 @@
 
 use fracture_core::{Backend, DType, ModelConfig};
 use fracture_cuda::CudaBackend;
-use fracture_engine::{CacheHandle, Engine, KvCacheManager, NodeConfig};
+use fracture_engine::{CacheHandle, Engine, KvCacheManager, NodeConfig, PagedKvCacheManager};
 use fracture_generate::{GenerationConfig, GenerationLoop};
 use fracture_gguf::{LayerWeights, WeightStore};
 use half::f16;
@@ -593,4 +593,179 @@ fn test_gpu_split_equivalence_asymmetric() {
     );
 
     assert_logits_match(&logits_full, &logits_split, "asymmetric split");
+}
+
+// ---------------------------------------------------------------------------
+// Test: Paged KV cache produces identical output to contiguous KV cache
+// ---------------------------------------------------------------------------
+//
+// This is the Phase 4 Step 1f correctness validation. The paged attention
+// kernel must produce byte-identical (within FP16 tolerance) results to
+// the contiguous attention kernel on the same model and input.
+
+#[test]
+fn test_paged_vs_contiguous_prefill() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+
+    let prompt = vec![1u32, 2, 3, 4, 5];
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+
+    // Contiguous path
+    let mut cont_cache = KvCacheManager::new(
+        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+    );
+    let cont_handle = cont_cache.alloc(engine.backend()).expect("contiguous alloc");
+    let logits_cont = engine
+        .forward(&prompt, &positions, &mut cont_cache, cont_handle, None)
+        .expect("contiguous forward");
+    cont_cache.free(cont_handle, engine.backend()).expect("free");
+
+    // Paged path
+    // Allocate enough blocks: ceil(5/16) = 1 block per layer, but pool needs
+    // at least 1 block. Use a generous pool.
+    let mut paged_cache = PagedKvCacheManager::new(
+        64, // 64 blocks — plenty for a 5-token prompt
+        cfg.num_layers,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        engine.backend(),
+    )
+    .expect("paged cache creation");
+    let paged_handle = paged_cache.alloc().expect("paged alloc");
+    let logits_paged = engine
+        .forward_paged(&prompt, &positions, &mut paged_cache, paged_handle)
+        .expect("paged forward");
+    paged_cache.free(paged_handle).expect("free");
+    paged_cache.destroy(engine.backend()).expect("pool destroy");
+
+    // Compare logits — should be identical within FP16 tolerance
+    assert_eq!(
+        logits_cont.len(),
+        logits_paged.len(),
+        "logits length mismatch: contiguous={} paged={}",
+        logits_cont.len(),
+        logits_paged.len()
+    );
+
+    let mut max_diff: f32 = 0.0;
+    let mut diff_count = 0usize;
+    for (i, (c, p)) in logits_cont.iter().zip(logits_paged.iter()).enumerate() {
+        let diff = (c - p).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        if diff > 0.01 {
+            diff_count += 1;
+            if diff_count <= 5 {
+                eprintln!(
+                    "  logit[{i}]: contiguous={c:.6} paged={p:.6} diff={diff:.6}"
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "Paged vs contiguous prefill: max_diff={max_diff:.6}, diffs>0.01: {diff_count}/{}",
+        logits_cont.len()
+    );
+    assert!(
+        max_diff < 0.05,
+        "paged attention diverges from contiguous: max_diff={max_diff:.6} (threshold 0.05)"
+    );
+}
+
+#[test]
+fn test_paged_vs_contiguous_decode_steps() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+
+    let prompt = vec![1u32, 2, 3];
+    let prompt_positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    let num_decode_steps = 5;
+
+    // --- Contiguous path ---
+    let mut cont_cache = KvCacheManager::new(
+        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+    );
+    let cont_handle = cont_cache.alloc(engine.backend()).expect("cont alloc");
+
+    // Prefill
+    let mut cont_logits = engine
+        .forward(&prompt, &prompt_positions, &mut cont_cache, cont_handle, None)
+        .expect("cont prefill");
+    let mut cont_tokens = Vec::new();
+
+    // Decode steps
+    for step in 0..num_decode_steps {
+        let token = cont_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        cont_tokens.push(token);
+
+        let pos = (prompt.len() + step) as u32;
+        cont_logits = engine
+            .forward(&[token], &[pos], &mut cont_cache, cont_handle, None)
+            .expect(&format!("cont decode step {step}"));
+    }
+    cont_cache.free(cont_handle, engine.backend()).expect("free");
+
+    // --- Paged path ---
+    let mut paged_cache = PagedKvCacheManager::new(
+        64,
+        cfg.num_layers,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        engine.backend(),
+    )
+    .expect("paged cache creation");
+    let paged_handle = paged_cache.alloc().expect("paged alloc");
+
+    // Prefill
+    let mut paged_logits = engine
+        .forward_paged(&prompt, &prompt_positions, &mut paged_cache, paged_handle)
+        .expect("paged prefill");
+    let mut paged_tokens = Vec::new();
+
+    // Decode steps
+    for step in 0..num_decode_steps {
+        let token = paged_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        paged_tokens.push(token);
+
+        let pos = (prompt.len() + step) as u32;
+        paged_logits = engine
+            .forward_paged(&[token], &[pos], &mut paged_cache, paged_handle)
+            .expect(&format!("paged decode step {step}"));
+    }
+    paged_cache.free(paged_handle).expect("free");
+    paged_cache.destroy(engine.backend()).expect("pool destroy");
+
+    // Compare: greedy token sequences must be identical
+    assert_eq!(
+        cont_tokens, paged_tokens,
+        "paged decode produced different tokens than contiguous:\n  contiguous: {cont_tokens:?}\n  paged:      {paged_tokens:?}"
+    );
+
+    // Compare final logits
+    let mut max_diff: f32 = 0.0;
+    for (c, p) in cont_logits.iter().zip(paged_logits.iter()) {
+        let diff = (c - p).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+    }
+    eprintln!(
+        "Paged vs contiguous after {num_decode_steps} decode steps: max_diff={max_diff:.6}, tokens match: {}",
+        cont_tokens == paged_tokens
+    );
+    assert!(
+        max_diff < 0.05,
+        "final logits diverge: max_diff={max_diff:.6}"
+    );
 }
