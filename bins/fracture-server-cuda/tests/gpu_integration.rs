@@ -7,7 +7,10 @@
 
 use fracture_core::{Backend, DType, ModelConfig};
 use fracture_cuda::CudaBackend;
-use fracture_engine::{CacheHandle, Engine, KvCacheManager, NodeConfig, PagedKvCacheManager};
+use fracture_engine::{
+    batched_forward, CacheHandle, Engine, KvCacheManager, NodeConfig,
+    PagedKvCacheManager, SequenceSlice,
+};
 use fracture_generate::{GenerationConfig, GenerationLoop};
 use fracture_gguf::{LayerWeights, WeightStore};
 use half::f16;
@@ -872,4 +875,98 @@ fn test_paged_vs_contiguous_multi_block() {
         max_diff < 0.05,
         "multi-block logits diverge: max_diff={max_diff:.6}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test: Batched forward produces identical per-sequence output to sequential
+// ---------------------------------------------------------------------------
+//
+// Phase 4 Step 2 validation. Run two sequences individually through
+// forward_paged, then run them together through batched_forward. Each
+// sequence's logits must be identical.
+
+#[test]
+fn test_batched_vs_sequential_prefill() {
+    let (engine, cfg) = setup_engine().expect("setup failed");
+
+    let prompt_a: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let prompt_b: Vec<u32> = vec![10, 20, 30];
+    let pos_a: Vec<u32> = (0..prompt_a.len() as u32).collect();
+    let pos_b: Vec<u32> = (0..prompt_b.len() as u32).collect();
+
+    // --- Sequential: run each sequence individually ---
+    let mut cache_a = PagedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    ).expect("cache_a");
+    let ha = cache_a.alloc().expect("alloc_a");
+    let logits_a_seq = engine
+        .forward_paged(&prompt_a, &pos_a, &mut cache_a, ha)
+        .expect("forward_a");
+    cache_a.free(ha).expect("free_a");
+    cache_a.destroy(engine.backend()).expect("destroy_a");
+
+    let mut cache_b = PagedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    ).expect("cache_b");
+    let hb = cache_b.alloc().expect("alloc_b");
+    let logits_b_seq = engine
+        .forward_paged(&prompt_b, &pos_b, &mut cache_b, hb)
+        .expect("forward_b");
+    cache_b.free(hb).expect("free_b");
+    cache_b.destroy(engine.backend()).expect("destroy_b");
+
+    // --- Batched: run both sequences together ---
+    let mut cache_batch = PagedKvCacheManager::new(
+        128, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend(),
+    ).expect("cache_batch");
+    let h1 = cache_batch.alloc().expect("alloc_1");
+    let h2 = cache_batch.alloc().expect("alloc_2");
+
+    let seqs = vec![
+        SequenceSlice { handle: h1, token_ids: prompt_a.clone(), positions: pos_a.clone() },
+        SequenceSlice { handle: h2, token_ids: prompt_b.clone(), positions: pos_b.clone() },
+    ];
+
+    let layer_range = 0..cfg.num_layers;
+    let batch_result = batched_forward(
+        engine.backend(), engine.weights(), &layer_range, &mut cache_batch, &seqs,
+    ).expect("batched forward");
+
+    cache_batch.free(h1).expect("free_1");
+    cache_batch.free(h2).expect("free_2");
+    cache_batch.destroy(engine.backend()).expect("destroy_batch");
+
+    // --- Compare ---
+    assert_eq!(batch_result.logits.len(), 2);
+
+    let logits_a_batch = &batch_result.logits[0];
+    let logits_b_batch = &batch_result.logits[1];
+
+    assert_eq!(logits_a_seq.len(), logits_a_batch.len());
+    assert_eq!(logits_b_seq.len(), logits_b_batch.len());
+
+    let mut max_diff_a: f32 = 0.0;
+    for (s, b) in logits_a_seq.iter().zip(logits_a_batch.iter()) {
+        max_diff_a = max_diff_a.max((s - b).abs());
+    }
+
+    let mut max_diff_b: f32 = 0.0;
+    for (s, b) in logits_b_seq.iter().zip(logits_b_batch.iter()) {
+        max_diff_b = max_diff_b.max((s - b).abs());
+    }
+
+    // Greedy token from each
+    let greedy_a_seq = logits_a_seq.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+    let greedy_a_bat = logits_a_batch.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+    let greedy_b_seq = logits_b_seq.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+    let greedy_b_bat = logits_b_batch.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+
+    eprintln!(
+        "Batched vs sequential prefill:\n  Seq A: max_diff={max_diff_a:.6}, greedy seq={greedy_a_seq} batch={greedy_a_bat}\n  Seq B: max_diff={max_diff_b:.6}, greedy seq={greedy_b_seq} batch={greedy_b_bat}"
+    );
+
+    assert!(max_diff_a < 0.05, "seq A logits diverge: max_diff={max_diff_a:.6}");
+    assert!(max_diff_b < 0.05, "seq B logits diverge: max_diff={max_diff_b:.6}");
+    assert_eq!(greedy_a_seq, greedy_a_bat, "seq A greedy token mismatch");
+    assert_eq!(greedy_b_seq, greedy_b_bat, "seq B greedy token mismatch");
 }
