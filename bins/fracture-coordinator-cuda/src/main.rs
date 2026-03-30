@@ -35,7 +35,9 @@ use handlers::{completions_handler, CoordState};
 struct CoordinatorConfig {
     listen_address: String,
     model_path: String,
-    expected_workers: usize,
+    /// Minimum workers before building initial pipeline. Default: 1.
+    /// Additional workers join dynamically via FT-7.
+    min_workers: usize,
     http_port: u16,
     max_seq_len: usize,
     scheduling_mode: String,
@@ -73,10 +75,10 @@ async fn main() -> Result<()> {
             .get_or_flag("FRACTURE_MODEL", &args, "--model")
             .expect("--model or FRACTURE_MODEL is required")
             .to_string(),
-        expected_workers: cfg
-            .get_or_flag("FRACTURE_WORKERS", &args, "--workers")
+        min_workers: cfg
+            .get_or_flag("FRACTURE_MIN_WORKERS", &args, "--min-workers")
             .and_then(|p| p.parse().ok())
-            .expect("--workers or FRACTURE_WORKERS is required"),
+            .unwrap_or(1),
         http_port: cfg
             .get_or_flag("FRACTURE_HTTP_PORT", &args, "--http-port")
             .and_then(|p| p.parse().ok())
@@ -113,7 +115,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Fracture coordinator (term={})", config.term);
     tracing::info!("listening for workers on {}", config.listen_address);
-    tracing::info!("expecting {} workers", config.expected_workers);
+    tracing::info!("min workers before pipeline: {}", config.min_workers);
     tracing::info!("model: {}", config.model_path);
 
     // Parse GGUF metadata for model config
@@ -219,7 +221,7 @@ async fn main() -> Result<()> {
         let model_config = model_config.clone();
         let pipeline_tx = pipeline_tx.clone();
         let cluster_tx_bg = cluster_tx.clone();
-        let expected_workers = config.expected_workers;
+        let expected_workers = config.min_workers;
         let max_seq_len = config.max_seq_len;
         let acceptance_timeout_secs = config.acceptance_timeout_secs;
 
