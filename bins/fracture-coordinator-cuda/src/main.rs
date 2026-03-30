@@ -46,6 +46,9 @@ struct CoordinatorConfig {
     /// Use the batched scheduler loop (Phase 4) instead of the
     /// one-at-a-time distributed_generate path.
     batched: bool,
+    /// Starting term for this coordinator instance. Workers with a higher
+    /// term will reject connections from this coordinator (FT-13).
+    term: u64,
 }
 
 #[tokio::main]
@@ -101,9 +104,15 @@ async fn main() -> Result<()> {
             .and_then(|p| p.parse().ok())
             .unwrap_or(120), // default 2 minutes
         batched: args.iter().any(|a| a == "--batched"),
+        term: args
+            .iter()
+            .position(|a| a == "--term")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0),
     };
 
-    tracing::info!("Fracture coordinator");
+    tracing::info!("Fracture coordinator (term={})", config.term);
     tracing::info!("listening for workers on {}", config.listen_address);
     tracing::info!("expecting {} workers", config.expected_workers);
     tracing::info!("model: {}", config.model_path);

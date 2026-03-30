@@ -284,6 +284,8 @@ async fn main() -> Result<()> {
 
     // Cluster manifest — updated by coordinator broadcasts, used for election/reconnection.
     let mut cluster_manifest: Option<ClusterManifestPayload> = None;
+    // Current known term — used to reject stale coordinators (FT-13).
+    let mut current_term: u64 = 0;
 
     // Election agent — initialized if coordinator-capable.
     let mut election_agent = if coordinator_capable {
@@ -559,6 +561,35 @@ async fn main() -> Result<()> {
                 }
             }
 
+            MessageType::Victory => {
+                match FramedConnection::deserialize_payload::<VictoryPayload>(&payload) {
+                    Ok(victory) => {
+                        if victory.term > current_term {
+                            tracing::info!(
+                                "received Victory from '{}' at term {} (coordinator: {})",
+                                victory.leader_id, victory.term, victory.coordinator_addr
+                            );
+                            current_term = victory.term;
+                            if let Some(ref mut agent) = election_agent {
+                                agent.on_victory(
+                                    &victory.leader_id,
+                                    victory.term,
+                                    &victory.coordinator_addr,
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                "ignoring stale Victory from '{}' (term {} <= {})",
+                                victory.leader_id, victory.term, current_term
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Victory deserialize error: {e}");
+                    }
+                }
+            }
+
             MessageType::ClusterManifest => {
                 match FramedConnection::deserialize_payload::<ClusterManifestPayload>(&payload) {
                     Ok(manifest) => {
@@ -572,10 +603,15 @@ async fn main() -> Result<()> {
                             );
                         } else {
                             tracing::info!(
-                                "received cluster manifest v{} ({} nodes)",
+                                "received cluster manifest v{} (term={}, {} nodes)",
                                 manifest.version,
+                                manifest.term,
                                 manifest.nodes.len(),
                             );
+                            // Update term from manifest (FT-13: stale coordinator rejection).
+                            if manifest.term > current_term {
+                                current_term = manifest.term;
+                            }
                             cluster_manifest = Some(manifest);
                         }
                     }
