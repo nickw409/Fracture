@@ -370,6 +370,30 @@ fn handle_streaming<B: Backend + 'static>(
         }
         let _cancel_guard = CancelGuard(cancel_on_drop);
 
+        // Ensures active_requests is decremented even if the stream is dropped.
+        struct MetricsGuard(Arc<DashboardState>, bool);
+        impl Drop for MetricsGuard {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.metrics.record_completion(&RequestRecord {
+                        id: String::new(),
+                        request_type: "chat",
+                        status: "cancelled",
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        time_to_first_token_ms: 0.0,
+                        total_duration_ms: 0.0,
+                        tokens_per_second: 0.0,
+                        finish_reason: "cancelled",
+                        temperature: 0.0,
+                        created_at: String::new(),
+                    });
+                }
+            }
+        }
+        let mut metrics_guard = MetricsGuard(Arc::clone(&dashboard), false);
+
         let id = gen_id();
         let created = unix_timestamp();
         let model = LOADED_MODEL_NAME;
@@ -478,6 +502,7 @@ fn handle_streaming<B: Backend + 'static>(
         };
         dashboard.metrics.record_completion(&record);
         dashboard.request_log.push(record);
+        metrics_guard.1 = true;
 
         yield Ok(Event::default().data("[DONE]"));
     };

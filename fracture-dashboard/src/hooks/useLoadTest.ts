@@ -31,7 +31,7 @@ export function useLoadTest() {
   const abortRef = useRef<AbortController | null>(null);
   const runningRef = useRef(false);
 
-  const start = useCallback((intervalMs = 3000, maxTokens = 64) => {
+  const start = useCallback((maxTokens = 64) => {
     if (runningRef.current) return;
     runningRef.current = true;
     const controller = new AbortController();
@@ -45,7 +45,7 @@ export function useLoadTest() {
       running: true,
     });
 
-    const fire = () => {
+    const fireNext = () => {
       if (!runningRef.current) return;
 
       const prompt = PROMPTS[Math.floor(Math.random() * PROMPTS.length)];
@@ -67,25 +67,22 @@ export function useLoadTest() {
             requestsCompleted: s.requestsCompleted + 1,
             totalTokens: s.totalTokens + tokens,
           }));
+          // Fire the next request after this one completes.
+          fireNext();
         },
         () => {
           setStats((s) => ({
             ...s,
             requestsFailed: s.requestsFailed + 1,
           }));
+          // Continue even after failures.
+          fireNext();
         },
         controller.signal,
       );
     };
 
-    // Fire first immediately, then on interval.
-    fire();
-    const id = setInterval(fire, intervalMs);
-
-    // Store cleanup in the controller's abort handler.
-    controller.signal.addEventListener('abort', () => {
-      clearInterval(id);
-    });
+    fireNext();
   }, []);
 
   const stop = useCallback(() => {

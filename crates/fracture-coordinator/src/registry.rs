@@ -27,6 +27,8 @@ pub struct WorkerEntry {
     pub status: WorkerStatus,
     /// Free blocks in this worker's paged KV cache pool (from heartbeat ack).
     pub free_blocks: u32,
+    /// GPU memory used in bytes (from heartbeat ack).
+    pub gpu_memory_used: u64,
 }
 
 impl std::fmt::Debug for WorkerEntry {
@@ -83,6 +85,7 @@ impl PeerRegistry {
                 last_heartbeat: Instant::now(),
                 status: WorkerStatus::Connected,
                 free_blocks: 0,
+                gpu_memory_used: 0,
             },
         );
         Ok(())
@@ -132,10 +135,11 @@ impl PeerRegistry {
     }
 
     /// Update a worker's last heartbeat time and block pool stats.
-    pub fn record_heartbeat(&mut self, node_id: &str, free_blocks: u32) {
+    pub fn record_heartbeat(&mut self, node_id: &str, free_blocks: u32, gpu_memory_used: u64) {
         if let Some(entry) = self.workers.get_mut(node_id) {
             entry.last_heartbeat = Instant::now();
             entry.free_blocks = free_blocks;
+            entry.gpu_memory_used = gpu_memory_used;
         }
     }
 
@@ -195,6 +199,11 @@ impl PeerRegistry {
             .filter(|e| now.duration_since(e.last_heartbeat) > timeout)
             .map(|e| e.capabilities.node_id.clone())
             .collect()
+    }
+
+    /// Iterate over immutable entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &WorkerEntry)> {
+        self.workers.iter()
     }
 
     /// Iterate over mutable entries (for sending messages to all workers).
@@ -508,7 +517,7 @@ mod tests {
         assert!(!reg.check_heartbeats(std::time::Duration::ZERO).is_empty());
 
         // Record heartbeat, then check with a generous timeout — should pass
-        reg.record_heartbeat("w1", 100);
+        reg.record_heartbeat("w1", 100, 0);
         let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(60));
         assert!(timed_out.is_empty());
 
@@ -535,7 +544,7 @@ mod tests {
             cache_memory_gb: 1.0,
         };
         reg.assign("w1", assign("w1", 0, 32)).unwrap();
-        reg.record_heartbeat("w1", 50);
+        reg.record_heartbeat("w1", 50, 0);
         assert_eq!(reg.min_free_blocks(), 50);
     }
 
@@ -556,8 +565,8 @@ mod tests {
         reg.assign("w1", assign("w1", 0, 16)).unwrap();
         reg.assign("w2", assign("w2", 16, 32)).unwrap();
 
-        reg.record_heartbeat("w1", 200);
-        reg.record_heartbeat("w2", 75);
+        reg.record_heartbeat("w1", 200, 0);
+        reg.record_heartbeat("w2", 75, 0);
 
         // Bottleneck is w2 with 75 free blocks
         assert_eq!(reg.min_free_blocks(), 75);
@@ -580,8 +589,8 @@ mod tests {
         reg.assign("w1", assign("w1", 0, 16)).unwrap();
         reg.assign("w2", assign("w2", 16, 32)).unwrap();
 
-        reg.record_heartbeat("w1", 200);
-        reg.record_heartbeat("w2", 10);
+        reg.record_heartbeat("w1", 200, 0);
+        reg.record_heartbeat("w2", 10, 0);
 
         // Mark the bottleneck as dead — should be excluded
         reg.mark_dead("w2");

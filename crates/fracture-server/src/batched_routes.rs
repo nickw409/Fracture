@@ -200,8 +200,34 @@ fn handle_streaming(
     is_completion: bool,
 ) -> Sse<impl futures_core::Stream<Item = std::result::Result<Event, Infallible>>> {
     state.dashboard.metrics.request_started();
+    let dashboard_for_stream = Arc::clone(&state.dashboard);
 
     let stream = async_stream::stream! {
+        // Guard: ensures active_requests is decremented even if the stream is dropped.
+        struct MetricsGuard(Arc<DashboardState>, bool);
+        impl Drop for MetricsGuard {
+            fn drop(&mut self) {
+                if !self.1 {
+                    // Stream dropped without completing — decrement active count.
+                    self.0.metrics.record_completion(&RequestRecord {
+                        id: String::new(),
+                        request_type: "chat",
+                        status: "cancelled",
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        time_to_first_token_ms: 0.0,
+                        total_duration_ms: 0.0,
+                        tokens_per_second: 0.0,
+                        finish_reason: "cancelled",
+                        temperature: 0.0,
+                        created_at: String::new(),
+                    });
+                }
+            }
+        }
+        let mut metrics_guard = MetricsGuard(dashboard_for_stream, false);
+
         let id = gen_id();
         let created = unix_timestamp();
         let model = LOADED_MODEL_NAME;
@@ -295,6 +321,7 @@ fn handle_streaming(
         };
         state.dashboard.metrics.record_completion(&record);
         state.dashboard.request_log.push(record);
+        metrics_guard.1 = true; // Mark as completed so drop guard doesn't double-decrement.
 
         yield Ok(Event::default().data("[DONE]"));
     };

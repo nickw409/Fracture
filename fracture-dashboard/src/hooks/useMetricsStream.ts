@@ -22,7 +22,9 @@ export function useMetricsStream(bufferSize = METRICS_BUFFER_SIZE) {
       return () => clearInterval(mockRef.current);
     }
 
-    const es = new EventSource('/v1/metrics/stream');
+    // Connect directly to the backend — SSE doesn't work reliably through Vite's proxy.
+    const base = import.meta.env.VITE_API_URL ?? `${window.location.protocol}//${window.location.hostname}:8080`;
+    const es = new EventSource(`${base}/v1/metrics/stream`);
 
     es.onopen = () => setConnected(true);
 

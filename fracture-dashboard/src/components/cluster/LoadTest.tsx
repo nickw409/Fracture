@@ -19,7 +19,7 @@ export default function LoadTest() {
           </button>
         ) : (
           <button
-            onClick={() => start(3000, 64)}
+            onClick={() => start(64)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-emerald-400/10 text-emerald-400 rounded-md hover:bg-emerald-400/20 transition-colors duration-150"
           >
             <Play size={12} /> Start

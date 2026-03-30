@@ -133,92 +133,61 @@ async fn main() -> Result<()> {
         model_config.vocab_size
     );
 
-    // Listen for worker connections
-    let listener = TcpListener::bind(&config.listen_address).await?;
-    let mut registry = PeerRegistry::new();
+    // Shared state — created before HTTP starts so dashboard is available immediately.
+    let registry = Arc::new(Mutex::new(PeerRegistry::new()));
+    let tokenizer = load_tokenizer(&config)?;
 
-    let timeout_duration = if config.acceptance_timeout_secs > 0 {
-        Some(Duration::from_secs(config.acceptance_timeout_secs))
-    } else {
-        None
-    };
-    tracing::info!(
-        "waiting for {} workers to register (timeout: {})...",
-        config.expected_workers,
-        timeout_duration.map_or("none".to_string(), |d| format!("{}s", d.as_secs()))
-    );
+    // Dashboard cluster snapshot via watch channel (starts empty, filled by worker acceptance).
+    use fracture_server::dashboard::dto::{ClusterResponse as DashboardClusterResponse, WorkerInfo as DashboardWorkerInfo};
+    let empty_cluster = build_cluster_snapshot(&registry, &model_config, config.max_seq_len).await;
+    let (cluster_tx, cluster_rx) = tokio::sync::watch::channel(empty_cluster);
 
-    let accept_start = std::time::Instant::now();
+    let dashboard_state = Arc::new(DashboardState {
+        metrics: Arc::new(MetricsCollector::new()),
+        request_log: Arc::new(RequestLog::new()),
+        cluster: ClusterProvider::Live(cluster_rx),
+        scheduler: None,
+    });
 
-    while registry.active_count() < config.expected_workers {
-        if let Some(timeout) = timeout_duration {
-            let elapsed = accept_start.elapsed();
-            if elapsed >= timeout {
-                anyhow::bail!(
-                    "timed out waiting for workers: got {}/{} after {}s",
-                    registry.active_count(),
-                    config.expected_workers,
-                    elapsed.as_secs()
-                );
-            }
-        }
+    // Pipeline watch channel — starts with an empty placeholder, replaced when workers connect.
+    let empty_pipeline = Arc::new(DistributedPipeline::empty(model_config.hidden_size));
+    let (pipeline_tx, pipeline_rx) = tokio::sync::watch::channel(Arc::clone(&empty_pipeline));
 
-        let accept_future = listener.accept();
-        let (stream, addr) = if let Some(timeout) = timeout_duration {
-            let remaining = timeout.saturating_sub(accept_start.elapsed());
-            match tokio::time::timeout(remaining, accept_future).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    anyhow::bail!(
-                        "timed out waiting for workers: got {}/{} after {}s",
-                        registry.active_count(),
-                        config.expected_workers,
-                        config.acceptance_timeout_secs
-                    );
-                }
-            }
-        } else {
-            accept_future.await?
-        };
-        tracing::info!("worker connected from {addr}");
-        let mut conn = FramedConnection::new(stream);
-
-        let (header, payload) = conn.recv().await?;
-        if header.msg_type != MessageType::Register {
-            tracing::warn!(
-                "expected Register from {addr}, got {:?} — dropping",
-                header.msg_type
-            );
-            continue;
-        }
-
-        let reg: RegisterPayload = FramedConnection::deserialize_payload(&payload)?;
-        tracing::info!(
-            "worker '{}' registered: {} ({:.1} GB available, decode={:.2} ms/layer)",
-            reg.node_id,
-            reg.gpu_model,
-            reg.gpu_memory_available as f64 / 1e9,
-            reg.decode_ms_per_layer
+    // Build HTTP router immediately.
+    use tower_http::cors::CorsLayer;
+    let router: Router = if config.batched {
+        tracing::info!("using batched scheduler loop (Phase 4)");
+        let handle = distributed_loop::start_distributed_loop(
+            Arc::clone(&empty_pipeline),
+            Arc::clone(&registry),
+            distributed_loop::DistributedLoopConfig::default(),
+            pipeline_rx,
         );
+        let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
+        create_batched_router(batched_state)
+    } else {
+        tracing::info!("using sequential distributed_generate");
+        let state = Arc::new(CoordState {
+            pipeline: Arc::clone(&empty_pipeline),
+            registry: Arc::clone(&registry),
+            seq_mgr: Arc::new(Mutex::new(SequenceStateManager::new())),
+            tokenizer,
+            max_seq_len: config.max_seq_len,
+        });
+        Router::new()
+            .route("/v1/completions", post(completions_handler))
+            .route("/v1/models", get(models_handler))
+            .route("/health", get(health_handler))
+            .with_state(state)
+            .merge(dashboard_routes(Arc::clone(&dashboard_state)))
+            .layer(CorsLayer::permissive())
+    };
 
-        let caps = WorkerCapabilities {
-            node_id: reg.node_id.clone(),
-            gpu_model: reg.gpu_model,
-            gpu_memory_available: reg.gpu_memory_available as usize,
-            compute_capability: reg.compute_capability,
-            decode_ms_per_layer: reg.decode_ms_per_layer,
-            prefill_ms_per_layer_128: reg.prefill_ms_per_layer_128,
-        };
+    // Start HTTP server immediately.
+    let http_addr = format!("0.0.0.0:{}", config.http_port);
+    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    tracing::info!("HTTP server listening on {}", http_listener.local_addr()?);
 
-        registry.register(caps, conn)?;
-    }
-
-    tracing::info!(
-        "all {} workers registered — running scheduler",
-        config.expected_workers
-    );
-
-    // Run scheduler
     let scheduling_mode = match config.scheduling_mode.as_str() {
         "auto" => SchedulingMode::Auto,
         "equal" => SchedulingMode::EqualSplit,
@@ -231,182 +200,56 @@ async fn main() -> Result<()> {
         }
     };
 
-    let scheduler_input = SchedulerInput {
-        model_config: model_config.clone(),
-        workers: registry.all_capabilities(),
-        coordinator_compute: None,
-        mode: scheduling_mode,
-        max_seq_len: config.max_seq_len,
-        hop_latency_ms: 2.0,
-    };
+    // Spawn worker acceptance + pipeline setup in the background.
+    let listener = TcpListener::bind(&config.listen_address).await?;
+    tracing::info!("listening for workers on {}", config.listen_address);
+    {
+        let registry = Arc::clone(&registry);
+        let model_config = model_config.clone();
+        let pipeline_tx = pipeline_tx.clone();
+        let cluster_tx_bg = cluster_tx.clone();
+        let expected_workers = config.expected_workers;
+        let max_seq_len = config.max_seq_len;
+        let acceptance_timeout_secs = config.acceptance_timeout_secs;
 
-    let schedule_result = scheduler::schedule(&scheduler_input)?;
+        tokio::spawn(async move {
+            if let Err(e) = accept_and_setup_pipeline(
+                &listener,
+                &registry,
+                &model_config,
+                scheduling_mode.clone(),
+                expected_workers,
+                max_seq_len,
+                acceptance_timeout_secs,
+                &pipeline_tx,
+            ).await {
+                tracing::error!("worker acceptance failed: {e}");
+                return;
+            }
 
-    tracing::info!("scheduler result:");
-    for a in &schedule_result.assignments {
-        tracing::info!(
-            "  {} → layers {:?} ({:?}), {:.1} ms/decode, {:.1} GB weights, {:.1} GB cache",
-            a.node_id,
-            a.layer_range,
-            a.role,
-            a.expected_decode_ms,
-            a.weight_memory_gb,
-            a.cache_memory_gb
-        );
-    }
-    tracing::info!(
-        "pipeline: {:.1} ms/token, imbalance={:.2}, bottleneck={}",
-        schedule_result.pipeline_decode_ms,
-        schedule_result.imbalance_ratio,
-        schedule_result.bottleneck_node
-    );
-    for ex in &schedule_result.excluded_nodes {
-        tracing::info!("  excluded: {} ({:?})", ex.node_id, ex.reason);
-    }
+            // Refresh cluster snapshot now that workers are ready.
+            let snap = build_cluster_snapshot(&registry, &model_config, max_seq_len).await;
+            let _ = cluster_tx_bg.send(snap);
 
-    // Send RegisterAck to each worker
-    for assignment in &schedule_result.assignments {
-        let ack = RegisterAckPayload {
-            layer_start: assignment.layer_range.start as u32,
-            layer_end: assignment.layer_range.end as u32,
-            total_layers: model_config.num_layers as u32,
-            max_seq_len: config.max_seq_len as u32,
-            model_config: model_config.clone(),
-        };
-        registry.assign(&assignment.node_id, assignment.clone())?;
-        let entry = registry.get_mut(&assignment.node_id).ok_or_else(|| {
-            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
-        })?;
-        entry
-            .connection
-            .send(MessageType::RegisterAck, 0, &ack)
-            .await?;
-        tracing::info!("sent RegisterAck to '{}'", assignment.node_id);
-    }
-
-    // Build distributed pipeline
-    let pipeline = DistributedPipeline::new(&schedule_result.assignments, model_config.hidden_size)?;
-    tracing::info!(
-        "distributed pipeline ready with {} stages",
-        pipeline.pipeline_order().len()
-    );
-
-    // Wait for all workers to finish weight loading and report ready.
-    tracing::info!("waiting for workers to finish weight loading...");
-    for assignment in &schedule_result.assignments {
-        let entry = registry.get_mut(&assignment.node_id).ok_or_else(|| {
-            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
-        })?;
-        let (header, _) = entry.connection.recv().await?;
-        if header.msg_type != MessageType::WorkerReady {
-            anyhow::bail!(
-                "expected WorkerReady from '{}', got {:?}",
-                assignment.node_id, header.msg_type
-            );
-        }
-        tracing::info!("worker '{}' ready", assignment.node_id);
-    }
-    tracing::info!("all workers ready");
-
-    // Load tokenizer
-    let tokenizer = load_tokenizer(&config)?;
-
-    let pipeline = Arc::new(pipeline);
-    let registry = Arc::new(Mutex::new(registry));
-
-    // Build dashboard state
-    let dashboard_state = Arc::new(DashboardState {
-        metrics: Arc::new(MetricsCollector::new()),
-        request_log: Arc::new(RequestLog::new()),
-        cluster: ClusterProvider::Standalone {
-            gpu_name: "distributed".to_string(),
-            vram_total_mb: 0,
-            vram_used_mb: 0,
-            model: DashboardModelInfo {
-                name: "llama-3-8b".to_string(),
-                parameters: "8B".to_string(),
-                layers: model_config.num_layers,
-                context_length: config.max_seq_len,
-                dtype: "FP16".to_string(),
-            },
-            total_layers: model_config.num_layers,
-        },
-        scheduler: None,
-    });
-
-    // Pipeline watch channel for fault-tolerant reconfiguration.
-    let (pipeline_tx, pipeline_rx) = tokio::sync::watch::channel(Arc::clone(&pipeline));
-
-    // Build HTTP router — either batched (Phase 4) or sequential.
-    use tower_http::cors::CorsLayer;
-    let router: Router = if config.batched {
-        tracing::info!("using batched scheduler loop (Phase 4)");
-        let handle = distributed_loop::start_distributed_loop(
-            Arc::clone(&pipeline),
-            Arc::clone(&registry),
-            distributed_loop::DistributedLoopConfig::default(),
-            pipeline_rx,
-        );
-        let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
-        create_batched_router(batched_state)
-    } else {
-        tracing::info!("using sequential distributed_generate");
-        let state = Arc::new(CoordState {
-            pipeline: Arc::clone(&pipeline),
-            registry: Arc::clone(&registry),
-            seq_mgr: Arc::new(Mutex::new(SequenceStateManager::new())),
-            tokenizer,
-            max_seq_len: config.max_seq_len,
+            // Periodic cluster snapshot refresh.
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let snap = build_cluster_snapshot(&registry, &model_config, max_seq_len).await;
+                if cluster_tx_bg.send(snap).is_err() {
+                    break;
+                }
+            }
         });
-        Router::new()
-            .route("/v1/completions", post(completions_handler))
-            .route("/v1/models", get(models_handler))
-            .route("/health", get(health_handler))
-            .with_state(state)
-            .merge(dashboard_routes(dashboard_state))
-            .layer(CorsLayer::permissive())
-    };
+    }
 
-    // Spawn reconnection listener — reuses the worker TCP listener so that
-    // workers that die and restart can reconnect and trigger reconfiguration.
-    let scheduling_mode_parsed = match config.scheduling_mode.as_str() {
-        "auto" => SchedulingMode::Auto,
-        _ => SchedulingMode::EqualSplit,
-    };
-    tokio::spawn(reconnection_listener(
-        listener,
-        Arc::clone(&registry),
-        model_config.clone(),
-        scheduling_mode_parsed.clone(),
-        config.max_seq_len,
-        pipeline_tx,
-    ));
-
-    // Start HTTP server
-    let http_addr = format!("0.0.0.0:{}", config.http_port);
-    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
-    tracing::info!("HTTP server listening on {}", http_listener.local_addr()?);
-
-    // Serve HTTP with graceful shutdown on ctrl-c
+    // Serve HTTP with graceful shutdown on ctrl-c.
     axum::serve(http_listener, router)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
             tracing::info!("shutting down...");
         })
         .await?;
-
-    // Send Shutdown to all workers
-    {
-        let mut reg = registry.lock().await;
-        for node_id in pipeline.pipeline_order() {
-            if let Some(entry) = reg.get_mut(node_id) {
-                let _ = entry
-                    .connection
-                    .send_empty(MessageType::Shutdown, 0)
-                    .await;
-            }
-        }
-    }
 
     tracing::info!("coordinator shut down");
     Ok(())
@@ -670,6 +513,244 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// Accept workers, run scheduler, set up pipeline, and broadcast via watch channel.
+async fn accept_and_setup_pipeline(
+    listener: &TcpListener,
+    registry: &Mutex<PeerRegistry>,
+    model_config: &fracture_core::ModelConfig,
+    scheduling_mode: SchedulingMode,
+    expected_workers: usize,
+    max_seq_len: usize,
+    acceptance_timeout_secs: u64,
+    pipeline_tx: &tokio::sync::watch::Sender<Arc<DistributedPipeline>>,
+) -> Result<()> {
+    let timeout_duration = if acceptance_timeout_secs > 0 {
+        Some(Duration::from_secs(acceptance_timeout_secs))
+    } else {
+        None
+    };
+    tracing::info!(
+        "waiting for {} workers to register (timeout: {})...",
+        expected_workers,
+        timeout_duration.map_or("none".to_string(), |d| format!("{}s", d.as_secs()))
+    );
+
+    let accept_start = std::time::Instant::now();
+
+    loop {
+        {
+            let reg = registry.lock().await;
+            if reg.active_count() >= expected_workers {
+                break;
+            }
+        }
+
+        if let Some(timeout) = timeout_duration {
+            if accept_start.elapsed() >= timeout {
+                let reg = registry.lock().await;
+                anyhow::bail!(
+                    "timed out waiting for workers: got {}/{} after {}s",
+                    reg.active_count(),
+                    expected_workers,
+                    timeout.as_secs()
+                );
+            }
+        }
+
+        let accept_future = listener.accept();
+        let (stream, addr) = if let Some(timeout) = timeout_duration {
+            let remaining = timeout.saturating_sub(accept_start.elapsed());
+            match tokio::time::timeout(remaining, accept_future).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let reg = registry.lock().await;
+                    anyhow::bail!(
+                        "timed out waiting for workers: got {}/{} after {}s",
+                        reg.active_count(),
+                        expected_workers,
+                        acceptance_timeout_secs
+                    );
+                }
+            }
+        } else {
+            accept_future.await?
+        };
+        tracing::info!("worker connected from {addr}");
+        let mut conn = FramedConnection::new(stream);
+
+        let (header, payload) = conn.recv().await?;
+        if header.msg_type != MessageType::Register {
+            tracing::warn!(
+                "expected Register from {addr}, got {:?} — dropping",
+                header.msg_type
+            );
+            continue;
+        }
+
+        let reg_msg: RegisterPayload = FramedConnection::deserialize_payload(&payload)?;
+        tracing::info!(
+            "worker '{}' registered: {} ({:.1} GB available, decode={:.2} ms/layer)",
+            reg_msg.node_id,
+            reg_msg.gpu_model,
+            reg_msg.gpu_memory_available as f64 / 1e9,
+            reg_msg.decode_ms_per_layer
+        );
+
+        let caps = WorkerCapabilities {
+            node_id: reg_msg.node_id.clone(),
+            gpu_model: reg_msg.gpu_model,
+            gpu_memory_available: reg_msg.gpu_memory_available as usize,
+            compute_capability: reg_msg.compute_capability,
+            decode_ms_per_layer: reg_msg.decode_ms_per_layer,
+            prefill_ms_per_layer_128: reg_msg.prefill_ms_per_layer_128,
+        };
+
+        let mut reg = registry.lock().await;
+        reg.register(caps, conn)?;
+    }
+
+    tracing::info!("all {} workers registered — running scheduler", expected_workers);
+
+    // Run scheduler.
+    let mut reg = registry.lock().await;
+    let scheduler_input = SchedulerInput {
+        model_config: model_config.clone(),
+        workers: reg.all_capabilities(),
+        coordinator_compute: None,
+        mode: scheduling_mode,
+        max_seq_len,
+        hop_latency_ms: 2.0,
+    };
+
+    let schedule_result = scheduler::schedule(&scheduler_input)?;
+
+    tracing::info!("scheduler result:");
+    for a in &schedule_result.assignments {
+        tracing::info!(
+            "  {} → layers {:?} ({:?}), {:.1} ms/decode, {:.1} GB weights, {:.1} GB cache",
+            a.node_id, a.layer_range, a.role, a.expected_decode_ms, a.weight_memory_gb, a.cache_memory_gb
+        );
+    }
+
+    // Send RegisterAck to each worker.
+    for assignment in &schedule_result.assignments {
+        let ack = RegisterAckPayload {
+            layer_start: assignment.layer_range.start as u32,
+            layer_end: assignment.layer_range.end as u32,
+            total_layers: model_config.num_layers as u32,
+            max_seq_len: max_seq_len as u32,
+            model_config: model_config.clone(),
+        };
+        reg.assign(&assignment.node_id, assignment.clone())?;
+        let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
+            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
+        })?;
+        entry.connection.send(MessageType::RegisterAck, 0, &ack).await?;
+        tracing::info!("sent RegisterAck to '{}'", assignment.node_id);
+    }
+
+    // Wait for WorkerReady from each.
+    tracing::info!("waiting for workers to finish weight loading...");
+    for assignment in &schedule_result.assignments {
+        let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
+            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
+        })?;
+        let (header, _) = entry.connection.recv().await?;
+        if header.msg_type != MessageType::WorkerReady {
+            anyhow::bail!(
+                "expected WorkerReady from '{}', got {:?}",
+                assignment.node_id, header.msg_type
+            );
+        }
+        tracing::info!("worker '{}' ready", assignment.node_id);
+    }
+
+    // Refresh last_heartbeat so workers aren't immediately marked dead
+    // by the distributed loop's heartbeat checker (which started earlier).
+    let now = std::time::Instant::now();
+    for assignment in &schedule_result.assignments {
+        if let Some(entry) = reg.get_mut(&assignment.node_id) {
+            entry.last_heartbeat = now;
+        }
+    }
+    drop(reg);
+
+    // Build pipeline and broadcast.
+    let pipeline = Arc::new(DistributedPipeline::new(
+        &schedule_result.assignments,
+        model_config.hidden_size,
+    )?);
+    tracing::info!("distributed pipeline ready with {} stages", pipeline.pipeline_order().len());
+    let _ = pipeline_tx.send(pipeline);
+
+    Ok(())
+}
+
+async fn build_cluster_snapshot(
+    registry: &Mutex<PeerRegistry>,
+    model_config: &fracture_core::ModelConfig,
+    max_seq_len: usize,
+) -> fracture_server::dashboard::dto::ClusterResponse {
+    use fracture_server::dashboard::dto::{
+        ClusterResponse as CR, ModelInfo as MI, WorkerInfo as WI,
+    };
+    let reg = registry.lock().await;
+    let order = reg.pipeline_order();
+    let workers: Vec<WI> = order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node_id)| {
+            let entry = reg.get(node_id)?;
+            let (layer_start, layer_end) = entry
+                .assignment
+                .as_ref()
+                .map(|a| (a.layer_range.start, a.layer_range.end.saturating_sub(1)))
+                .unwrap_or((0, 0));
+            let role = if i == 0 {
+                "head"
+            } else if i == order.len() - 1 {
+                "tail"
+            } else {
+                "middle"
+            };
+            let status = match entry.status {
+                fracture_coordinator::registry::WorkerStatus::Ready => "active",
+                fracture_coordinator::registry::WorkerStatus::Dead => "dead",
+                _ => "calibrating",
+            };
+            let vram_total_mb =
+                (entry.capabilities.gpu_memory_available / (1024 * 1024)) as u64;
+            let vram_used_mb = entry.gpu_memory_used / (1024 * 1024);
+            let heartbeat_age_ms = entry.last_heartbeat.elapsed().as_millis() as u64;
+            Some(WI {
+                id: i,
+                role,
+                address: entry.capabilities.node_id.clone(),
+                gpu: entry.capabilities.gpu_model.clone(),
+                vram_total_mb,
+                vram_used_mb,
+                layers: [layer_start, layer_end],
+                status,
+                last_heartbeat_ms: heartbeat_age_ms,
+                calibration_ms_per_layer: entry.capabilities.decode_ms_per_layer as f64,
+            })
+        })
+        .collect();
+    CR {
+        mode: "distributed",
+        num_workers: workers.len(),
+        workers,
+        scheduling_mode: "auto",
+        model: MI {
+            name: "llama-3-8b".to_string(),
+            parameters: "8B".to_string(),
+            layers: model_config.num_layers,
+            context_length: max_seq_len,
+            dtype: "FP16".to_string(),
+        },
+    }
 }
 
 fn error_json(message: &str) -> serde_json::Value {

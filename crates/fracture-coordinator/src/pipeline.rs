@@ -13,19 +13,19 @@ use fracture_core::{FractureError, Result};
 use fracture_protocol::{frame::{FrameHeader, MessageType}, messages::*, FramedConnection};
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// Receive the next message from a connection, skipping HeartbeatAck messages.
 ///
 /// The heartbeat task sends Heartbeat messages on the same connection used
 /// for Forward/CacheAlloc. Workers respond with HeartbeatAck in their serve
 /// loop, so acks can arrive interleaved with forward results. This helper
-/// transparently skips them.
+/// transparently skips them. Any successful recv (including skipped acks)
+/// proves the worker is alive, so the caller should update last_heartbeat.
 async fn recv_skipping_heartbeat_acks(conn: &mut FramedConnection) -> Result<(FrameHeader, Vec<u8>)> {
     loop {
         let (header, payload) = conn.recv().await?;
         if header.msg_type == MessageType::HeartbeatAck {
-            // Silently skip — the heartbeat tracker will detect missed acks
-            // via its own timeout mechanism.
             continue;
         }
         return Ok((header, payload));
@@ -59,6 +59,17 @@ impl std::fmt::Debug for DistributedPipeline {
 }
 
 impl DistributedPipeline {
+    /// Create an empty pipeline placeholder (no workers yet).
+    /// Used at coordinator startup before workers connect.
+    pub fn empty(hidden_size: usize) -> Self {
+        Self {
+            pipeline_order: Vec::new(),
+            hidden_size,
+            total_layers: 0,
+            allocated_seqs: Mutex::new(HashSet::new()),
+        }
+    }
+
     /// Create a new distributed pipeline from scheduler assignments.
     ///
     /// Validates that layer ranges are contiguous starting from 0 and cover
@@ -163,6 +174,7 @@ impl DistributedPipeline {
 
             // Wait for CacheAllocAck or Error from the worker
             let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
+            entry.last_heartbeat = Instant::now();
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
@@ -292,6 +304,7 @@ impl DistributedPipeline {
 
             // Receive ForwardResult
             let (header, payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
+            entry.last_heartbeat = Instant::now();
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&payload)?;
@@ -412,6 +425,7 @@ impl DistributedPipeline {
                 .await?;
 
             let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
+            entry.last_heartbeat = Instant::now();
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;

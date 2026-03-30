@@ -121,13 +121,17 @@ async fn distributed_loop_task(
             }
         }
 
-        // Send heartbeats periodically (inline, between batch iterations).
+        // Heartbeat: send pings and check for dead workers periodically.
         if last_heartbeat.elapsed() >= config.heartbeat_interval {
-            let dead_workers = send_heartbeat_round(
-                &registry,
-                &mut heartbeat_tracker,
-                config.heartbeat_max_missed,
-            ).await;
+            // Send heartbeats to all workers.
+            send_heartbeats(&registry).await;
+
+            // Poll all worker connections for acks (non-blocking).
+            // Any response (ack or otherwise) refreshes last_heartbeat on that worker.
+            poll_worker_acks(&registry).await;
+
+            let timeout = config.heartbeat_interval * config.heartbeat_max_missed as u32;
+            let dead_workers = check_dead_workers(&registry, timeout).await;
 
             if !dead_workers.is_empty() {
                 tracing::error!("dead workers detected: {dead_workers:?}");
@@ -191,12 +195,23 @@ async fn distributed_loop_task(
             tokio::select! {
                 req = request_rx.recv() => {
                     match req {
-                        Some(r) => pending.push(r),
+                        Some(r) => {
+                            // Refresh heartbeats when transitioning from idle to active.
+                            let mut reg = registry.lock().await;
+                            let now = Instant::now();
+                            for (_, entry) in reg.iter_mut() {
+                                if entry.status == fracture_coordinator::registry::WorkerStatus::Ready {
+                                    entry.last_heartbeat = now;
+                                }
+                            }
+                            drop(reg);
+                            pending.push(r);
+                        },
                         None => return,
                     }
                 }
                 _ = tokio::time::sleep_until(heartbeat_deadline.into()) => {
-                    // Heartbeat timer fired while idle — loop back to send heartbeat.
+                    // Heartbeat timer fired while idle — loop back to send heartbeat + poll acks.
                     continue;
                 }
                 _ = pipeline_rx.changed() => {
@@ -451,74 +466,59 @@ async fn distributed_loop_task(
     }
 }
 
-/// Send heartbeats to all workers, wait for acks, and check for dead ones.
-/// Returns the list of newly-dead worker node IDs.
-async fn send_heartbeat_round(
-    registry: &Mutex<PeerRegistry>,
-    tracker: &mut HeartbeatTracker,
-    max_missed: usize,
-) -> Vec<String> {
+/// Send heartbeat pings to all ready workers (best-effort, no ack waiting).
+async fn send_heartbeats(registry: &Mutex<PeerRegistry>) {
     let mut reg = registry.lock().await;
-
-    let nonce = rand::random::<u64>();
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
     let payload = HeartbeatPayload {
         timestamp_ns: now_ns,
-        nonce,
+        nonce: rand::random(),
     };
-    tracker.set_pending_nonce(nonce);
-
     let node_ids = reg.pipeline_order();
-
-    // Send heartbeats (best-effort).
     for node_id in &node_ids {
         if let Some(entry) = reg.get_mut(node_id) {
-            if let Err(e) = entry.connection.send(MessageType::Heartbeat, 0, &payload).await {
-                tracing::warn!("heartbeat send to '{node_id}' failed: {e}");
-            }
+            let _ = entry.connection.send(MessageType::Heartbeat, 0, &payload).await;
         }
     }
+}
 
-    // Wait for acks with a timeout, then process them.
-    let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let mut acks_received = 0usize;
-
-    while acks_received < node_ids.len() {
-        // Try to recv an ack from each worker that hasn't responded yet.
-        let mut got_one = false;
-        for node_id in &node_ids {
-            if let Some(entry) = reg.get_mut(node_id) {
-                match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    entry.connection.recv(),
-                ).await {
-                    Ok(Ok((header, payload_bytes))) => {
-                        if header.msg_type == MessageType::HeartbeatAck {
-                            if let Ok(ack) = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload_bytes) {
-                                tracker.process_ack(&mut reg, node_id, &ack);
-                                acks_received += 1;
-                                got_one = true;
-                            }
+/// Non-blocking poll of all worker connections for any pending messages.
+/// Any successful recv proves the worker is alive and refreshes last_heartbeat.
+/// HeartbeatAck payloads are parsed to extract gpu_memory_used and free_blocks.
+async fn poll_worker_acks(registry: &Mutex<PeerRegistry>) {
+    let mut reg = registry.lock().await;
+    let node_ids = reg.pipeline_order();
+    for node_id in &node_ids {
+        if let Some(entry) = reg.get_mut(node_id) {
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                entry.connection.recv(),
+            ).await {
+                Ok(Ok((header, payload))) => {
+                    entry.last_heartbeat = Instant::now();
+                    if header.msg_type == MessageType::HeartbeatAck {
+                        if let Ok(ack) = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload) {
+                            entry.free_blocks = ack.free_blocks;
+                            entry.gpu_memory_used = ack.gpu_memory_used;
                         }
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("heartbeat ack recv from '{node_id}' failed: {e}");
-                    }
-                    Err(_) => {} // timeout, try next worker
                 }
+                _ => {}
             }
         }
-        if !got_one || tokio::time::Instant::now() >= ack_deadline {
-            break;
-        }
     }
+}
 
-    // Increment missed counters for workers that didn't respond and detect dead ones.
-    let timed_out = tracker.increment_missed(&node_ids, max_missed);
-    heartbeat::mark_dead_workers(&mut reg, &timed_out);
-
-    timed_out
+/// Check for dead workers based on elapsed time since last successful communication.
+async fn check_dead_workers(
+    registry: &Mutex<PeerRegistry>,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut reg = registry.lock().await;
+    let dead = reg.check_heartbeats(timeout);
+    heartbeat::mark_dead_workers(&mut reg, &dead);
+    dead
 }

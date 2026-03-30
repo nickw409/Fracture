@@ -26,6 +26,9 @@ pub enum ClusterProvider {
         model: ModelInfo,
         total_layers: usize,
     },
+    /// Live cluster state updated externally (e.g., by the coordinator's heartbeat loop).
+    /// The watch receiver always has the latest snapshot.
+    Live(tokio::sync::watch::Receiver<ClusterResponse>),
 }
 
 /// Shared state for all dashboard endpoints.
@@ -85,6 +88,7 @@ async fn cluster_handler(
             scheduling_mode: "auto",
             model: model.clone(),
         },
+        ClusterProvider::Live(rx) => rx.borrow().clone(),
     };
 
     (StatusCode::OK, Json(response))
@@ -134,9 +138,9 @@ async fn metrics_stream_handler(
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            // Pull real cache utilization from scheduler if available.
-            let kv_util = if let Some(ref handle) = state.scheduler {
-                handle.snapshot().await
+            // Pull cache utilization from scheduler snapshot or cluster data.
+            let (kv_util, heartbeats) = if let Some(ref handle) = state.scheduler {
+                let util = handle.snapshot().await
                     .map(|s| {
                         if s.total_blocks > 0 {
                             (s.total_blocks - s.free_blocks) as f64 / s.total_blocks as f64
@@ -144,11 +148,18 @@ async fn metrics_stream_handler(
                             0.0
                         }
                     })
-                    .unwrap_or(0.0)
+                    .unwrap_or(0.0);
+                (util, vec![0])
+            } else if let ClusterProvider::Live(ref rx) = state.cluster {
+                let cluster = rx.borrow();
+                let heartbeats: Vec<u64> = cluster.workers.iter().map(|w| w.last_heartbeat_ms).collect();
+                // TODO: pipe free_blocks from heartbeat acks for real cache utilization.
+                // For now report 0 — VRAM usage is misleading (includes model weights).
+                (0.0, heartbeats)
             } else {
-                0.0
+                (0.0, vec![0])
             };
-            let snapshot = state.metrics.snapshot(kv_util, vec![0]);
+            let snapshot = state.metrics.snapshot(kv_util, heartbeats);
             let data = serde_json::to_string(&snapshot).unwrap_or_default();
             yield Ok::<_, Infallible>(Event::default().data(data));
         }
