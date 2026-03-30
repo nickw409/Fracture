@@ -39,7 +39,7 @@ mod distributed_loop;
 
 /// Shared state for the coordinator's HTTP handlers.
 struct CoordState {
-    pipeline: Arc<DistributedPipeline>,
+    pipeline_rx: tokio::sync::watch::Receiver<Arc<DistributedPipeline>>,
     registry: Arc<Mutex<PeerRegistry>>,
     seq_mgr: Arc<Mutex<SequenceStateManager>>,
     tokenizer: Tokenizer,
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!("using sequential distributed_generate");
         let state = Arc::new(CoordState {
-            pipeline: Arc::clone(&empty_pipeline),
+            pipeline_rx: pipeline_rx,
             registry: Arc::clone(&registry),
             seq_mgr: Arc::new(Mutex::new(SequenceStateManager::new())),
             tokenizer,
@@ -212,6 +212,7 @@ async fn main() -> Result<()> {
         let max_seq_len = config.max_seq_len;
         let acceptance_timeout_secs = config.acceptance_timeout_secs;
 
+        let scheduling_mode_for_recon = scheduling_mode.clone();
         tokio::spawn(async move {
             if let Err(e) = accept_and_setup_pipeline(
                 &listener,
@@ -230,6 +231,17 @@ async fn main() -> Result<()> {
             // Refresh cluster snapshot now that workers are ready.
             let snap = build_cluster_snapshot(&registry, &model_config, max_seq_len).await;
             let _ = cluster_tx_bg.send(snap);
+
+            // Spawn reconnection listener — reuses the worker TCP listener so
+            // that workers that die and restart can reconnect.
+            tokio::spawn(reconnection_listener(
+                listener,
+                Arc::clone(&registry),
+                model_config.clone(),
+                scheduling_mode_for_recon,
+                max_seq_len,
+                pipeline_tx,
+            ));
 
             // Periodic cluster snapshot refresh.
             let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -319,8 +331,9 @@ async fn completions_handler(
     }
 
     // Run generation through the distributed pipeline
+    let pipeline = state.pipeline_rx.borrow().clone();
     let result = distributed_generate(
-        &state.pipeline,
+        &pipeline,
         &state.registry,
         &state.seq_mgr,
         &prompt_tokens,
@@ -921,23 +934,112 @@ async fn reconnection_listener(
 
         {
             let mut reg = registry.lock().await;
+            // Mark the old entry as dead so re-registration succeeds.
+            // The worker may reconnect before the heartbeat detects the death.
+            reg.mark_dead(&reg_payload.node_id);
             if let Err(e) = reg.register(caps, conn) {
                 tracing::error!("failed to re-register '{}': {e}", reg_payload.node_id);
                 continue;
             }
         }
 
-        // Trigger reconfiguration with the new worker included.
-        if let Err(e) = reconfigure_pipeline(
-            &registry,
-            &model_config,
-            scheduling_mode.clone(),
-            max_seq_len,
-            &pipeline_tx,
-        )
-        .await
+        // Re-run scheduler, send RegisterAck to the fresh worker (it expects
+        // RegisterAck, not Reconfigure, since it just sent Register).
+        // Any already-running workers get Reconfigure.
+        let result = {
+            let mut reg = registry.lock().await;
+            let caps = reg.all_capabilities();
+            if caps.is_empty() {
+                tracing::error!("no workers available after re-registration");
+                continue;
+            }
+            let input = scheduler::SchedulerInput {
+                model_config: model_config.clone(),
+                workers: caps,
+                coordinator_compute: None,
+                mode: scheduling_mode.clone(),
+                max_seq_len,
+                hop_latency_ms: 2.0,
+            };
+            match scheduler::schedule(&input) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("scheduler failed after reconnect: {e}");
+                    continue;
+                }
+            }
+        };
+
+        tracing::info!("new schedule after reconnect:");
+        for a in &result.assignments {
+            tracing::info!("  {} → layers {:?} ({:?})", a.node_id, a.layer_range, a.role);
+        }
+
+        // Send RegisterAck to the reconnecting worker (fresh process expects RegisterAck).
+        let mut all_ok = true;
         {
-            tracing::error!("reconfiguration after reconnect failed: {e}");
+            let mut reg = registry.lock().await;
+            for assignment in &result.assignments {
+                let ack = RegisterAckPayload {
+                    layer_start: assignment.layer_range.start as u32,
+                    layer_end: assignment.layer_range.end as u32,
+                    total_layers: model_config.num_layers as u32,
+                    max_seq_len: max_seq_len as u32,
+                    model_config: model_config.clone(),
+                };
+                reg.assign(&assignment.node_id, assignment.clone()).ok();
+                if let Some(entry) = reg.get_mut(&assignment.node_id) {
+                    // Fresh workers get RegisterAck, already-running workers get Reconfigure.
+                    let msg_type = if assignment.node_id == reg_payload.node_id {
+                        MessageType::RegisterAck
+                    } else {
+                        MessageType::Reconfigure
+                    };
+                    if let Err(e) = entry.connection.send(msg_type, 0, &ack).await {
+                        tracing::error!("failed to send to '{}': {e}", assignment.node_id);
+                        all_ok = false;
+                    }
+                }
+            }
+        }
+
+        if !all_ok {
+            tracing::error!("reconfiguration after reconnect partially failed");
+            continue;
+        }
+
+        // Wait for WorkerReady from all workers.
+        {
+            let mut reg = registry.lock().await;
+            for assignment in &result.assignments {
+                if let Some(entry) = reg.get_mut(&assignment.node_id) {
+                    match entry.connection.recv().await {
+                        Ok((header, _)) if header.msg_type == MessageType::WorkerReady => {
+                            tracing::info!("worker '{}' ready after reconnect", assignment.node_id);
+                        }
+                        Ok((header, _)) => {
+                            tracing::error!(
+                                "expected WorkerReady from '{}', got {:?}",
+                                assignment.node_id, header.msg_type
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("recv from '{}' failed: {e}", assignment.node_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build new pipeline and broadcast.
+        match DistributedPipeline::new(&result.assignments, model_config.hidden_size) {
+            Ok(new_pipeline) => {
+                let _ = pipeline_tx.send(Arc::new(new_pipeline));
+                tracing::info!("pipeline reconfigured after worker reconnection");
+            }
+            Err(e) => {
+                tracing::error!("failed to build pipeline after reconnect: {e}");
+            }
         }
     }
 }
