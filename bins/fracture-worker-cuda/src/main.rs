@@ -20,6 +20,8 @@ use fracture_protocol::{
     tensor::{make_header, wire_to_dtype},
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
@@ -266,6 +268,21 @@ async fn main() -> Result<()> {
         };
     }
 
+    // SIGTERM handler: set flag so serve loop can send LeaveIntent gracefully.
+    let leave_requested = Arc::new(AtomicBool::new(false));
+    let leave_flag = Arc::clone(&leave_requested);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                sigterm.recv().await;
+                tracing::info!("received SIGTERM — requesting graceful leave");
+                leave_flag.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+
     // Outer loop: cycles between serving and reconnection until Exited.
     while state != WorkerState::Exited {
 
@@ -274,6 +291,22 @@ async fn main() -> Result<()> {
         if state != WorkerState::Ready {
             break;
         }
+
+        // Check for graceful leave request (SIGTERM).
+        if leave_requested.load(Ordering::SeqCst) {
+            tracing::info!("sending LeaveIntent to coordinator");
+            let payload = LeaveIntentPayload {
+                reason: "SIGTERM received".into(),
+            };
+            if let Err(e) = conn.send(MessageType::LeaveIntent, 0, &payload).await {
+                tracing::error!("failed to send LeaveIntent: {e}");
+                state = WorkerState::DisconnectedStandby;
+                break;
+            }
+            // Continue serving until coordinator sends Shutdown.
+            leave_requested.store(false, Ordering::SeqCst);
+        }
+
         let (header, payload) = match conn.recv().await {
             Ok(frame) => frame,
             Err(e) => {

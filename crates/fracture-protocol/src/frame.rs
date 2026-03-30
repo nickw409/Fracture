@@ -53,6 +53,8 @@ pub enum MessageType {
     Reconfigure = 0x0F,
     /// Worker re-registration after reconnection (carries current state).
     ReRegister = 0x14,
+    /// Worker announces intent to leave the cluster gracefully.
+    LeaveIntent = 0x15,
 }
 
 impl MessageType {
@@ -74,6 +76,7 @@ impl MessageType {
             0x0E => Ok(Self::WorkerReady),
             0x0F => Ok(Self::Reconfigure),
             0x14 => Ok(Self::ReRegister),
+            0x15 => Ok(Self::LeaveIntent),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -181,6 +184,7 @@ mod tests {
             MessageType::WorkerReady,
             MessageType::Reconfigure,
             MessageType::ReRegister,
+            MessageType::LeaveIntent,
         ];
         for mt in types {
             let v = mt as u8;

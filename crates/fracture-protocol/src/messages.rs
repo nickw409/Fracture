@@ -178,6 +178,15 @@ pub struct ReRegisterPayload {
     pub active_cache_seq_ids: Vec<u64>,
 }
 
+// ── 0x15 LeaveIntent (Worker → Coordinator) ─────────────────────────────
+
+/// Worker announces intent to leave the cluster gracefully.
+/// The coordinator will drain work from this worker before removing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveIntentPayload {
+    pub reason: String,
+}
+
 // ── 0x0A Error (Bidirectional) ──────────────────────────────────────────
 
 /// Error codes for the Error message type.

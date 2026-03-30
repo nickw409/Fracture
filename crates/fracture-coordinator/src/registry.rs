@@ -15,6 +15,8 @@ pub enum WorkerStatus {
     Connected,
     /// Assigned layers and ready to serve.
     Ready,
+    /// Worker has announced intent to leave; no new work should be scheduled to it.
+    Draining,
     /// Missed too many heartbeats.
     Dead,
 }
@@ -141,6 +143,16 @@ impl PeerRegistry {
     pub fn mark_dead(&mut self, node_id: &str) {
         if let Some(entry) = self.workers.get_mut(node_id) {
             entry.status = WorkerStatus::Dead;
+        }
+    }
+
+    /// Mark a worker as draining (intent to leave). No new work should be
+    /// scheduled to this worker, but existing sequences continue until complete.
+    pub fn mark_draining(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            if entry.status == WorkerStatus::Ready {
+                entry.status = WorkerStatus::Draining;
+            }
         }
     }
 

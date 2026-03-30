@@ -145,11 +145,21 @@ async fn distributed_loop_task(
                 let acks = poll_worker_acks_concurrent(&reader_handles).await;
 
                 // Process acks through the tracker (validates nonce, resets missed count).
+                // Also detect any LeaveIntent messages.
+                let mut leaving_workers: Vec<String> = Vec::new();
                 {
                     let mut reg = registry.lock().await;
-                    for (node_id, ack) in &acks {
-                        if let Some(ack) = ack {
-                            tracker.process_ack(&mut reg, node_id, ack);
+                    for (node_id, poll) in &acks {
+                        match poll {
+                            PollResult::Ack(ack) => {
+                                tracker.process_ack(&mut reg, node_id, ack);
+                            }
+                            PollResult::LeaveIntent => {
+                                tracing::info!("worker '{}' sent LeaveIntent — marking as draining", node_id);
+                                reg.mark_draining(node_id);
+                                leaving_workers.push(node_id.clone());
+                            }
+                            PollResult::Nothing => {}
                         }
                     }
                 }
@@ -234,6 +244,56 @@ async fn distributed_loop_task(
             tracker.set_pending_nonce(nonce);
 
             last_heartbeat = Instant::now();
+        }
+
+        // Handle draining workers: when all active sequences complete, send
+        // Shutdown to draining workers and rebalance with remaining workers.
+        if active.is_empty() && !pipeline_degraded {
+            let draining_workers: Vec<String> = {
+                let reg = registry.lock().await;
+                reg.iter()
+                    .filter(|(_, e)| e.status == fracture_coordinator::registry::WorkerStatus::Draining)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            if !draining_workers.is_empty() {
+                tracing::info!("draining workers ready to leave: {draining_workers:?}");
+                // Send Shutdown to draining workers.
+                {
+                    let mut reg = registry.lock().await;
+                    for node_id in &draining_workers {
+                        if let Some(entry) = reg.get_mut(node_id) {
+                            let _ = entry.writer.send_empty(MessageType::Shutdown, 0).await;
+                        }
+                        reg.mark_dead(node_id);
+                    }
+                }
+                // Rebalance with remaining workers.
+                if let Some(ref model_cfg) = config.model_config {
+                    match fracture_coordinator::rebalance::forced_rebalance(
+                        &registry,
+                        &pipeline,
+                        model_cfg,
+                        &config.scheduling_mode,
+                        config.max_seq_len,
+                        &draining_workers,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            pipeline = result.pipeline;
+                            tracing::info!(
+                                "rebalanced after graceful leave: {} stages",
+                                pipeline.pipeline_order().len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("rebalance after graceful leave failed: {e}");
+                            pipeline_degraded = true;
+                        }
+                    }
+                }
+            }
         }
 
         // If pipeline is degraded, reject new requests until reconfigured.
@@ -547,13 +607,19 @@ async fn send_heartbeats(registry: &Mutex<PeerRegistry>) -> u64 {
     nonce
 }
 
-/// Poll all worker readers concurrently for heartbeat acks.
+/// Result of polling a single worker during heartbeat phase.
+enum PollResult {
+    Ack(HeartbeatAckPayload),
+    LeaveIntent,
+    Nothing,
+}
+
+/// Poll all worker readers concurrently for heartbeat acks and leave intents.
 ///
-/// Each reader is polled independently with a short timeout. Returns
-/// `(node_id, Option<HeartbeatAckPayload>)` for each worker.
+/// Each reader is polled independently with a short timeout.
 async fn poll_worker_acks_concurrent(
     reader_handles: &[(String, Arc<tokio::sync::Mutex<FramedReader>>)],
-) -> Vec<(String, Option<HeartbeatAckPayload>)> {
+) -> Vec<(String, PollResult)> {
     let mut set = tokio::task::JoinSet::new();
 
     for (node_id, reader) in reader_handles {
@@ -566,15 +632,23 @@ async fn poll_worker_acks_concurrent(
             })
             .await;
 
-            let ack = match result {
+            let poll = match result {
                 Ok(Ok((header, payload)))
                     if header.msg_type == MessageType::HeartbeatAck =>
                 {
-                    FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok()
+                    match FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload) {
+                        Ok(ack) => PollResult::Ack(ack),
+                        Err(_) => PollResult::Nothing,
+                    }
                 }
-                _ => None,
+                Ok(Ok((header, _)))
+                    if header.msg_type == MessageType::LeaveIntent =>
+                {
+                    PollResult::LeaveIntent
+                }
+                _ => PollResult::Nothing,
             };
-            (node_id, ack)
+            (node_id, poll)
         });
     }
 
