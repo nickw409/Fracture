@@ -639,12 +639,41 @@ async fn main() -> Result<()> {
                                 tracing::info!(
                                     "coordinator promotion successful: listening on {addr}"
                                 );
-                                // FT-12b will handle state reconstruction here:
-                                // accept ReRegister from other workers, rebuild pipeline,
-                                // start HTTP server and scheduler loop.
-                                // For now, just hold the listener open.
-                                drop(listener);
-                                // Stay in standby — full promotion logic in FT-12b.
+
+                                // Reconstruct state from peer workers (FT-12b).
+                                let self_caps = WorkerCapabilities {
+                                    node_id: node_id.clone(),
+                                    gpu_model: node.engine().backend().device_name().to_string(),
+                                    gpu_memory_available: node.engine().backend().available_memory(),
+                                    compute_capability: (0, 0),
+                                    decode_ms_per_layer: decode_ms,
+                                    prefill_ms_per_layer_128: prefill_ms,
+                                };
+                                let peer_count = cluster_manifest.as_ref()
+                                    .map(|m| m.nodes.iter().filter(|n| n.node_id != node_id).count())
+                                    .unwrap_or(0);
+
+                                match reconstruct_state(
+                                    &listener,
+                                    &node_id,
+                                    self_caps,
+                                    &config,
+                                    ack.max_seq_len as usize,
+                                    peer_count,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                                {
+                                    Ok((_pipeline, _registry)) => {
+                                        tracing::info!("state reconstruction complete — coordinator ready");
+                                        // Full HTTP server and scheduler loop startup
+                                        // would go here. For now, the pipeline is built
+                                        // and peers are connected.
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("state reconstruction failed: {e}");
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("coordinator promotion failed: {e}");
@@ -1030,6 +1059,10 @@ fn run_calibration(
     Ok((decode_avg, prefill_avg))
 }
 
+use fracture_coordinator::pipeline::DistributedPipeline;
+use fracture_coordinator::registry::PeerRegistry;
+use fracture_coordinator::scheduler::{self, WorkerCapabilities, SchedulerInput, SchedulingMode};
+
 /// Promote this worker to coordinator (FT-12).
 ///
 /// Spawns coordinator tasks alongside existing worker tasks:
@@ -1061,4 +1094,183 @@ async fn promote_to_coordinator(
     // because we need the pipeline to be rebuilt before we can serve requests.
 
     Ok((listener, local_addr))
+}
+
+/// Reconstruct coordinator state from worker registrations (FT-12b).
+///
+/// The newly promoted coordinator:
+/// 1. Registers itself in a fresh PeerRegistry
+/// 2. Accepts ReRegister from other workers (with timeout)
+/// 3. Runs the scheduler to assign layers
+/// 4. Builds a DistributedPipeline
+///
+/// Returns the pipeline and registry for the scheduler loop.
+async fn reconstruct_state(
+    listener: &tokio::net::TcpListener,
+    self_node_id: &str,
+    self_caps: WorkerCapabilities,
+    model_config: &fracture_core::ModelConfig,
+    max_seq_len: usize,
+    expected_peers: usize,
+    timeout: Duration,
+) -> Result<(Arc<DistributedPipeline>, Arc<tokio::sync::Mutex<PeerRegistry>>)> {
+    let registry = Arc::new(tokio::sync::Mutex::new(PeerRegistry::new()));
+
+    // Register self as a worker in the registry (we're both coordinator and worker).
+    // We don't have a FramedConnection to ourselves, so we can't use the normal
+    // register() path. Instead we'll handle self-assignment separately after scheduling.
+    tracing::info!("state reconstruction: expecting {} peer workers", expected_peers);
+
+    let mut peer_count = 0;
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while peer_count < expected_peers {
+        let remaining = deadline - tokio::time::Instant::now();
+        if remaining.is_zero() {
+            tracing::warn!(
+                "state reconstruction timeout: got {}/{} peers",
+                peer_count, expected_peers
+            );
+            break;
+        }
+
+        let accept = tokio::time::timeout(remaining, listener.accept()).await;
+        match accept {
+            Ok(Ok((stream, addr))) => {
+                let mut conn = FramedConnection::new(stream);
+                match conn.recv().await {
+                    Ok((header, payload)) if header.msg_type == MessageType::ReRegister => {
+                        let rereg: ReRegisterPayload =
+                            FramedConnection::deserialize_payload(&payload)?;
+                        tracing::info!(
+                            "peer '{}' re-registered from {addr}: layers {:?}",
+                            rereg.node_id,
+                            rereg.current_layer_start.zip(rereg.current_layer_end),
+                        );
+                        let caps = WorkerCapabilities {
+                            node_id: rereg.node_id.clone(),
+                            gpu_model: rereg.gpu_model,
+                            gpu_memory_available: rereg.gpu_memory_available as usize,
+                            compute_capability: rereg.compute_capability,
+                            decode_ms_per_layer: rereg.decode_ms_per_layer,
+                            prefill_ms_per_layer_128: rereg.prefill_ms_per_layer_128,
+                        };
+                        let mut reg = registry.lock().await;
+                        reg.register(caps, conn)?;
+                        peer_count += 1;
+                    }
+                    Ok((header, _)) => {
+                        tracing::warn!(
+                            "expected ReRegister from {addr}, got {:?}",
+                            header.msg_type
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to read from {addr}: {e}");
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!("accept error during reconstruction: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "state reconstruction timeout: got {}/{} peers",
+                    peer_count, expected_peers
+                );
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "state reconstruction: {} peers registered, running scheduler",
+        peer_count
+    );
+
+    // Run scheduler with all workers (self + peers).
+    let mut all_caps = {
+        let reg = registry.lock().await;
+        reg.all_capabilities()
+    };
+    all_caps.push(self_caps);
+
+    let input = SchedulerInput {
+        model_config: model_config.clone(),
+        workers: all_caps,
+        coordinator_compute: None,
+        mode: SchedulingMode::Auto,
+        max_seq_len,
+        hop_latency_ms: 2.0,
+    };
+    let result = scheduler::schedule(&input)?;
+
+    tracing::info!("state reconstruction: schedule computed");
+    for a in &result.assignments {
+        tracing::info!("  {} → layers {:?} ({:?})", a.node_id, a.layer_range, a.role);
+    }
+
+    // Send RegisterAck to peers (assignment unchanged → skip weight reload,
+    // assignment changed → Reconfigure).
+    {
+        let mut reg = registry.lock().await;
+        for assignment in &result.assignments {
+            if assignment.node_id == self_node_id {
+                continue; // Self — handled separately
+            }
+            let ack = RegisterAckPayload {
+                layer_start: assignment.layer_range.start as u32,
+                layer_end: assignment.layer_range.end as u32,
+                total_layers: model_config.num_layers as u32,
+                max_seq_len: max_seq_len as u32,
+                model_config: model_config.clone(),
+            };
+            reg.assign(&assignment.node_id, assignment.clone()).ok();
+            if let Some(entry) = reg.get_mut(&assignment.node_id) {
+                // Use RegisterAck for now — workers will determine if they need
+                // to reconfigure based on whether the assignment matches.
+                if let Err(e) = entry.writer.send(MessageType::RegisterAck, 0, &ack).await {
+                    tracing::error!("failed to send to '{}': {e}", assignment.node_id);
+                }
+            }
+        }
+    }
+
+    // Wait for WorkerReady from peers.
+    {
+        let reg = registry.lock().await;
+        for assignment in &result.assignments {
+            if assignment.node_id == self_node_id {
+                continue;
+            }
+            if let Some(entry) = reg.get(&assignment.node_id) {
+                match entry.reader.lock().await.recv().await {
+                    Ok((hdr, _)) if hdr.msg_type == MessageType::WorkerReady => {
+                        tracing::info!("peer '{}' ready", assignment.node_id);
+                    }
+                    Ok((hdr, _)) => {
+                        tracing::error!(
+                            "expected WorkerReady from '{}', got {:?}",
+                            assignment.node_id, hdr.msg_type
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("recv from '{}' failed: {e}", assignment.node_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build pipeline.
+    let pipeline = Arc::new(DistributedPipeline::new(
+        &result.assignments,
+        model_config.hidden_size,
+    )?);
+    tracing::info!(
+        "state reconstruction complete: {} pipeline stages",
+        pipeline.pipeline_order().len()
+    );
+
+    Ok((pipeline, registry))
 }
