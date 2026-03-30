@@ -246,8 +246,7 @@ async fn distributed_loop_task(
             last_heartbeat = Instant::now();
         }
 
-        // Handle draining workers: when all active sequences complete, send
-        // Shutdown to draining workers and rebalance with remaining workers.
+        // Handle draining/pending workers when all active sequences complete.
         if active.is_empty() && !pipeline_degraded {
             let draining_workers: Vec<String> = {
                 let reg = registry.lock().await;
@@ -256,9 +255,21 @@ async fn distributed_loop_task(
                     .map(|(id, _)| id.clone())
                     .collect()
             };
-            if !draining_workers.is_empty() {
-                tracing::info!("draining workers ready to leave: {draining_workers:?}");
-                // Send Shutdown to draining workers.
+            let pending_workers: Vec<String> = {
+                let reg = registry.lock().await;
+                reg.pending_workers()
+            };
+            let needs_rebalance = !draining_workers.is_empty() || !pending_workers.is_empty();
+
+            if needs_rebalance {
+                if !draining_workers.is_empty() {
+                    tracing::info!("draining workers ready to leave: {draining_workers:?}");
+                }
+                if !pending_workers.is_empty() {
+                    tracing::info!("pending workers ready to join: {pending_workers:?}");
+                }
+
+                // Send Shutdown to draining workers and mark them dead.
                 {
                     let mut reg = registry.lock().await;
                     for node_id in &draining_workers {
@@ -268,7 +279,8 @@ async fn distributed_loop_task(
                         reg.mark_dead(node_id);
                     }
                 }
-                // Rebalance with remaining workers.
+
+                // Rebalance: exclude draining (now dead) workers, include pending workers.
                 if let Some(ref model_cfg) = config.model_config {
                     match fracture_coordinator::rebalance::forced_rebalance(
                         &registry,
@@ -283,12 +295,14 @@ async fn distributed_loop_task(
                         Ok(result) => {
                             pipeline = result.pipeline;
                             tracing::info!(
-                                "rebalanced after graceful leave: {} stages",
+                                "rebalanced (leave: {}, join: {}): {} stages",
+                                draining_workers.len(),
+                                pending_workers.len(),
                                 pipeline.pipeline_order().len()
                             );
                         }
                         Err(e) => {
-                            tracing::error!("rebalance after graceful leave failed: {e}");
+                            tracing::error!("rebalance failed: {e}");
                             pipeline_degraded = true;
                         }
                     }

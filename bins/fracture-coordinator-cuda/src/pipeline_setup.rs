@@ -357,17 +357,35 @@ pub async fn reconnection_listener(
             }
         };
 
+        // Check if this is a truly new worker (never seen before) or a reconnection.
+        let is_new_worker = {
+            let reg = registry.lock().await;
+            reg.get(&node_id).is_none()
+        };
+
         {
             let mut reg = registry.lock().await;
-            // Mark the old entry as dead so re-registration succeeds.
-            reg.mark_dead(&node_id);
+            if !is_new_worker {
+                // Mark the old entry as dead so re-registration succeeds.
+                reg.mark_dead(&node_id);
+            }
             if let Err(e) = reg.register(caps, conn) {
-                tracing::error!("failed to re-register '{}': {e}", node_id);
+                tracing::error!("failed to register '{}': {e}", node_id);
+                continue;
+            }
+            // New workers are held in Pending state until the distributed loop
+            // incorporates them via graceful rebalance.
+            if is_new_worker {
+                reg.mark_pending(&node_id);
+                tracing::info!(
+                    "new worker '{}' registered as Pending — will join pipeline after current sequences drain",
+                    node_id
+                );
                 continue;
             }
         }
 
-        // Re-run scheduler to get current assignments.
+        // Reconnecting worker: re-run scheduler and reconfigure immediately.
         let result = {
             let reg = registry.lock().await;
             let all_caps = reg.all_capabilities();

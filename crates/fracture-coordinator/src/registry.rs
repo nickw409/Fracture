@@ -17,6 +17,8 @@ pub enum WorkerStatus {
     Ready,
     /// Worker has announced intent to leave; no new work should be scheduled to it.
     Draining,
+    /// New worker waiting to be incorporated into the pipeline via rebalance.
+    Pending,
     /// Missed too many heartbeats.
     Dead,
 }
@@ -154,6 +156,22 @@ impl PeerRegistry {
                 entry.status = WorkerStatus::Draining;
             }
         }
+    }
+
+    /// Mark a worker as pending (waiting to join the pipeline via rebalance).
+    pub fn mark_pending(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            entry.status = WorkerStatus::Pending;
+        }
+    }
+
+    /// Return node IDs of workers in Pending status.
+    pub fn pending_workers(&self) -> Vec<String> {
+        self.workers
+            .iter()
+            .filter(|(_, e)| e.status == WorkerStatus::Pending)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Update a worker's last heartbeat time and block pool stats.
