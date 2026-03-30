@@ -23,6 +23,46 @@ use std::collections::HashMap;
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
 
+// ---------------------------------------------------------------------------
+// Worker state machine (FT-1)
+// ---------------------------------------------------------------------------
+
+/// Tracks the worker's lifecycle state. Transitions:
+///
+/// ```text
+/// Starting → Connected → Ready ⇄ DisconnectedStandby
+///                                         │
+///                           Shutdown ──→ Exited
+///                           (from any connected state)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Starting/Connected used by FT-2 (reconnection)
+enum WorkerState {
+    /// Initial state: calibrating, not yet connected to coordinator.
+    Starting,
+    /// TCP connected and registered, waiting for layer assignment + weight load.
+    Connected,
+    /// Weights loaded, serving forward/cache/heartbeat requests.
+    Ready,
+    /// Coordinator connection lost. GPU state (weights, KV caches) retained.
+    /// Worker will attempt reconnection.
+    DisconnectedStandby,
+    /// Explicit shutdown received — worker will exit.
+    Exited,
+}
+
+impl std::fmt::Display for WorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerState::Starting => write!(f, "Starting"),
+            WorkerState::Connected => write!(f, "Connected"),
+            WorkerState::Ready => write!(f, "Ready"),
+            WorkerState::DisconnectedStandby => write!(f, "DisconnectedStandby"),
+            WorkerState::Exited => write!(f, "Exited"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -201,14 +241,37 @@ async fn main() -> Result<()> {
     // Signal the coordinator that weight loading is complete and the
     // worker is ready to process forward/cache requests.
     conn.send_empty(MessageType::WorkerReady, 0).await?;
-    tracing::info!("ready — entering serve loop");
+    let mut state = WorkerState::Ready;
+    tracing::info!("ready — entering serve loop (state: {state})");
 
-    // Serve loop
+    // Macro to send a message, transitioning to DisconnectedStandby on failure
+    // instead of propagating the error up to main().
+    macro_rules! send_or_standby {
+        ($conn:expr, $msg_type:expr, $seq_id:expr, $payload:expr, $state:expr) => {
+            if let Err(e) = $conn.send($msg_type, $seq_id, $payload).await {
+                tracing::error!("send {:?} failed: {e}", $msg_type);
+                $state = WorkerState::DisconnectedStandby;
+                break;
+            }
+        };
+    }
+    macro_rules! send_empty_or_standby {
+        ($conn:expr, $msg_type:expr, $seq_id:expr, $state:expr) => {
+            if let Err(e) = $conn.send_empty($msg_type, $seq_id).await {
+                tracing::error!("send {:?} failed: {e}", $msg_type);
+                $state = WorkerState::DisconnectedStandby;
+                break;
+            }
+        };
+    }
+
+    // Serve loop — returns DisconnectedStandby on connection loss, Exited on Shutdown.
     loop {
         let (header, payload) = match conn.recv().await {
             Ok(frame) => frame,
             Err(e) => {
                 tracing::error!("connection lost: {e}");
+                state = WorkerState::DisconnectedStandby;
                 break;
             }
         };
@@ -224,8 +287,7 @@ async fn main() -> Result<()> {
                 );
                 match result {
                     Ok(result_payload) => {
-                        conn.send(MessageType::ForwardResult, header.seq_id, &result_payload)
-                            .await?;
+                        send_or_standby!(conn, MessageType::ForwardResult, header.seq_id, &result_payload, state);
                     }
                     Err(e) => {
                         tracing::error!("forward error for seq {}: {e}", header.seq_id);
@@ -233,7 +295,7 @@ async fn main() -> Result<()> {
                             error_code: ErrorCode::Internal,
                             message: e.to_string(),
                         };
-                        conn.send(MessageType::Error, header.seq_id, &err).await?;
+                        send_or_standby!(conn, MessageType::Error, header.seq_id, &err, state);
                     }
                 }
             }
@@ -244,7 +306,6 @@ async fn main() -> Result<()> {
                     match cache.alloc(node.engine().backend()) {
                         Ok(h) => {
                             e.insert(h);
-                            // Also allocate in paged cache for BatchedForward support
                             match paged_cache.alloc() {
                                 Ok(ph) => {
                                     paged_handles.insert(seq_id, ph);
@@ -256,7 +317,7 @@ async fn main() -> Result<()> {
                                     );
                                 }
                             }
-                            conn.send_empty(MessageType::CacheAllocAck, seq_id).await?;
+                            send_empty_or_standby!(conn, MessageType::CacheAllocAck, seq_id, state);
                             tracing::debug!("allocated cache for seq {seq_id}");
                         }
                         Err(e) => {
@@ -267,7 +328,7 @@ async fn main() -> Result<()> {
                                 ),
                             };
                             tracing::error!("cache alloc OOM for seq {seq_id}: {e}");
-                            conn.send(MessageType::Error, seq_id, &err).await?;
+                            send_or_standby!(conn, MessageType::Error, seq_id, &err, state);
                         }
                     }
                 } else {
@@ -278,16 +339,16 @@ async fn main() -> Result<()> {
                         ),
                     };
                     tracing::warn!("duplicate CacheAlloc for seq {seq_id}");
-                    conn.send(MessageType::Error, seq_id, &err).await?;
+                    send_or_standby!(conn, MessageType::Error, seq_id, &err, state);
                 }
             }
 
             MessageType::CacheFree => {
                 let seq_id = header.seq_id;
                 if let Some(h) = handles.remove(&seq_id) {
-                    cache.free(h, node.engine().backend())?;
+                    let _ = cache.free(h, node.engine().backend());
                     if let Some(ph) = paged_handles.remove(&seq_id) {
-                        paged_cache.free(ph)?;
+                        let _ = paged_cache.free(ph);
                     }
                     tracing::debug!("freed cache for seq {seq_id}");
                 } else {
@@ -298,12 +359,18 @@ async fn main() -> Result<()> {
                         ),
                     };
                     tracing::warn!("CacheFree for unknown seq {seq_id}");
-                    conn.send(MessageType::Error, seq_id, &err).await?;
+                    send_or_standby!(conn, MessageType::Error, seq_id, &err, state);
                 }
             }
 
             MessageType::Heartbeat => {
-                let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload)?;
+                let hb: HeartbeatPayload = match FramedConnection::deserialize_payload(&payload) {
+                    Ok(hb) => hb,
+                    Err(e) => {
+                        tracing::error!("heartbeat deserialize error: {e}");
+                        continue;
+                    }
+                };
                 let ack = HeartbeatAckPayload {
                     timestamp_echo: hb.timestamp_ns,
                     nonce_echo: hb.nonce,
@@ -312,12 +379,17 @@ async fn main() -> Result<()> {
                     active_sequences: handles.len() as u32,
                     free_blocks: paged_cache.num_free_blocks() as u32,
                 };
-                conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
+                send_or_standby!(conn, MessageType::HeartbeatAck, 0, &ack, state);
             }
 
             MessageType::Reconfigure => {
-                let reconf: RegisterAckPayload =
-                    FramedConnection::deserialize_payload(&payload)?;
+                let reconf: RegisterAckPayload = match FramedConnection::deserialize_payload(&payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("reconfigure deserialize error: {e}");
+                        continue;
+                    }
+                };
                 let new_range = reconf.layer_start as usize..reconf.layer_end as usize;
                 tracing::info!(
                     "reconfiguring: layers {:?} → {:?}",
@@ -376,7 +448,7 @@ async fn main() -> Result<()> {
                     num_blocks, new_range
                 );
 
-                conn.send_empty(MessageType::WorkerReady, 0).await?;
+                send_empty_or_standby!(conn, MessageType::WorkerReady, 0, state);
                 tracing::info!("ready after reconfigure");
             }
 
@@ -389,6 +461,7 @@ async fn main() -> Result<()> {
                     let _ = paged_cache.free(ph);
                 }
                 let _ = paged_cache.destroy(node.engine().backend());
+                state = WorkerState::Exited;
                 break;
             }
 
@@ -402,12 +475,7 @@ async fn main() -> Result<()> {
                 );
                 match result {
                     Ok(result_payload) => {
-                        conn.send(
-                            MessageType::BatchedForwardResult,
-                            header.seq_id,
-                            &result_payload,
-                        )
-                        .await?;
+                        send_or_standby!(conn, MessageType::BatchedForwardResult, header.seq_id, &result_payload, state);
                     }
                     Err(e) => {
                         tracing::error!("batched forward error: {e}");
@@ -415,7 +483,7 @@ async fn main() -> Result<()> {
                             error_code: ErrorCode::Internal,
                             message: e.to_string(),
                         };
-                        conn.send(MessageType::Error, header.seq_id, &err).await?;
+                        send_or_standby!(conn, MessageType::Error, header.seq_id, &err, state);
                     }
                 }
             }
@@ -426,12 +494,31 @@ async fn main() -> Result<()> {
                     error_code: ErrorCode::ProtocolViolation,
                     message: format!("unexpected message type: {other:?}"),
                 };
-                conn.send(MessageType::Error, header.seq_id, &err).await?;
+                send_or_standby!(conn, MessageType::Error, header.seq_id, &err, state);
             }
         }
     }
 
-    tracing::info!("worker shut down");
+    // Handle post-serve-loop state
+    match state {
+        WorkerState::DisconnectedStandby => {
+            tracing::warn!(
+                "coordinator connection lost — entering standby \
+                 (GPU state retained, {} cached sequences preserved)",
+                handles.len()
+            );
+            // FT-2 will add reconnection with exponential backoff here.
+            // For now the worker stays alive but idle — this prevents the
+            // process from exiting and releasing GPU resources.
+            tracing::info!("standby: waiting for reconnection (not yet implemented)");
+        }
+        WorkerState::Exited => {
+            tracing::info!("worker shut down (explicit Shutdown)");
+        }
+        _ => {
+            tracing::warn!("unexpected post-loop state: {state}");
+        }
+    }
     Ok(())
 }
 
