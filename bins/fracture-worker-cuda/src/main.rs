@@ -268,6 +268,9 @@ async fn main() -> Result<()> {
         };
     }
 
+    // Cluster manifest — updated by coordinator broadcasts, used for election/reconnection.
+    let mut cluster_manifest: Option<ClusterManifestPayload> = None;
+
     // SIGTERM handler: set flag so serve loop can send LeaveIntent gracefully.
     let leave_requested = Arc::new(AtomicBool::new(false));
     let leave_flag = Arc::clone(&leave_requested);
@@ -524,6 +527,32 @@ async fn main() -> Result<()> {
                             message: e.to_string(),
                         };
                         send_or_standby!(conn, MessageType::Error, header.seq_id, &err, state);
+                    }
+                }
+            }
+
+            MessageType::ClusterManifest => {
+                match FramedConnection::deserialize_payload::<ClusterManifestPayload>(&payload) {
+                    Ok(manifest) => {
+                        let dominated = cluster_manifest.as_ref()
+                            .is_some_and(|old| old.version >= manifest.version);
+                        if dominated {
+                            tracing::debug!(
+                                "ignoring stale manifest v{} (current v{})",
+                                manifest.version,
+                                cluster_manifest.as_ref().unwrap().version,
+                            );
+                        } else {
+                            tracing::info!(
+                                "received cluster manifest v{} ({} nodes)",
+                                manifest.version,
+                                manifest.nodes.len(),
+                            );
+                            cluster_manifest = Some(manifest);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("manifest deserialize error: {e}");
                     }
                 }
             }

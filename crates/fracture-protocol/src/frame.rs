@@ -51,6 +51,8 @@ pub enum MessageType {
     /// Coordinator tells a worker to reconfigure with a new layer range.
     /// Payload is RegisterAckPayload (same fields).
     Reconfigure = 0x0F,
+    /// Cluster manifest broadcast (coordinator → workers).
+    ClusterManifest = 0x13,
     /// Worker re-registration after reconnection (carries current state).
     ReRegister = 0x14,
     /// Worker announces intent to leave the cluster gracefully.
@@ -75,6 +77,7 @@ impl MessageType {
             0x0D => Ok(Self::BatchedForwardResult),
             0x0E => Ok(Self::WorkerReady),
             0x0F => Ok(Self::Reconfigure),
+            0x13 => Ok(Self::ClusterManifest),
             0x14 => Ok(Self::ReRegister),
             0x15 => Ok(Self::LeaveIntent),
             _ => Err(FractureError::Protocol(format!(
@@ -183,6 +186,7 @@ mod tests {
             MessageType::BatchedForwardResult,
             MessageType::WorkerReady,
             MessageType::Reconfigure,
+            MessageType::ClusterManifest,
             MessageType::ReRegister,
             MessageType::LeaveIntent,
         ];

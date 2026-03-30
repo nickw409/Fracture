@@ -156,6 +156,42 @@ pub struct CacheAllocPayload {
 // ── 0x08 CacheFree — no payload (seq_id in frame header) ────────────────
 // ── 0x09 Shutdown — no payload ──────────────────────────────────────────
 
+// ── 0x13 ClusterManifest (Coordinator → Workers) ────────────────────────
+
+/// Cluster manifest broadcast to all workers for peer discovery.
+/// Workers store this locally for election and coordinator fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterManifestPayload {
+    /// Monotonic version number. Workers reject manifests with version <= current.
+    pub version: u64,
+    /// Current election term.
+    pub term: u64,
+    /// All nodes in the cluster.
+    pub nodes: Vec<NodeInfo>,
+}
+
+/// Information about a single node in the cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    /// Address for peer connections (election, reconnection).
+    pub address: String,
+    /// Election priority (lower = higher priority, 0 = highest).
+    pub election_priority: u32,
+    /// Whether this node can become coordinator.
+    pub coordinator_capable: bool,
+    /// Current role in the cluster.
+    pub role: NodeRole,
+}
+
+/// Role of a node in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    Coordinator,
+    Worker,
+    Standby,
+}
+
 // ── 0x14 ReRegister (Worker → Coordinator) ──────────────────────────────
 
 /// Worker re-registration payload sent after reconnecting to the coordinator.
@@ -517,6 +553,45 @@ mod tests {
         let payload = CacheAllocPayload { max_seq_len: 4096 };
         let decoded: CacheAllocPayload = bincode_roundtrip(&payload);
         assert_eq!(decoded.max_seq_len, 4096);
+    }
+
+    #[test]
+    fn test_cluster_manifest_roundtrip() {
+        let payload = ClusterManifestPayload {
+            version: 3,
+            term: 1,
+            nodes: vec![
+                NodeInfo {
+                    node_id: "coordinator-0".into(),
+                    address: "192.168.1.10:9400".into(),
+                    election_priority: 0,
+                    coordinator_capable: true,
+                    role: NodeRole::Coordinator,
+                },
+                NodeInfo {
+                    node_id: "worker-gpu0".into(),
+                    address: "192.168.1.20:9400".into(),
+                    election_priority: 1,
+                    coordinator_capable: true,
+                    role: NodeRole::Worker,
+                },
+                NodeInfo {
+                    node_id: "worker-gpu1".into(),
+                    address: "192.168.1.30:9400".into(),
+                    election_priority: u32::MAX,
+                    coordinator_capable: false,
+                    role: NodeRole::Worker,
+                },
+            ],
+        };
+        let decoded: ClusterManifestPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.term, 1);
+        assert_eq!(decoded.nodes.len(), 3);
+        assert_eq!(decoded.nodes[0].role, NodeRole::Coordinator);
+        assert!(decoded.nodes[1].coordinator_capable);
+        assert!(!decoded.nodes[2].coordinator_capable);
+        assert_eq!(decoded.nodes[2].election_priority, u32::MAX);
     }
 
     #[test]
