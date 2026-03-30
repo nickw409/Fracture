@@ -3,7 +3,10 @@ use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
 use fracture_engine::{Engine, KvCacheManager};
 use fracture_gguf::WeightStore;
-use fracture_server::{create_router, AppState};
+use fracture_server::dashboard::dto::ModelInfo;
+use fracture_server::dashboard::metrics::MetricsCollector;
+use fracture_server::dashboard::request_log::RequestLog;
+use fracture_server::{create_router, AppState, ClusterProvider, DashboardState};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tracing_subscriber::EnvFilter;
@@ -89,12 +92,35 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Build dashboard state
+    let dashboard_state = Arc::new(DashboardState {
+        metrics: Arc::new(MetricsCollector::new()),
+        request_log: Arc::new(RequestLog::new()),
+        cluster: ClusterProvider::Standalone {
+            gpu_name: engine.backend().device_name().to_string(),
+            vram_total_mb: (engine.backend().total_memory() / (1024 * 1024)) as u64,
+            vram_used_mb: ((engine.backend().total_memory() - engine.backend().available_memory())
+                / (1024 * 1024)) as u64,
+            model: ModelInfo {
+                name: "llama-3-8b".to_string(),
+                parameters: "8B".to_string(),
+                layers: config.num_layers,
+                context_length: config.max_seq_len,
+                dtype: "FP16".to_string(),
+            },
+            total_layers: config.num_layers,
+        },
+        scheduler: None,
+    });
+
     // Build app state and router
     let state = Arc::new(AppState {
         engine,
         cache: Mutex::new(cache),
         tokenizer,
+        dashboard: dashboard_state,
     });
+
     let router = create_router(state);
 
     // Start server

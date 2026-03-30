@@ -23,6 +23,10 @@ use fracture_protocol::{
     messages::*,
 };
 use fracture_server::api::*;
+use fracture_server::dashboard::dto::ModelInfo as DashboardModelInfo;
+use fracture_server::dashboard::metrics::MetricsCollector;
+use fracture_server::dashboard::request_log::RequestLog;
+use fracture_server::dashboard::routes::{dashboard_routes, ClusterProvider, DashboardState};
 use fracture_server::{create_batched_router, BatchedAppState, SchedulerHandle};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -310,7 +314,28 @@ async fn main() -> Result<()> {
     let pipeline = Arc::new(pipeline);
     let registry = Arc::new(Mutex::new(registry));
 
+    // Build dashboard state
+    let dashboard_state = Arc::new(DashboardState {
+        metrics: Arc::new(MetricsCollector::new()),
+        request_log: Arc::new(RequestLog::new()),
+        cluster: ClusterProvider::Standalone {
+            gpu_name: "distributed".to_string(),
+            vram_total_mb: 0,
+            vram_used_mb: 0,
+            model: DashboardModelInfo {
+                name: "llama-3-8b".to_string(),
+                parameters: "8B".to_string(),
+                layers: model_config.num_layers,
+                context_length: config.max_seq_len,
+                dtype: "FP16".to_string(),
+            },
+            total_layers: model_config.num_layers,
+        },
+        scheduler: None,
+    });
+
     // Build HTTP router — either batched (Phase 4) or sequential.
+    use tower_http::cors::CorsLayer;
     let router: Router = if config.batched {
         tracing::info!("using batched scheduler loop (Phase 4)");
         let handle = distributed_loop::start_distributed_loop(
@@ -318,7 +343,7 @@ async fn main() -> Result<()> {
             Arc::clone(&registry),
             distributed_loop::DistributedLoopConfig::default(),
         );
-        let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer));
+        let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
         create_batched_router(batched_state)
     } else {
         tracing::info!("using sequential distributed_generate");
@@ -334,6 +359,8 @@ async fn main() -> Result<()> {
             .route("/v1/models", get(models_handler))
             .route("/health", get(health_handler))
             .with_state(state)
+            .merge(dashboard_routes(dashboard_state))
+            .layer(CorsLayer::permissive())
     };
 
     // Start HTTP server
