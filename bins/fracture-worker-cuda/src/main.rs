@@ -196,8 +196,11 @@ async fn main() -> Result<()> {
     // prompts longer than ~10 tokens.
     let scratch_reserve = 2 * 1024 * 1024 * 1024;
 
-    // TurboQuant: allocate quantized cache if configured, otherwise FP16 paged cache
-    let mut _quantized_cache: Option<QuantizedKvCacheManager> = None;
+    // Create the batched KV cache — either TurboQuant or FP16 paged
+    let use_turboquant = tq_config.is_some();
+    let mut quantized_cache: Option<QuantizedKvCacheManager> = None;
+    let mut paged_cache: Option<PagedKvCacheManager> = None;
+
     if let Some(ref tq_cfg) = tq_config {
         let num_blocks = tq_cfg.compute_num_blocks(
             gpu_avail,
@@ -216,7 +219,7 @@ async fn main() -> Result<()> {
             (num_blocks * bytes_per_block) as f64 / 1e6,
             num_blocks * BLOCK_SIZE,
         );
-        _quantized_cache = Some(QuantizedKvCacheManager::new(
+        quantized_cache = Some(QuantizedKvCacheManager::new(
             num_blocks,
             layer_range.len(),
             ack.model_config.num_kv_heads,
@@ -225,34 +228,61 @@ async fn main() -> Result<()> {
             tq_cfg.clone(),
             node.engine().backend(),
         )?);
-    }
-
-    let num_blocks = compute_num_blocks(
-        gpu_avail,
-        scratch_reserve,
-        layer_range.len(),
-        ack.model_config.num_kv_heads,
-        ack.model_config.head_dim,
-    );
-    let mut paged_cache = PagedKvCacheManager::new(
-        num_blocks,
-        layer_range.len(),
-        ack.model_config.num_kv_heads,
-        ack.model_config.head_dim,
-        node.engine().backend(),
-    )?;
-    let bytes_per_block = BLOCK_SIZE
-        * ack.model_config.num_kv_heads
-        * ack.model_config.head_dim
-        * 2 * 2
-        * layer_range.len();
-    if tq_config.is_none() {
+    } else {
+        let num_blocks = compute_num_blocks(
+            gpu_avail,
+            scratch_reserve,
+            layer_range.len(),
+            ack.model_config.num_kv_heads,
+            ack.model_config.head_dim,
+        );
+        let bytes_per_block = BLOCK_SIZE
+            * ack.model_config.num_kv_heads
+            * ack.model_config.head_dim
+            * 2 * 2
+            * layer_range.len();
         tracing::info!(
             "paged KV cache: {} blocks ({:.1} MB), ~{} tokens capacity",
             num_blocks,
             (num_blocks * bytes_per_block) as f64 / 1e6,
             num_blocks * BLOCK_SIZE,
         );
+        paged_cache = Some(PagedKvCacheManager::new(
+            num_blocks,
+            layer_range.len(),
+            ack.model_config.num_kv_heads,
+            ack.model_config.head_dim,
+            node.engine().backend(),
+        )?);
+    }
+
+    // Helper: alloc from the active paged cache (TQ or FP16)
+    macro_rules! paged_alloc {
+        () => {
+            if let Some(ref mut qc) = quantized_cache {
+                fracture_engine::PagedCache::alloc(qc)
+            } else {
+                fracture_engine::PagedCache::alloc(paged_cache.as_mut().unwrap())
+            }
+        };
+    }
+    macro_rules! paged_free {
+        ($handle:expr) => {
+            if let Some(ref mut qc) = quantized_cache {
+                fracture_engine::PagedCache::free(qc, $handle)
+            } else {
+                fracture_engine::PagedCache::free(paged_cache.as_mut().unwrap(), $handle)
+            }
+        };
+    }
+    macro_rules! paged_free_blocks {
+        () => {
+            if let Some(ref qc) = quantized_cache {
+                qc.num_free_blocks()
+            } else {
+                paged_cache.as_ref().unwrap().num_free_blocks()
+            }
+        };
     }
 
     // Sequence tracking: seq_id -> CacheHandle
@@ -307,7 +337,7 @@ async fn main() -> Result<()> {
                         Ok(h) => {
                             e.insert(h);
                             // Also allocate in paged cache for BatchedForward support
-                            match paged_cache.alloc() {
+                            match paged_alloc!() {
                                 Ok(ph) => {
                                     paged_handles.insert(seq_id, ph);
                                 }
@@ -349,7 +379,7 @@ async fn main() -> Result<()> {
                 if let Some(h) = handles.remove(&seq_id) {
                     cache.free(h, node.engine().backend())?;
                     if let Some(ph) = paged_handles.remove(&seq_id) {
-                        paged_cache.free(ph)?;
+                        paged_free!(ph)?;
                     }
                     tracing::debug!("freed cache for seq {seq_id}");
                 } else {
@@ -372,7 +402,7 @@ async fn main() -> Result<()> {
                     gpu_memory_used: node.engine().backend().total_memory() as u64
                         - node.engine().backend().available_memory() as u64,
                     active_sequences: handles.len() as u32,
-                    free_blocks: paged_cache.num_free_blocks() as u32,
+                    free_blocks: paged_free_blocks!() as u32,
                 };
                 conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
             }
@@ -392,9 +422,14 @@ async fn main() -> Result<()> {
                     let _ = cache.free(h, node.engine().backend());
                 }
                 for (_, ph) in paged_handles.drain() {
-                    let _ = paged_cache.free(ph);
+                    let _ = paged_free!(ph);
                 }
-                let _ = paged_cache.destroy(node.engine().backend());
+                if let Some(ref qc) = quantized_cache {
+                    let _ = qc.destroy(node.engine().backend());
+                }
+                if let Some(ref pc) = paged_cache {
+                    let _ = pc.destroy(node.engine().backend());
+                }
 
                 // Reload weights for the new layer range.
                 tracing::info!("reloading weights for layers {:?}...", new_range);
@@ -419,24 +454,32 @@ async fn main() -> Result<()> {
                 );
                 let gpu_avail = node.engine().backend().available_memory();
                 let scratch_reserve = 2 * 1024 * 1024 * 1024;
-                let num_blocks = compute_num_blocks(
-                    gpu_avail,
-                    scratch_reserve,
-                    new_range.len(),
-                    reconf.model_config.num_kv_heads,
-                    reconf.model_config.head_dim,
-                );
-                paged_cache = PagedKvCacheManager::new(
-                    num_blocks,
-                    new_range.len(),
-                    reconf.model_config.num_kv_heads,
-                    reconf.model_config.head_dim,
-                    node.engine().backend(),
-                )?;
-                tracing::info!(
-                    "reconfigured: {} blocks, layers {:?}",
-                    num_blocks, new_range
-                );
+
+                if let Some(ref tq_cfg) = tq_config {
+                    let num_blocks = tq_cfg.compute_num_blocks(
+                        gpu_avail, scratch_reserve, new_range.len(),
+                        reconf.model_config.num_kv_heads, reconf.model_config.head_dim,
+                    );
+                    quantized_cache = Some(QuantizedKvCacheManager::new(
+                        num_blocks, new_range.len(),
+                        reconf.model_config.num_kv_heads, reconf.model_config.head_dim,
+                        512, tq_cfg.clone(), node.engine().backend(),
+                    )?);
+                    paged_cache = None;
+                    tracing::info!("reconfigured: TQ {} blocks, layers {:?}", num_blocks, new_range);
+                } else {
+                    let num_blocks = compute_num_blocks(
+                        gpu_avail, scratch_reserve, new_range.len(),
+                        reconf.model_config.num_kv_heads, reconf.model_config.head_dim,
+                    );
+                    paged_cache = Some(PagedKvCacheManager::new(
+                        num_blocks, new_range.len(),
+                        reconf.model_config.num_kv_heads, reconf.model_config.head_dim,
+                        node.engine().backend(),
+                    )?);
+                    quantized_cache = None;
+                    tracing::info!("reconfigured: {} blocks, layers {:?}", num_blocks, new_range);
+                }
 
                 conn.send_empty(MessageType::WorkerReady, 0).await?;
                 tracing::info!("ready after reconfigure");
@@ -448,20 +491,23 @@ async fn main() -> Result<()> {
                     let _ = cache.free(h, node.engine().backend());
                 }
                 for (_, ph) in paged_handles.drain() {
-                    let _ = paged_cache.free(ph);
+                    let _ = paged_free!(ph);
                 }
-                let _ = paged_cache.destroy(node.engine().backend());
+                if let Some(ref qc) = quantized_cache {
+                    let _ = qc.destroy(node.engine().backend());
+                }
+                if let Some(ref pc) = paged_cache {
+                    let _ = pc.destroy(node.engine().backend());
+                }
                 break;
             }
 
             MessageType::BatchedForward => {
-                let result = handle_batched_forward(
-                    &header,
-                    &payload,
-                    &node,
-                    &mut paged_cache,
-                    &paged_handles,
-                );
+                let result = if let Some(ref mut qc) = quantized_cache {
+                    handle_batched_forward(&header, &payload, &node, qc, &paged_handles)
+                } else {
+                    handle_batched_forward(&header, &payload, &node, paged_cache.as_mut().unwrap(), &paged_handles)
+                };
                 match result {
                     Ok(result_payload) => {
                         conn.send(
@@ -567,11 +613,11 @@ fn handle_forward(
 
 /// Handle a BatchedForward message: deserialize input, run batched forward through
 /// this node's layers with paged KV cache, serialize output.
-fn handle_batched_forward(
+fn handle_batched_forward<C: fracture_engine::PagedCache>(
     _header: &fracture_protocol::FrameHeader,
     payload: &[u8],
     node: &ComputeNodeImpl<CudaBackend>,
-    paged_cache: &mut PagedKvCacheManager,
+    paged_cache: &mut C,
     paged_handles: &HashMap<u64, CacheHandle>,
 ) -> fracture_core::Result<BatchedForwardResultPayload> {
     let req: BatchedForwardPayload = FramedConnection::deserialize_payload(payload)?;

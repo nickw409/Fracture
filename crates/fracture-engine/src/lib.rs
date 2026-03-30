@@ -8,7 +8,7 @@ mod pipeline;
 pub mod quantized_paged_kv_cache;
 pub mod scheduler;
 
-pub use batched::{batched_forward, batched_forward_node, BatchedOutput, SequenceSlice};
+pub use batched::{batched_forward, batched_forward_node, BatchedOutput, PagedCache, SequenceSlice};
 pub use engine::{Engine, KvCacheBackend};
 pub use scheduler::{ActiveSequence, BatchScheduler, GenerationEvent, PendingRequest};
 pub use kv_cache::{CacheHandle, KvCacheManager};

@@ -226,7 +226,7 @@ async fn scheduler_loop_task<B: Backend + 'static>(
                     engine_ref.backend(),
                     engine_ref.weights(),
                     &lr,
-                    &mut cache_guard,
+                    &mut *cache_guard,
                     &slices,
                 )
             })
