@@ -544,4 +544,167 @@ impl Backend for CudaBackend {
     fn marker_pop(&self) {
         nvtx::range_pop();
     }
+
+    fn turboquant_compress(
+        &self,
+        input: &DeviceTensor,
+        rotation_matrix: &DeviceTensor,
+        centroids: &DeviceTensor,
+        bits: u8,
+        packed_out: &DeviceTensor,
+        norms_out: &DeviceTensor,
+    ) -> Result<()> {
+        nvtx::range_push("turboquant_compress");
+
+        let input_ptr = self.get_ptr(input.id)?;
+        let rotation_ptr = self.get_ptr(rotation_matrix.id)?;
+        let centroids_ptr = self.get_ptr(centroids.id)?;
+        let packed_ptr = self.get_ptr(packed_out.id)?;
+        let norms_ptr = self.get_ptr(norms_out.id)?;
+
+        let num_tokens = input.shape[0] as c_int;
+        let num_kv_heads = input.shape[1] as c_int;
+        let head_dim = input.shape[2] as c_int;
+        let n_levels = centroids.shape[0] as c_int;
+        let packed_dim_per_head = (head_dim as usize * bits as usize).div_ceil(8) as c_int;
+
+        cuda_check!(launch_turboquant_compress(
+            input_ptr as *const c_void,
+            rotation_ptr as *const f32,
+            centroids_ptr as *const f32,
+            packed_ptr,
+            norms_ptr,
+            num_tokens,
+            num_kv_heads,
+            head_dim,
+            n_levels,
+            bits as c_int,
+            packed_dim_per_head,
+            self.stream,
+        ));
+
+        nvtx::range_pop();
+        Ok(())
+    }
+
+    fn attention_paged_tq(
+        &self,
+        q: &DeviceTensor,
+        block_table: &[i32],
+        k_packed: &[&DeviceTensor],
+        k_norms: &[&DeviceTensor],
+        v_packed: &[&DeviceTensor],
+        v_norms: &[&DeviceTensor],
+        k_rotation: &DeviceTensor,
+        v_rotation: &DeviceTensor,
+        k_centroids: &DeviceTensor,
+        v_centroids: &DeviceTensor,
+        key_bits: u8,
+        value_bits: u8,
+        num_kv_heads: usize,
+        kv_len: usize,
+        start_pos: usize,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        nvtx::range_push("attention_paged_tq");
+
+        let q_ptr = self.get_ptr(q.id)?;
+        let out_ptr = self.get_ptr(out.id)?;
+        let k_rot_ptr = self.get_ptr(k_rotation.id)?;
+        let v_rot_ptr = self.get_ptr(v_rotation.id)?;
+        let k_cent_ptr = self.get_ptr(k_centroids.id)?;
+        let v_cent_ptr = self.get_ptr(v_centroids.id)?;
+
+        let num_tokens = q.shape[0] as c_int;
+        let num_q_heads = q.shape[1] as c_int;
+        let head_dim = q.shape[2] as c_int;
+
+        let k_packed_dim_per_head = (head_dim as usize * key_bits as usize).div_ceil(8) as c_int;
+        let v_packed_dim_per_head = (head_dim as usize * value_bits as usize).div_ceil(8) as c_int;
+
+        // Resolve block tensor IDs to device pointers (K packed)
+        let kp_ptrs: Vec<*const c_void> = k_packed
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+        let kn_ptrs: Vec<*const c_void> = k_norms
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+        let vp_ptrs: Vec<*const c_void> = v_packed
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+        let vn_ptrs: Vec<*const c_void> = v_norms
+            .iter()
+            .map(|t| self.get_ptr(t.id).map(|p| p as *const c_void))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Copy block_table to device
+        let bt_size = std::mem::size_of_val(block_table);
+        let mut bt_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut bt_dev, bt_size));
+        cuda_check!(cudaMemcpy(
+            bt_dev,
+            block_table.as_ptr() as *const c_void,
+            bt_size,
+            CUDA_MEMCPY_HOST_TO_DEVICE
+        ));
+
+        // Copy pointer arrays to device (4 arrays)
+        let ptr_size = |ptrs: &[*const c_void]| ptrs.len() * std::mem::size_of::<*const c_void>();
+
+        let mut kp_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut kp_dev, ptr_size(&kp_ptrs)));
+        cuda_check!(cudaMemcpy(kp_dev, kp_ptrs.as_ptr() as *const c_void, ptr_size(&kp_ptrs), CUDA_MEMCPY_HOST_TO_DEVICE));
+
+        let mut kn_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut kn_dev, ptr_size(&kn_ptrs)));
+        cuda_check!(cudaMemcpy(kn_dev, kn_ptrs.as_ptr() as *const c_void, ptr_size(&kn_ptrs), CUDA_MEMCPY_HOST_TO_DEVICE));
+
+        let mut vp_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut vp_dev, ptr_size(&vp_ptrs)));
+        cuda_check!(cudaMemcpy(vp_dev, vp_ptrs.as_ptr() as *const c_void, ptr_size(&vp_ptrs), CUDA_MEMCPY_HOST_TO_DEVICE));
+
+        let mut vn_dev: *mut c_void = std::ptr::null_mut();
+        cuda_check!(cudaMalloc(&mut vn_dev, ptr_size(&vn_ptrs)));
+        cuda_check!(cudaMemcpy(vn_dev, vn_ptrs.as_ptr() as *const c_void, ptr_size(&vn_ptrs), CUDA_MEMCPY_HOST_TO_DEVICE));
+
+        cuda_check!(launch_attention_paged_tq(
+            out_ptr,
+            q_ptr as *const c_void,
+            bt_dev as *const c_int,
+            kp_dev as *const *const c_void,
+            kn_dev as *const *const c_void,
+            vp_dev as *const *const c_void,
+            vn_dev as *const *const c_void,
+            k_rot_ptr as *const f32,
+            v_rot_ptr as *const f32,
+            k_cent_ptr as *const f32,
+            v_cent_ptr as *const f32,
+            num_tokens,
+            num_q_heads,
+            num_kv_heads as c_int,
+            head_dim,
+            kv_len as c_int,
+            start_pos as c_int,
+            key_bits as c_int,
+            value_bits as c_int,
+            k_packed_dim_per_head,
+            v_packed_dim_per_head,
+            self.stream,
+        ));
+
+        // Free temporary device allocations
+        unsafe {
+            cudaFree(bt_dev);
+            cudaFree(kp_dev);
+            cudaFree(kn_dev);
+            cudaFree(vp_dev);
+            cudaFree(vn_dev);
+        }
+
+        nvtx::range_pop();
+        Ok(())
+    }
 }

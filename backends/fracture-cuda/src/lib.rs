@@ -1,4 +1,4 @@
-mod ffi;
+pub mod ffi;
 mod nvtx;
 mod timers;
 
@@ -114,13 +114,18 @@ impl CudaBackend {
     }
 
     /// Look up the device pointer for a TensorId.
-    fn get_ptr(&self, id: TensorId) -> Result<*mut c_void> {
+    pub fn get_ptr(&self, id: TensorId) -> Result<*mut c_void> {
         let state = self.state.lock().unwrap();
         state
             .tensors
             .get(&id.0)
             .copied()
             .ok_or_else(|| FractureError::TensorNotFound(format!("tensor id {}", id.0)))
+    }
+
+    /// Get the CUDA stream handle (for direct FFI calls in tests).
+    pub fn stream(&self) -> cudaStream_t {
+        self.stream
     }
 
     /// Pre-compute RoPE frequency table and store on GPU.

@@ -6,6 +6,7 @@ description: |
   tensors, enabling pipeline-parallel inference across multiple nodes on one machine.
   Phase 3: distributed inference — wire protocol, scheduling, heartbeat, multi-machine pipeline.
   Phase 4: production inference — paged KV cache, continuous batching, distributed batching.
+  Phase 4.5: TurboQuant KV cache compression — 5x memory reduction via rotation + Lloyd-Max quantization.
   Dashboard: React/TypeScript observability UI with cluster topology, live metrics, inference
   playground, and scheduler visualization. Served as static files or via Vite dev proxy.
   CUDA backend initially; engine is backend-agnostic via the Backend trait to support Metal in Phase 5+.
@@ -2997,3 +2998,276 @@ sections:
           tokens generated, max tokens. Colored state badges
           (blue=prefilling, green=decoding, gray=completed).
           Auto-refreshes via useScheduler 2s polling.
+
+  # ============================================================
+  # TurboQuant KV Cache Compression (Phase 4.5)
+  # ============================================================
+
+  - name: TurboQuant Config
+    path: crates/fracture-core/src/turboquant.rs
+    behaviors:
+      - name: config-defaults
+        status: implemented
+        description: |
+          TurboQuantConfig defaults to key_bits=4, value_bits=2,
+          protected_bits=8, protected_layers=0, residual_tokens=0, seed=42.
+
+      - name: config-validation
+        status: implemented
+        description: |
+          validate() rejects bit widths other than 2, 4, or 8 for
+          key_bits, value_bits, and protected_bits. Returns typed error.
+
+      - name: per-layer-bit-widths
+        status: implemented
+        description: |
+          key_bits_for_layer and value_bits_for_layer return protected_bits
+          for first/last N layers, normal bits for middle layers. is_protected
+          handles edge cases (more protected than total, single-layer models).
+
+      - name: memory-budget-calculation
+        status: implemented
+        description: |
+          bytes_per_block_total sums per-layer sizes accounting for mixed
+          bit widths. compute_num_blocks divides available memory by per-block
+          cost. packed_dim_per_head uses div_ceil for non-aligned dimensions.
+
+  - name: Lloyd-Max Codebook
+    path: crates/fracture-core/src/turboquant.rs
+    behaviors:
+      - name: lloyd-max-solver
+        status: implemented
+        description: |
+          LloydMaxCodebook::compute solves optimal scalar quantizer for
+          N(0, 1/d) via iterative conditional expectation with Simpson's
+          rule integration. Converges to tolerance 1e-10 in <100 iterations.
+
+      - name: codebook-symmetry
+        status: implemented
+        description: |
+          Centroids are symmetric around zero (verified for 2-bit and 4-bit).
+          Middle boundary is ~0. Centroids are sorted ascending.
+
+      - name: codebook-dimension-scaling
+        status: implemented
+        description: |
+          Centroids scale with 1/sqrt(d). Ratio between d=64 and d=128
+          codebooks matches sqrt(2) within 0.1 tolerance.
+
+      - name: codebook-distortion-monotonicity
+        status: implemented
+        description: |
+          Higher bit widths produce lower MSE distortion. Verified via
+          Monte Carlo sampling: 4-bit MSE < 2-bit MSE by at least 2x.
+
+  - name: Rotation Matrix Generation
+    path: crates/fracture-core/src/turboquant.rs
+    behaviors:
+      - name: haar-orthogonal-generation
+        status: implemented
+        description: |
+          generate_rotation_matrix produces d×d orthogonal matrix via QR
+          decomposition of seeded Gaussian matrix. Diagonal sign correction
+          ensures det=+1. Uses Xoshiro256** PRNG for determinism.
+
+      - name: orthogonality-verification
+        status: implemented
+        description: |
+          Q^T @ Q = I within 1e-4 tolerance. Verified for d=16, 32, 128.
+
+      - name: norm-preservation
+        status: implemented
+        description: |
+          ||Pi @ x|| = ||x|| within 1e-3. Roundtrip Pi^T @ Pi @ x = x
+          within 1e-4. Verified by unit tests.
+
+      - name: coordinate-distribution
+        status: implemented
+        description: |
+          After rotating a unit vector by Pi, coordinates follow approximately
+          N(0, 1/d). Mean < 0.05, std within 50% of 1/sqrt(d).
+
+      - name: kv-rotation-separation
+        status: implemented
+        description: |
+          K and V use distinct rotation matrices (different seeds:
+          K=base+layer*1000, V=base+layer*1000+500). Prevents V corruption
+          during query pre-rotation optimization.
+
+  - name: TurboQuant Compress Kernel
+    path: backends/fracture-cuda/kernels/turboquant_compress.cu
+    behaviors:
+      - name: fused-compress-pipeline
+        status: implemented
+        description: |
+          Single kernel fuses normalize, rotate, Lloyd-Max quantize, and
+          bit-pack. Grid (N, num_kv_heads), 128 threads. Shared memory
+          holds input and rotated vectors as FP32.
+
+      - name: epsilon-guarded-normalization
+        status: implemented
+        description: |
+          Divides by (norm + 1e-8) to prevent NaN on zero vectors. Stored
+          norm is the true L2 norm (without epsilon). Zero vector produces
+          norm ~0 and quantized indices near the zero-crossing centroid.
+
+      - name: bit-packing-correctness
+        status: implemented
+        description: |
+          4-bit packs 2 indices per byte (high/low nibble). 2-bit packs
+          4 indices per byte. 8-bit stores 1 index per byte. Validated
+          by GPU round-trip tests at all three bit widths.
+
+  - name: TurboQuant Attention Kernel
+    path: backends/fracture-cuda/kernels/attention_paged_tq.cu
+    behaviors:
+      - name: query-pre-rotation-optimization
+        status: implemented
+        description: |
+          Pre-rotates query once with Pi_k (O(d^2)), then computes all K
+          scores as O(d) dot products in rotated space. Reduces per-KV work
+          from O(d^2) to O(d). Mathematically equivalent to unrotating each
+          K vector (verified by unit test).
+
+      - name: v-accumulation-optimization
+        status: implemented
+        description: |
+          Accumulates weighted V sum in rotated space, unrotates once at
+          end with Pi_v^T. Reduces V computation from O(kv_len*d^2) to
+          O(kv_len*d + d^2). Mathematically equivalent (verified by unit test).
+
+      - name: scaled-attention-scores
+        status: implemented
+        description: |
+          Scores include 1/sqrt(head_dim) scaling factor. Causal masking
+          uses start_pos + token_idx + 1, same as FP16 paged attention.
+
+      - name: separate-kv-rotations
+        status: implemented
+        description: |
+          Kernel receives distinct Pi_k and Pi_v rotation matrices.
+          Pi_k used for query pre-rotation (Phase 1), Pi_v used for
+          output unrotation (Phase 3).
+
+  - name: Quantized Block Pool
+    path: crates/fracture-engine/src/quantized_paged_kv_cache.rs
+    behaviors:
+      - name: pool-pre-allocation
+        status: implemented
+        description: |
+          QuantizedBlockPool pre-allocates all block memory at startup.
+          Per-block-per-layer tensors: packed_indices (INT8) and norms (FP16)
+          for both K and V. Sizes vary by layer when protected_layers > 0.
+
+      - name: rotation-matrix-upload
+        status: implemented
+        description: |
+          Two rotation matrices per layer (K and V) generated on host and
+          uploaded to device as [head_dim, head_dim] FP32 tensors.
+
+      - name: codebook-upload
+        status: implemented
+        description: |
+          One centroid table per distinct bit-width uploaded to device.
+          HashMap<u8, DeviceTensor> keyed by bits. Only needed bit-widths
+          are computed and uploaded.
+
+      - name: compress-scratch-pre-allocation
+        status: implemented
+        description: |
+          CompressScratch pre-allocates k_packed, k_norms, v_packed, v_norms
+          tensors sized for max_compress_tokens and the maximum packed_dim
+          across all layers (including protected 8-bit layers).
+
+      - name: block-alloc-free-lifecycle
+        status: implemented
+        description: |
+          alloc_block pops from free list, free_block pushes back. OOM returns
+          OutOfMemory error with requested block size. Free list is LIFO.
+
+  - name: Quantized KV Cache Manager
+    path: crates/fracture-engine/src/quantized_paged_kv_cache.rs
+    behaviors:
+      - name: sequence-alloc-free
+        status: implemented
+        description: |
+          alloc allocates initial block, returns CacheHandle. free returns
+          all blocks to pool. Double-free and invalid handle return errors.
+
+      - name: append-kv-compression
+        status: implemented
+        description: |
+          append_kv calls Backend::turboquant_compress on K and V with
+          per-layer rotation matrices and centroids, then copy_rows into
+          quantized blocks. Block growth on layer 0 matches FP16 paged logic.
+
+      - name: multi-sequence-isolation
+        status: implemented
+        description: |
+          Multiple sequences have independent block tables, sequence lengths,
+          and handle namespaces. Freeing one does not affect others.
+
+  - name: PagedCache Trait
+    path: crates/fracture-engine/src/batched.rs
+    behaviors:
+      - name: trait-abstraction
+        status: implemented
+        description: |
+          PagedCache trait with seq_len, block_table, append_kv,
+          dispatch_attention, alloc, free. Both PagedKvCacheManager and
+          QuantizedKvCacheManager implement it.
+
+      - name: generic-batched-forward
+        status: implemented
+        description: |
+          batched_forward and batched_forward_node are generic over
+          C: PagedCache. Zero code duplication between FP16 and TQ paths.
+          dispatch_attention encapsulates the attention call differences.
+
+      - name: fp16-dispatch
+        status: implemented
+        description: |
+          PagedKvCacheManager::dispatch_attention gathers block tensors
+          and calls Backend::attention_paged (existing FP16 kernel).
+
+      - name: tq-dispatch
+        status: implemented
+        description: |
+          QuantizedKvCacheManager::dispatch_attention gathers packed indices,
+          norms, rotation matrices, centroids and calls Backend::attention_paged_tq.
+
+  - name: TurboQuant GPU Validation
+    path: bins/fracture-server-cuda/tests/turboquant_gpu.rs
+    behaviors:
+      - name: compress-decompress-roundtrip
+        status: implemented
+        description: |
+          GPU round-trip tests at 2-bit (cosine > 0.80), 4-bit (> 0.95),
+          and 8-bit (> 0.999). Validates the full compress kernel →
+          decompress kernel pipeline on real CUDA hardware.
+
+      - name: norm-preservation-gpu
+        status: implemented
+        description: |
+          Stored norms match input L2 norms within 2% relative error.
+          Verified on GPU with random FP16 input vectors.
+
+      - name: zero-vector-safety
+        status: implemented
+        description: |
+          Zero input vector produces norm ~0, no NaN, no crash.
+          Epsilon-guarded normalization prevents division by zero.
+
+      - name: e2e-tq8-vs-fp16
+        status: implemented
+        description: |
+          Full batched_forward with 8-bit TQ vs FP16 paged cache on same
+          random model weights and prompt. Logit cosine similarity > 0.95.
+          Measured: 0.999999.
+
+      - name: e2e-k4v2-vs-fp16
+        status: implemented
+        description: |
+          Full batched_forward with K4/V2 TQ vs FP16. Logit cosine
+          similarity > 0.70, greedy argmax matches. Measured: 0.998995,
+          argmax identical.

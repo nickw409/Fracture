@@ -149,8 +149,8 @@ fn test_snapshot_with_active_sequences() {
         event_tx: tx,
     });
     {
-        let cache_guard = cache.lock().unwrap();
-        let _ = scheduler.schedule(&cache_guard);
+        let mut cache_guard = cache.lock().unwrap();
+        let _ = scheduler.schedule(&mut cache_guard);
     }
     // Simulate a generated token so it's in decode state.
     scheduler.active.get_mut(&0).unwrap().generated_tokens.push(42);

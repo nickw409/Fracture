@@ -33,6 +33,46 @@ async fn recv_skipping_heartbeat_acks(
     }
 }
 
+/// Like [`recv_skipping_heartbeat_acks`] but takes an owned Arc, allowing
+/// it to be spawned into a `JoinSet` for concurrent polling.
+async fn recv_skipping_heartbeat_acks_owned(
+    reader: std::sync::Arc<tokio::sync::Mutex<FramedReader>>,
+) -> Result<(FrameHeader, Vec<u8>)> {
+    let mut r = reader.lock().await;
+    loop {
+        let (header, payload) = r.recv().await?;
+        if header.msg_type == MessageType::HeartbeatAck {
+            continue;
+        }
+        return Ok((header, payload));
+    }
+}
+
+/// Parse raw LE f32 bytes into per-sequence logits vectors.
+///
+/// Divides the flat logits array evenly across `num_sequences` sequences,
+/// returning one `Vec<f32>` per sequence (each of length `vocab_size`).
+fn split_logits_per_sequence(data: &[u8], num_sequences: usize) -> Vec<Vec<f32>> {
+    let all_logits: Vec<f32> = data
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let vocab_size = if num_sequences > 0 {
+        all_logits.len() / num_sequences
+    } else {
+        0
+    };
+
+    (0..num_sequences)
+        .map(|si| {
+            let start = si * vocab_size;
+            let end = start + vocab_size;
+            all_logits[start..end].to_vec()
+        })
+        .collect()
+}
+
 /// Orchestrates forward passes across distributed workers.
 ///
 /// The pipeline sends Forward messages sequentially through workers in
@@ -120,7 +160,6 @@ impl DistributedPipeline {
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
-        max_seq_len: u32,
     ) -> Result<()> {
         {
             let seqs = self.allocated_seqs.lock().unwrap();
@@ -131,11 +170,10 @@ impl DistributedPipeline {
             }
         }
 
-        let payload = CacheAllocPayload { max_seq_len };
         let mut succeeded: Vec<String> = Vec::new();
 
         let result = self
-            .try_alloc_all(registry, seq_id, &payload, &mut succeeded)
+            .try_alloc_all(registry, seq_id, &mut succeeded)
             .await;
 
         if result.is_err() {
@@ -155,26 +193,47 @@ impl DistributedPipeline {
         Ok(())
     }
 
-    /// Attempt to send CacheAlloc to all workers and collect acks.
+    /// Send CacheAlloc to all workers concurrently, then collect acks.
     /// On any failure, returns the error (caller handles rollback).
     async fn try_alloc_all(
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
-        payload: &CacheAllocPayload,
         succeeded: &mut Vec<String>,
     ) -> Result<()> {
+        // Phase 1: Send CacheAlloc to all workers (writes are fast).
         for node_id in &self.pipeline_order {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
             })?;
             entry
                 .writer
-                .send(MessageType::CacheAlloc, seq_id, payload)
+                .send_empty(MessageType::CacheAlloc, seq_id)
                 .await?;
+        }
 
-            // Wait for CacheAllocAck or Error from the worker
-            let (header, resp_payload) = recv_skipping_heartbeat_acks(&entry.reader).await?;
+        // Phase 2: Collect acks from all workers concurrently.
+        let mut readers: Vec<(String, std::sync::Arc<tokio::sync::Mutex<FramedReader>>)> =
+            self.pipeline_order
+                .iter()
+                .filter_map(|id| {
+                    registry.get(id).map(|e| (id.clone(), e.reader.clone()))
+                })
+                .collect();
+
+        let mut set = tokio::task::JoinSet::new();
+        for (node_id, reader) in readers.drain(..) {
+            set.spawn(async move {
+                let result = recv_skipping_heartbeat_acks_owned(reader).await;
+                (node_id, result)
+            });
+        }
+
+        while let Some(join_result) = set.join_next().await {
+            let (node_id, result) = join_result.map_err(|e| {
+                FractureError::Pipeline(format!("CacheAlloc task panicked: {e}"))
+            })?;
+            let (header, resp_payload) = result?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
@@ -191,7 +250,7 @@ impl DistributedPipeline {
                 )));
             }
 
-            succeeded.push(node_id.clone());
+            succeeded.push(node_id);
         }
         Ok(())
     }
@@ -429,111 +488,47 @@ impl DistributedPipeline {
                 )));
             }
 
-            if header.msg_type == MessageType::BatchedForwardResult {
+            let output = if header.msg_type == MessageType::BatchedForwardResult {
                 let result: BatchedForwardResultPayload =
                     FramedConnection::deserialize_payload(&resp_payload)?;
-
-                match result.output {
-                    ForwardOutputWire::Logits { data } => {
-                        if !is_last {
-                            return Err(FractureError::Pipeline(format!(
-                                "non-tail worker '{}' returned logits in batched forward",
-                                node_id
-                            )));
-                        }
-                        // Split logits by per-sequence offsets.
-                        let all_logits: Vec<f32> = data
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                            .collect();
-
-                        let vocab_size = if !sequences.is_empty() {
-                            all_logits.len() / sequences.len()
-                        } else {
-                            0
-                        };
-
-                        let per_seq: Vec<Vec<f32>> = sequences
-                            .iter()
-                            .enumerate()
-                            .map(|(si, _)| {
-                                let start = si * vocab_size;
-                                let end = start + vocab_size;
-                                all_logits[start..end].to_vec()
-                            })
-                            .collect();
-
-                        return Ok(per_seq);
-                    }
-                    ForwardOutputWire::Activations {
-                        tensor_header,
-                        tensor_data,
-                    } => {
-                        if is_last {
-                            return Err(FractureError::Pipeline(format!(
-                                "tail worker '{}' returned activations in batched forward",
-                                node_id
-                            )));
-                        }
-                        current_input = ForwardInputWire::Activations {
-                            tensor_header,
-                            tensor_data,
-                        };
-                    }
-                }
+                result.output
             } else if header.msg_type == MessageType::ForwardResult {
                 // Worker responded with non-batched ForwardResult — handle gracefully.
                 let result: ForwardResultPayload =
                     FramedConnection::deserialize_payload(&resp_payload)?;
-                match result.output {
-                    ForwardOutputWire::Logits { data } => {
-                        if !is_last {
-                            return Err(FractureError::Pipeline(format!(
-                                "non-tail worker '{}' returned logits",
-                                node_id
-                            )));
-                        }
-                        let all_logits: Vec<f32> = data
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                            .collect();
-                        let vocab_size = if !sequences.is_empty() {
-                            all_logits.len() / sequences.len()
-                        } else {
-                            0
-                        };
-                        let per_seq: Vec<Vec<f32>> = sequences
-                            .iter()
-                            .enumerate()
-                            .map(|(si, _)| {
-                                let start = si * vocab_size;
-                                let end = start + vocab_size;
-                                all_logits[start..end].to_vec()
-                            })
-                            .collect();
-                        return Ok(per_seq);
-                    }
-                    ForwardOutputWire::Activations {
-                        tensor_header,
-                        tensor_data,
-                    } => {
-                        if is_last {
-                            return Err(FractureError::Pipeline(format!(
-                                "tail worker '{}' returned activations",
-                                node_id
-                            )));
-                        }
-                        current_input = ForwardInputWire::Activations {
-                            tensor_header,
-                            tensor_data,
-                        };
-                    }
-                }
+                result.output
             } else {
                 return Err(FractureError::Protocol(format!(
                     "expected BatchedForwardResult from '{}', got {:?}",
                     node_id, header.msg_type
                 )));
+            };
+
+            match output {
+                ForwardOutputWire::Logits { data } => {
+                    if !is_last {
+                        return Err(FractureError::Pipeline(format!(
+                            "non-tail worker '{}' returned logits in batched forward",
+                            node_id
+                        )));
+                    }
+                    return Ok(split_logits_per_sequence(&data, sequences.len()));
+                }
+                ForwardOutputWire::Activations {
+                    tensor_header,
+                    tensor_data,
+                } => {
+                    if is_last {
+                        return Err(FractureError::Pipeline(format!(
+                            "tail worker '{}' returned activations in batched forward",
+                            node_id
+                        )));
+                    }
+                    current_input = ForwardInputWire::Activations {
+                        tensor_header,
+                        tensor_data,
+                    };
+                }
             }
         }
 

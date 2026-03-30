@@ -216,6 +216,62 @@ unsafe extern "C" {
         n: c_int,
         stream: cudaStream_t,
     ) -> cudaError_t;
+
+    // ── TurboQuant kernels ───────────────────────────────────────
+
+    pub fn launch_turboquant_compress(
+        input: *const c_void,
+        rotation: *const f32,
+        centroids: *const f32,
+        packed_out: *mut c_void,
+        norms_out: *mut c_void,
+        num_tokens: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        n_levels: c_int,
+        bits: c_int,
+        packed_dim_per_head: c_int,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn launch_turboquant_decompress(
+        packed_in: *const c_void,
+        norms_in: *const c_void,
+        rotation: *const f32,
+        centroids: *const f32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        bits: c_int,
+        packed_dim_per_head: c_int,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn launch_attention_paged_tq(
+        output: *mut c_void,
+        q: *const c_void,
+        block_table: *const c_int,
+        k_packed_ptrs: *const *const c_void,
+        k_norms_ptrs: *const *const c_void,
+        v_packed_ptrs: *const *const c_void,
+        v_norms_ptrs: *const *const c_void,
+        k_rotation: *const f32,
+        v_rotation: *const f32,
+        k_centroids: *const f32,
+        v_centroids: *const f32,
+        num_tokens: c_int,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        kv_len: c_int,
+        start_pos: c_int,
+        key_bits: c_int,
+        value_bits: c_int,
+        k_packed_dim_per_head: c_int,
+        v_packed_dim_per_head: c_int,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }
 
 // ── CUDA Event API ────────────────────────────────────────────────

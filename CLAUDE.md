@@ -7,8 +7,8 @@ Distributed cross-platform LLM inference engine in Rust with pluggable GPU backe
 Rust workspace with strict crate boundaries enforcing backend-agnosticism:
 
 ### Core Crates
-- `crates/fracture-core` — Backend trait, DeviceTensor, ModelConfig, StopReason, profiling types, error types
-- `crates/fracture-engine` — Backend-generic transformer forward pass, KV cache (contiguous + paged), node abstraction, pipeline coordinator, IPC transport, batch scheduler, batched forward
+- `crates/fracture-core` — Backend trait, DeviceTensor, ModelConfig, StopReason, profiling types, error types, TurboQuantConfig, Lloyd-Max solver, rotation matrix generation
+- `crates/fracture-engine` — Backend-generic transformer forward pass, KV cache (contiguous + paged + quantized), PagedCache trait, node abstraction, pipeline coordinator, IPC transport, batch scheduler, batched forward
 - `crates/fracture-generate` — Sampling (temperature/top-k/top-p/seeded), generation loop with StopReason, cooperative cancellation
 - `crates/fracture-server` — OpenAI-compatible HTTP API (axum) with SSE streaming, finish_reason, usage stats. Two modes: Phase 3 Mutex-serialized (`routes.rs`) and Phase 4 batched (`batched_routes.rs` + `scheduler_loop.rs`)
 - `crates/fracture-gguf` — GGUF file parser and weight loader (FP16/FP32/BF16)
@@ -18,7 +18,7 @@ Rust workspace with strict crate boundaries enforcing backend-agnosticism:
 - `crates/fracture-coordinator` — Scheduler, peer registry, sequence state, heartbeat, distributed pipeline (single + batched forward)
 
 ### Backend & Binaries
-- `backends/fracture-cuda` — CUDA Backend trait implementation (includes paged attention kernel)
+- `backends/fracture-cuda` — CUDA Backend trait implementation (paged attention, TurboQuant compress/decompress/attention kernels)
 - `bins/fracture-server-cuda` — Single-node server binary
 - `bins/fracture-worker-cuda` — Distributed worker binary (calibration, registration, forward serving)
 - `bins/fracture-coordinator-cuda` — Distributed coordinator binary (scheduling, pipeline orchestration, HTTP API)
@@ -44,6 +44,7 @@ Tests are serialized by GPU memory sensitivity via `.config/nextest.toml`:
 
 ## Conventions
 
+- **Architecture docs are the spec.** When `docs/fracture_phase*_architecture.md` specifies a design (trait, concurrency model, module boundary), implement that design. Do not substitute a simpler ad-hoc pattern because the correct approach is harder. If the specified approach feels too complex, flag it — don't silently downgrade.
 - FP16 storage, FP32 accumulation for all compute
 - Row-major tensor convention everywhere (cuBLAS column-major handled inside CUDA backend only)
 - DeviceTensor is an opaque handle (TensorId + shape + dtype) — engine never touches device pointers. Use `try_new()` for validated construction, `new()` for infallible (test/internal) use
@@ -60,13 +61,44 @@ Tests are serialized by GPU memory sensitivity via `.config/nextest.toml`:
 - Both contiguous and paged KV cache coexist via `KvCacheBackend` enum; contiguous is default until paged is validated on production model
 - BatchScheduler uses decode-priority policy: active decodes always scheduled before new prefills
 - Prefill chunking splits prompts > `max_prefill_tokens` (default 512, configurable) across iterations
+- TurboQuant uses separate K and V rotation matrices per layer (different seeds) — never share a single rotation for both
+- TurboQuant codebook centroids scale with `1/sqrt(head_dim)` — codebooks are dimension-specific, not universal
+- `PagedCache` trait abstracts FP16 paged and TurboQuant quantized caches; `batched_forward` is generic over it
+- TurboQuant compress scratch tensors are pre-allocated (sized for max bit-width across layers) to avoid per-call cudaMalloc
 
 ## Build & Test
 
 ```bash
 cargo check          # Verify workspace compiles
-cargo nextest run    # Run all tests (636 tests: unit + GPU kernel + integration + e2e)
+cargo nextest run    # Run all tests (772 tests: unit + GPU kernel + integration + e2e)
 cargo clippy         # Lint
+```
+
+**Always use `cargo nextest run`, never `cargo test`.** Nextest enforces test groups in `.config/nextest.toml` that serialize GPU-memory-sensitive and e2e tests. `cargo test` ignores these groups and will cause OOM or port conflicts.
+
+### Worktrees
+
+Use git worktrees for isolated feature branches. Convention: `../Fracture-<feature>` as a sibling directory with a matching branch name.
+
+```bash
+git branch my-feature
+git worktree add ../Fracture-my-feature my-feature
+```
+
+**Use `git -C <worktree-path>` for all git operations in worktrees** — do not `cd` into the worktree for git commands. `git -C` matches the permission pattern `Bash(git -C:*)` directly, while `cd && git` does not.
+
+```bash
+git -C ../Fracture-my-feature add -A
+git -C ../Fracture-my-feature commit -m "message"
+```
+
+For non-git commands (cargo, etc.), use `cd <path> && cargo ...`. Edits to worktree files work normally since user-level permissions cover `/home/nick/projects/Fracture*/**`.
+
+When done, merge back and clean up:
+```bash
+git merge my-feature --no-ff -m "merge: description"
+git worktree remove ../Fracture-my-feature
+git branch -d my-feature
 ```
 
 CUDA backend requires NVIDIA GPU + CUDA toolkit. The workspace compiles without CUDA for non-GPU crates.
@@ -121,6 +153,22 @@ Phase 4 adds production inference capabilities. See `docs/fracture_phase4_archit
 - E2e validated: distributed batched output matches sequential greedy output for multiple prompts
 - E2e validated: concurrent requests through batched distributed pipeline produce correct independent outputs
 - Throughput benchmark: measures tokens/second under concurrent load
+
+### Completed (Step 4.5 — TurboQuant KV Cache Compression)
+
+- Google's TurboQuant (ICLR 2026) integrated as opt-in `--kv-quant turboquant` mode
+- Community-validated V3 algorithm: MSE-only (no QJL — fails under softmax), rotation + Lloyd-Max quantization
+- `PagedCache` trait in `batched.rs`: both `PagedKvCacheManager` (FP16) and `QuantizedKvCacheManager` implement it; `batched_forward` and `batched_forward_node` are generic over `C: PagedCache`
+- `TurboQuantConfig` (`turboquant.rs`): key_bits, value_bits, protected_bits, protected_layers, seed
+- `QuantizedBlockPool` + `QuantizedKvCacheManager` (`quantized_paged_kv_cache.rs`): pre-allocated compressed blocks with per-layer bit widths, rotation matrices, and codebooks on device
+- `CompressScratch`: pre-allocated scratch tensors to avoid per-call cudaMalloc
+- Three CUDA kernels: `turboquant_compress.cu` (fused normalize/rotate/quantize/pack), `turboquant_decompress.cu` (test utility), `attention_paged_tq.cu` (fused decompress+attention with query pre-rotation optimization)
+- `Backend::turboquant_compress()` and `Backend::attention_paged_tq()` trait methods with default error returns
+- Worker/coordinator `--kv-quant turboquant` CLI flags; worker serve loop dispatches via PagedCache trait
+- Asymmetric K/V bits (default K4/V2 = 5.1x compression), per-layer protection (8-bit edge layers)
+- Separate K/V rotation matrices per layer (distinct seeds prevent V corruption during query pre-rotation)
+- GPU validated: TQ K4/V2 logit cosine similarity = 0.999 vs FP16; identical greedy argmax
+- See `docs/turboquant.md` for full technical documentation
 
 ### Planned (Steps 5-6)
 

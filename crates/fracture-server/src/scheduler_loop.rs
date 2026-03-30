@@ -139,10 +139,10 @@ async fn scheduler_loop_task<B: Backend + 'static>(
             }
         }
 
-        // Build the batch.
+        // Build the batch (also allocates cache for new prefill sequences).
         let decision = {
-            let cache_guard = cache.lock().unwrap();
-            scheduler.schedule(&cache_guard)
+            let mut cache_guard = cache.lock().unwrap();
+            scheduler.schedule(&mut cache_guard)
         };
 
         if decision.total_tokens == 0 {
@@ -150,40 +150,12 @@ async fn scheduler_loop_task<B: Backend + 'static>(
             continue;
         }
 
-        // Allocate cache for new prefill sequences.
-        let mut failed_seq_ids = Vec::new();
-        {
-            let mut cache_guard = cache.lock().unwrap();
-            for pf in &decision.prefills {
-                if cache_guard.seq_len(pf.handle).is_err() {
-                    match cache_guard.alloc() {
-                        Ok(handle) => {
-                            if let Some(seq) = scheduler.active.get_mut(&pf.seq_id) {
-                                seq.handle = handle;
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(seq) = scheduler.active.remove(&pf.seq_id) {
-                                let _ = seq.event_tx.send(GenerationEvent::Error(
-                                    format!("cache allocation failed: {e}"),
-                                ));
-                            }
-                            failed_seq_ids.push(pf.seq_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build SequenceSlices, skipping failed allocations.
+        // Build SequenceSlices.
         let mut slices: Vec<SequenceSlice> = Vec::new();
         let mut slice_seq_ids: Vec<u64> = Vec::new();
         let mut slice_is_prefill: Vec<bool> = Vec::new();
 
         for pf in &decision.prefills {
-            if failed_seq_ids.contains(&pf.seq_id) {
-                continue;
-            }
             let Some(seq) = scheduler.active.get(&pf.seq_id) else {
                 continue;
             };
@@ -226,7 +198,7 @@ async fn scheduler_loop_task<B: Backend + 'static>(
                     engine_ref.backend(),
                     engine_ref.weights(),
                     &lr,
-                    &mut cache_guard,
+                    &mut *cache_guard,
                     &slices,
                 )
             })

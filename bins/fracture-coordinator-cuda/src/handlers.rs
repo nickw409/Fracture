@@ -190,7 +190,7 @@ async fn distributed_generate_inner(
     // Allocate cache on all workers
     {
         let mut reg = registry.lock().await;
-        pipeline.alloc_cache(&mut reg, seq_id, 0).await?;
+        pipeline.alloc_cache(&mut reg, seq_id).await?;
     }
 
     // Prefill
