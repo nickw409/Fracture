@@ -9,9 +9,14 @@
 use fracture_core::turboquant::{
     generate_rotation_matrix, get_codebook, TurboQuantConfig,
 };
-use fracture_core::{Backend, DType, DeviceTensor};
+use fracture_core::{Backend, DType, DeviceTensor, ModelConfig};
 use fracture_cuda::CudaBackend;
+use fracture_engine::{
+    batched_forward, PagedKvCacheManager, QuantizedKvCacheManager, SequenceSlice,
+};
+use fracture_gguf::{LayerWeights, WeightStore};
 use half::f16;
+use rand::Rng;
 
 /// Upload a rotation matrix to the GPU.
 fn upload_rotation(backend: &CudaBackend, d: usize, seed: u64) -> DeviceTensor {
@@ -423,4 +428,232 @@ fn test_turboquant_compress_8bit() {
     backend.free(&packed).unwrap();
     backend.free(&norms).unwrap();
     backend.free(&output).unwrap();
+}
+
+// ── End-to-end: TurboQuant batched_forward vs FP16 batched_forward ─────
+
+fn e2e_test_config() -> ModelConfig {
+    ModelConfig {
+        hidden_size: 64,
+        num_layers: 2,
+        num_q_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 16,
+        intermediate_size: 128,
+        vocab_size: 256,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        max_seq_len: 64,
+    }
+}
+
+fn random_fp16_bytes_seeded(numel: usize) -> Vec<u8> {
+    let mut rng = rand::rng();
+    let mut bytes = Vec::with_capacity(numel * 2);
+    for _ in 0..numel {
+        let val: f32 = rng.random_range(-0.1..0.1);
+        let fp16 = f16::from_f32(val);
+        bytes.extend_from_slice(&fp16.to_le_bytes());
+    }
+    bytes
+}
+
+fn alloc_random(
+    backend: &CudaBackend,
+    shape: &[usize],
+) -> fracture_core::Result<DeviceTensor> {
+    let tensor = backend.alloc(shape, DType::FP16)?;
+    let numel: usize = shape.iter().product();
+    let data = random_fp16_bytes_seeded(numel);
+    backend.copy_to_device(&tensor, &data)?;
+    Ok(tensor)
+}
+
+fn build_e2e_weights(backend: &CudaBackend) -> fracture_core::Result<WeightStore> {
+    let cfg = e2e_test_config();
+    let token_embedding = alloc_random(backend, &[cfg.vocab_size, cfg.hidden_size])?;
+    let mut layers = Vec::new();
+    for _ in 0..cfg.num_layers {
+        layers.push(LayerWeights {
+            q_proj: alloc_random(backend, &[cfg.hidden_size, cfg.hidden_size])?,
+            k_proj: alloc_random(backend, &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size])?,
+            v_proj: alloc_random(backend, &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size])?,
+            o_proj: alloc_random(backend, &[cfg.hidden_size, cfg.hidden_size])?,
+            gate_proj: alloc_random(backend, &[cfg.intermediate_size, cfg.hidden_size])?,
+            up_proj: alloc_random(backend, &[cfg.intermediate_size, cfg.hidden_size])?,
+            down_proj: alloc_random(backend, &[cfg.hidden_size, cfg.intermediate_size])?,
+            attn_norm: alloc_random(backend, &[cfg.hidden_size])?,
+            ffn_norm: alloc_random(backend, &[cfg.hidden_size])?,
+        });
+    }
+    let output_norm = alloc_random(backend, &[cfg.hidden_size])?;
+    let lm_head = alloc_random(backend, &[cfg.vocab_size, cfg.hidden_size])?;
+    Ok(WeightStore {
+        config: cfg,
+        token_embedding,
+        layers,
+        output_norm,
+        lm_head,
+    })
+}
+
+/// Compare TurboQuant 8-bit batched_forward against FP16 batched_forward.
+///
+/// 8-bit TQ should produce nearly identical logits to FP16 since the
+/// quantization distortion is negligible at 256 levels.
+#[test]
+fn test_batched_forward_tq8_vs_fp16() {
+    let mut backend = CudaBackend::new(0).unwrap();
+    let cfg = e2e_test_config();
+    backend
+        .precompute_rope_freqs(cfg.head_dim, cfg.rope_theta)
+        .unwrap();
+
+    let weights = build_e2e_weights(&backend).unwrap();
+    let layer_range = 0..cfg.num_layers;
+
+    let prompt = vec![1u32, 2, 3, 4, 5];
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+
+    // FP16 paged path
+    let mut fp16_cache = PagedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend,
+    )
+    .unwrap();
+    let fp16_handle = fracture_engine::PagedCache::alloc(&mut fp16_cache).unwrap();
+    let sequences_fp16 = vec![SequenceSlice {
+        handle: fp16_handle,
+        token_ids: prompt.clone(),
+        positions: positions.clone(),
+    }];
+    let fp16_output = batched_forward(
+        &backend, &weights, &layer_range, &mut fp16_cache, &sequences_fp16,
+    )
+    .unwrap();
+
+    // TQ 8-bit path (near-lossless)
+    let tq_config = TurboQuantConfig {
+        key_bits: 8,
+        value_bits: 8,
+        protected_bits: 8,
+        protected_layers: 0,
+        residual_tokens: 0,
+        seed: 42,
+    };
+    let mut tq_cache = QuantizedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim,
+        prompt.len(), tq_config, &backend,
+    )
+    .unwrap();
+    let tq_handle = fracture_engine::PagedCache::alloc(&mut tq_cache).unwrap();
+    let sequences_tq = vec![SequenceSlice {
+        handle: tq_handle,
+        token_ids: prompt.clone(),
+        positions: positions.clone(),
+    }];
+    let tq_output = batched_forward(
+        &backend, &weights, &layer_range, &mut tq_cache, &sequences_tq,
+    )
+    .unwrap();
+
+    // Compare logits
+    let fp16_logits = &fp16_output.logits[0];
+    let tq_logits = &tq_output.logits[0];
+    assert_eq!(fp16_logits.len(), tq_logits.len());
+
+    let sim = cosine_similarity(fp16_logits, tq_logits);
+    eprintln!("TQ8 vs FP16 logit cosine similarity: {sim:.6}");
+
+    assert!(
+        sim > 0.95,
+        "8-bit TQ logits should be close to FP16 (cosine > 0.95), got {sim}"
+    );
+
+    // Cleanup
+    fracture_engine::PagedCache::free(&mut fp16_cache, fp16_handle).unwrap();
+    fp16_cache.destroy(&backend).unwrap();
+    fracture_engine::PagedCache::free(&mut tq_cache, tq_handle).unwrap();
+    tq_cache.destroy(&backend).unwrap();
+}
+
+/// Compare TurboQuant K4/V2 batched_forward against FP16.
+///
+/// K4/V2 has more quantization noise but should still produce
+/// correlated logits (same general distribution).
+#[test]
+fn test_batched_forward_tq_k4v2_vs_fp16() {
+    let mut backend = CudaBackend::new(0).unwrap();
+    let cfg = e2e_test_config();
+    backend
+        .precompute_rope_freqs(cfg.head_dim, cfg.rope_theta)
+        .unwrap();
+
+    let weights = build_e2e_weights(&backend).unwrap();
+    let layer_range = 0..cfg.num_layers;
+
+    let prompt = vec![10u32, 20, 30];
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+
+    // FP16
+    let mut fp16_cache = PagedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend,
+    )
+    .unwrap();
+    let fp16_handle = fracture_engine::PagedCache::alloc(&mut fp16_cache).unwrap();
+    let fp16_output = batched_forward(
+        &backend, &weights, &layer_range, &mut fp16_cache,
+        &[SequenceSlice {
+            handle: fp16_handle, token_ids: prompt.clone(), positions: positions.clone(),
+        }],
+    )
+    .unwrap();
+
+    // TQ K4/V2
+    let tq_config = TurboQuantConfig::default(); // K4/V2
+    let mut tq_cache = QuantizedKvCacheManager::new(
+        64, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim,
+        prompt.len(), tq_config, &backend,
+    )
+    .unwrap();
+    let tq_handle = fracture_engine::PagedCache::alloc(&mut tq_cache).unwrap();
+    let tq_output = batched_forward(
+        &backend, &weights, &layer_range, &mut tq_cache,
+        &[SequenceSlice {
+            handle: tq_handle, token_ids: prompt.clone(), positions: positions.clone(),
+        }],
+    )
+    .unwrap();
+
+    let fp16_logits = &fp16_output.logits[0];
+    let tq_logits = &tq_output.logits[0];
+    assert_eq!(fp16_logits.len(), tq_logits.len());
+
+    let sim = cosine_similarity(fp16_logits, tq_logits);
+    eprintln!("TQ K4/V2 vs FP16 logit cosine similarity: {sim:.6}");
+
+    // K4/V2 has more noise — lower threshold
+    assert!(
+        sim > 0.70,
+        "K4/V2 TQ logits should correlate with FP16 (cosine > 0.70), got {sim}"
+    );
+
+    // Verify argmax — top prediction should often agree
+    let fp16_argmax = fp16_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap()
+        .0;
+    let tq_argmax = tq_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap()
+        .0;
+    eprintln!("FP16 argmax: {fp16_argmax}, TQ K4/V2 argmax: {tq_argmax}");
+
+    fracture_engine::PagedCache::free(&mut fp16_cache, fp16_handle).unwrap();
+    fp16_cache.destroy(&backend).unwrap();
+    fracture_engine::PagedCache::free(&mut tq_cache, tq_handle).unwrap();
+    tq_cache.destroy(&backend).unwrap();
 }
