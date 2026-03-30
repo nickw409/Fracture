@@ -51,6 +51,12 @@ pub enum MessageType {
     /// Coordinator tells a worker to reconfigure with a new layer range.
     /// Payload is RegisterAckPayload (same fields).
     Reconfigure = 0x0F,
+    /// Election start broadcast (candidate → peers).
+    ElectionStart = 0x10,
+    /// Election challenge (higher-priority node → candidate).
+    ElectionChallenge = 0x11,
+    /// Victory declaration (new leader → all peers).
+    Victory = 0x12,
     /// Cluster manifest broadcast (coordinator → workers).
     ClusterManifest = 0x13,
     /// Worker re-registration after reconnection (carries current state).
@@ -77,6 +83,9 @@ impl MessageType {
             0x0D => Ok(Self::BatchedForwardResult),
             0x0E => Ok(Self::WorkerReady),
             0x0F => Ok(Self::Reconfigure),
+            0x10 => Ok(Self::ElectionStart),
+            0x11 => Ok(Self::ElectionChallenge),
+            0x12 => Ok(Self::Victory),
             0x13 => Ok(Self::ClusterManifest),
             0x14 => Ok(Self::ReRegister),
             0x15 => Ok(Self::LeaveIntent),
@@ -186,6 +195,9 @@ mod tests {
             MessageType::BatchedForwardResult,
             MessageType::WorkerReady,
             MessageType::Reconfigure,
+            MessageType::ElectionStart,
+            MessageType::ElectionChallenge,
+            MessageType::Victory,
             MessageType::ClusterManifest,
             MessageType::ReRegister,
             MessageType::LeaveIntent,

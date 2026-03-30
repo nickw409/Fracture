@@ -156,6 +156,37 @@ pub struct CacheAllocPayload {
 // ── 0x08 CacheFree — no payload (seq_id in frame header) ────────────────
 // ── 0x09 Shutdown — no payload ──────────────────────────────────────────
 
+// ── 0x10 ElectionStart (Node → Peers) ───────────────────────────────────
+
+/// Broadcast by a candidate to start an election.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionStartPayload {
+    pub candidate_id: String,
+    pub priority: u32,
+    pub term: u64,
+}
+
+// ── 0x11 ElectionChallenge (Node → Candidate) ──────────────────────────
+
+/// Sent by a higher-priority node to challenge a candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionChallengePayload {
+    pub challenger_id: String,
+    pub priority: u32,
+    pub term: u64,
+}
+
+// ── 0x12 Victory (Leader → Peers) ──────────────────────────────────────
+
+/// Broadcast by the election winner to declare victory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VictoryPayload {
+    pub leader_id: String,
+    pub term: u64,
+    /// Address where the new coordinator accepts connections.
+    pub coordinator_addr: String,
+}
+
 // ── 0x13 ClusterManifest (Coordinator → Workers) ────────────────────────
 
 /// Cluster manifest broadcast to all workers for peer discovery.
