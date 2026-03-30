@@ -1,5 +1,6 @@
 mod backend;
 mod dtype;
+pub mod env_config;
 mod error;
 mod model_config;
 mod profiling;

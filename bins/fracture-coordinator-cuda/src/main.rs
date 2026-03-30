@@ -57,26 +57,28 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Load config file (fracture.env) → CLI flags as fallback.
     let args: Vec<String> = std::env::args().collect();
-
-    // Helper: env var with flag fallback.
-    let env_or_flag = |env_key: &str, flag: &str| -> Option<String> {
-        std::env::var(env_key).ok().or_else(|| {
-            args.iter()
-                .position(|a| a == flag)
-                .and_then(|i| args.get(i + 1).cloned())
-        })
-    };
+    let (cfg, cfg_path) = fracture_core::env_config::load_config(&args);
+    if let Some(path) = cfg_path {
+        tracing::info!("loaded config from {path}");
+    }
 
     let config = CoordinatorConfig {
-        listen_address: env_or_flag("FRACTURE_LISTEN", "--listen")
-            .unwrap_or_else(|| "0.0.0.0:9400".into()),
-        model_path: env_or_flag("FRACTURE_MODEL", "--model")
-            .expect("--model or FRACTURE_MODEL is required"),
-        expected_workers: env_or_flag("FRACTURE_WORKERS", "--workers")
+        listen_address: cfg
+            .get_or_flag("FRACTURE_LISTEN", &args, "--listen")
+            .unwrap_or("0.0.0.0:9400")
+            .to_string(),
+        model_path: cfg
+            .get_or_flag("FRACTURE_MODEL", &args, "--model")
+            .expect("--model or FRACTURE_MODEL is required")
+            .to_string(),
+        expected_workers: cfg
+            .get_or_flag("FRACTURE_WORKERS", &args, "--workers")
             .and_then(|p| p.parse().ok())
             .expect("--workers or FRACTURE_WORKERS is required"),
-        http_port: env_or_flag("FRACTURE_HTTP_PORT", "--http-port")
+        http_port: cfg
+            .get_or_flag("FRACTURE_HTTP_PORT", &args, "--http-port")
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080),
         max_seq_len: args
