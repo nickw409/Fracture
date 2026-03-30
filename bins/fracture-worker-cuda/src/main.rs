@@ -72,30 +72,40 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Parse CLI args
+    // Parse CLI args. Env vars take precedence over flags for network config.
     let args: Vec<String> = std::env::args().collect();
-    let coordinator_addr_arg = args
-        .iter()
-        .position(|a| a == "--coordinator")
-        .and_then(|i| args.get(i + 1).cloned());
 
-    let seed_addrs: Vec<String> = args
-        .iter()
-        .position(|a| a == "--seed")
-        .and_then(|i| args.get(i + 1))
+    let coordinator_addr_arg = std::env::var("FRACTURE_COORDINATOR").ok().or_else(|| {
+        args.iter()
+            .position(|a| a == "--coordinator")
+            .and_then(|i| args.get(i + 1).cloned())
+    });
+
+    let seed_addrs: Vec<String> = std::env::var("FRACTURE_SEEDS")
+        .ok()
+        .or_else(|| {
+            args.iter()
+                .position(|a| a == "--seed")
+                .and_then(|i| args.get(i + 1).cloned())
+        })
         .map(|s| s.split(',').map(|a| a.trim().to_string()).collect())
         .unwrap_or_default();
 
-    let peer_port: u16 = args
-        .iter()
-        .position(|a| a == "--peer-port")
-        .and_then(|i| args.get(i + 1))
+    let peer_port: u16 = std::env::var("FRACTURE_PEER_PORT")
+        .ok()
         .and_then(|p| p.parse().ok())
+        .or_else(|| {
+            args.iter()
+                .position(|a| a == "--peer-port")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|p| p.parse().ok())
+        })
         .unwrap_or(0); // 0 = OS-assigned
 
     if coordinator_addr_arg.is_none() && seed_addrs.is_empty() {
         eprintln!(
-            "usage: fracture-worker-cuda (--coordinator <host:port> | --seed <h1:p,h2:p,...>) \
+            "usage: Set FRACTURE_COORDINATOR or FRACTURE_SEEDS env var, or use:\n  \
+             fracture-worker-cuda (--coordinator <host:port> | --seed <h1:p,h2:p,...>) \
              --model <path-to-gguf> [--gpu <id>] [--node-id <name>] [--peer-port <port>]"
         );
         std::process::exit(1);

@@ -59,27 +59,24 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // Helper: env var with flag fallback.
+    let env_or_flag = |env_key: &str, flag: &str| -> Option<String> {
+        std::env::var(env_key).ok().or_else(|| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        })
+    };
+
     let config = CoordinatorConfig {
-        listen_address: args
-            .iter()
-            .position(|a| a == "--listen")
-            .and_then(|i| args.get(i + 1).cloned())
+        listen_address: env_or_flag("FRACTURE_LISTEN", "--listen")
             .unwrap_or_else(|| "0.0.0.0:9400".into()),
-        model_path: args
-            .iter()
-            .position(|a| a == "--model")
-            .and_then(|i| args.get(i + 1).cloned())
-            .expect("--model <path-to-gguf> is required"),
-        expected_workers: args
-            .iter()
-            .position(|a| a == "--workers")
-            .and_then(|i| args.get(i + 1))
+        model_path: env_or_flag("FRACTURE_MODEL", "--model")
+            .expect("--model or FRACTURE_MODEL is required"),
+        expected_workers: env_or_flag("FRACTURE_WORKERS", "--workers")
             .and_then(|p| p.parse().ok())
-            .expect("--workers <count> is required"),
-        http_port: args
-            .iter()
-            .position(|a| a == "--http-port")
-            .and_then(|i| args.get(i + 1))
+            .expect("--workers or FRACTURE_WORKERS is required"),
+        http_port: env_or_flag("FRACTURE_HTTP_PORT", "--http-port")
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080),
         max_seq_len: args
