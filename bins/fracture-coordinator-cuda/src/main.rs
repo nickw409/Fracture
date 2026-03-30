@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
+mod admin;
 mod distributed_loop;
 mod handlers;
 mod pipeline_setup;
@@ -159,7 +160,14 @@ async fn main() -> Result<()> {
             pipeline_rx,
         );
         let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
+        // Admin API for cluster management (rebalance, drain, cluster info).
+        let (admin_rebalance_tx, _admin_rebalance_rx) = tokio::sync::mpsc::unbounded_channel();
+        let admin_state = Arc::new(admin::AdminState {
+            registry: Arc::clone(&registry),
+            rebalance_tx: admin_rebalance_tx,
+        });
         create_batched_router(batched_state)
+            .merge(admin::admin_routes(admin_state))
     } else {
         tracing::info!("using sequential distributed_generate");
         let state = Arc::new(CoordState {
