@@ -3,6 +3,9 @@
 //! Connects to a coordinator, benchmarks the local GPU, registers with
 //! calibration data, receives a layer assignment, loads weights, and
 //! serves Forward/Cache/Heartbeat requests over the wire protocol.
+//!
+//! Heartbeat handling runs in a dedicated router task so that heartbeat
+//! responses are never blocked by long-running forward passes.
 
 use anyhow::Result;
 use fracture_core::Backend;
@@ -15,13 +18,35 @@ use fracture_engine::{
 use fracture_gguf::{GgufParser, WeightStore};
 use fracture_protocol::{
     connection::FramedConnection,
-    frame::MessageType,
+    frame::{FrameHeader, MessageType},
     messages::*,
     tensor::{make_header, wire_to_dtype},
+
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
+
+/// Shared worker stats read by the heartbeat responder and updated
+/// by the main serve loop. Lock-free via atomics.
+struct WorkerStats {
+    gpu_memory_used: AtomicU64,
+    active_sequences: AtomicU32,
+    free_blocks: AtomicU32,
+}
+
+impl WorkerStats {
+    fn new() -> Self {
+        Self {
+            gpu_memory_used: AtomicU64::new(0),
+            active_sequences: AtomicU32::new(0),
+            free_blocks: AtomicU32::new(0),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -153,7 +178,7 @@ async fn main() -> Result<()> {
     let engine = Engine::new(backend, weights, layer_range.clone());
     let mut node = ComputeNodeImpl::new(engine, node_config);
 
-    // Create KV cache manager for our layer range (contiguous — used by Forward)
+    // Create KV cache manager for our layer range (contiguous -- used by Forward)
     let mut cache = KvCacheManager::new(
         layer_range.len(),
         ack.model_config.num_kv_heads,
@@ -198,17 +223,76 @@ async fn main() -> Result<()> {
     // Paged cache handles: seq_id -> CacheHandle (separate namespace)
     let mut paged_handles: HashMap<u64, CacheHandle> = HashMap::new();
 
-    // Signal the coordinator that weight loading is complete and the
-    // worker is ready to process forward/cache requests.
-    conn.send_empty(MessageType::WorkerReady, 0).await?;
-    tracing::info!("ready — entering serve loop");
+    // Split connection: reader goes to the message router task,
+    // writer is shared between heartbeat responder and main loop.
+    let (writer, reader) = conn.into_split();
+    let writer = Arc::new(Mutex::new(writer));
 
-    // Serve loop
+    // Shared stats for heartbeat responses (updated by main loop, read by router).
+    let stats = Arc::new(WorkerStats::new());
+    stats.gpu_memory_used.store(
+        node.engine().backend().total_memory() as u64
+            - node.engine().backend().available_memory() as u64,
+        Ordering::Relaxed,
+    );
+    stats.free_blocks.store(paged_cache.num_free_blocks() as u32, Ordering::Relaxed);
+
+    // Signal the coordinator that weight loading is complete.
+    writer.lock().await.send_empty(MessageType::WorkerReady, 0).await?;
+    tracing::info!("ready -- entering serve loop");
+
+    // Spawn message router: reads all messages, handles heartbeats immediately,
+    // forwards everything else to the main loop via channel.
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<(FrameHeader, Vec<u8>)>();
+    let router_writer = writer.clone();
+    let router_stats = stats.clone();
+    let router_handle = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            let (header, payload) = match reader.recv().await {
+                Ok(frame) => frame,
+                Err(e) => {
+                    tracing::error!("connection lost: {e}");
+                    break;
+                }
+            };
+
+            if header.msg_type == MessageType::Heartbeat {
+                // Respond immediately -- never blocked by forward passes.
+                let ack = match FramedConnection::deserialize_payload::<HeartbeatPayload>(&payload) {
+                    Ok(hb) => HeartbeatAckPayload {
+                        timestamp_echo: hb.timestamp_ns,
+                        nonce_echo: hb.nonce,
+                        gpu_memory_used: router_stats.gpu_memory_used.load(Ordering::Relaxed),
+                        active_sequences: router_stats.active_sequences.load(Ordering::Relaxed),
+                        free_blocks: router_stats.free_blocks.load(Ordering::Relaxed),
+                    },
+                    Err(e) => {
+                        tracing::warn!("malformed Heartbeat payload: {e}");
+                        continue;
+                    }
+                };
+                let mut w = router_writer.lock().await;
+                if let Err(e) = w.send(MessageType::HeartbeatAck, 0, &ack).await {
+                    tracing::error!("failed to send HeartbeatAck: {e}");
+                    break;
+                }
+                continue;
+            }
+
+            // Forward non-heartbeat messages to the main loop.
+            if msg_tx.send((header, payload)).is_err() {
+                break; // Main loop exited
+            }
+        }
+    });
+
+    // Serve loop -- receives forwarded messages from the router.
     loop {
-        let (header, payload) = match conn.recv().await {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::error!("connection lost: {e}");
+        let (header, payload) = match msg_rx.recv().await {
+            Some(frame) => frame,
+            None => {
+                tracing::error!("message router closed");
                 break;
             }
         };
@@ -222,9 +306,10 @@ async fn main() -> Result<()> {
                     &mut cache,
                     &mut handles,
                 );
+                let mut w = writer.lock().await;
                 match result {
                     Ok(result_payload) => {
-                        conn.send(MessageType::ForwardResult, header.seq_id, &result_payload)
+                        w.send(MessageType::ForwardResult, header.seq_id, &result_payload)
                             .await?;
                     }
                     Err(e) => {
@@ -233,7 +318,7 @@ async fn main() -> Result<()> {
                             error_code: ErrorCode::Internal,
                             message: e.to_string(),
                         };
-                        conn.send(MessageType::Error, header.seq_id, &err).await?;
+                        w.send(MessageType::Error, header.seq_id, &err).await?;
                     }
                 }
             }
@@ -244,19 +329,32 @@ async fn main() -> Result<()> {
                     match cache.alloc(node.engine().backend()) {
                         Ok(h) => {
                             e.insert(h);
-                            // Also allocate in paged cache for BatchedForward support
+                            // Also allocate in paged cache for BatchedForward support.
+                            // If paged alloc fails, fail the entire CacheAlloc -- don't
+                            // send a false CacheAllocAck. (Fix #2)
                             match paged_cache.alloc() {
                                 Ok(ph) => {
                                     paged_handles.insert(seq_id, ph);
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "paged cache alloc for seq {seq_id} failed \
-                                         (batched forward unavailable): {e}"
-                                    );
+                                Err(alloc_err) => {
+                                    // Rollback the contiguous alloc
+                                    let contiguous_handle = handles.remove(&seq_id).unwrap();
+                                    let _ = cache.free(contiguous_handle, node.engine().backend());
+                                    let err = ErrorPayload {
+                                        error_code: ErrorCode::OutOfMemory,
+                                        message: format!(
+                                            "CacheAlloc for seq {seq_id} failed (paged): {alloc_err}"
+                                        ),
+                                    };
+                                    tracing::error!("paged cache alloc OOM for seq {seq_id}: {alloc_err}");
+                                    writer.lock().await.send(MessageType::Error, seq_id, &err).await?;
+                                    // Update stats
+                                    stats.active_sequences.store(handles.len() as u32, Ordering::Relaxed);
+                                    stats.free_blocks.store(paged_cache.num_free_blocks() as u32, Ordering::Relaxed);
+                                    continue;
                                 }
                             }
-                            conn.send_empty(MessageType::CacheAllocAck, seq_id).await?;
+                            writer.lock().await.send_empty(MessageType::CacheAllocAck, seq_id).await?;
                             tracing::debug!("allocated cache for seq {seq_id}");
                         }
                         Err(e) => {
@@ -267,7 +365,7 @@ async fn main() -> Result<()> {
                                 ),
                             };
                             tracing::error!("cache alloc OOM for seq {seq_id}: {e}");
-                            conn.send(MessageType::Error, seq_id, &err).await?;
+                            writer.lock().await.send(MessageType::Error, seq_id, &err).await?;
                         }
                     }
                 } else {
@@ -278,8 +376,16 @@ async fn main() -> Result<()> {
                         ),
                     };
                     tracing::warn!("duplicate CacheAlloc for seq {seq_id}");
-                    conn.send(MessageType::Error, seq_id, &err).await?;
+                    writer.lock().await.send(MessageType::Error, seq_id, &err).await?;
                 }
+                // Update stats after alloc changes
+                stats.active_sequences.store(handles.len() as u32, Ordering::Relaxed);
+                stats.free_blocks.store(paged_cache.num_free_blocks() as u32, Ordering::Relaxed);
+                stats.gpu_memory_used.store(
+                    node.engine().backend().total_memory() as u64
+                        - node.engine().backend().available_memory() as u64,
+                    Ordering::Relaxed,
+                );
             }
 
             MessageType::CacheFree => {
@@ -298,21 +404,11 @@ async fn main() -> Result<()> {
                         ),
                     };
                     tracing::warn!("CacheFree for unknown seq {seq_id}");
-                    conn.send(MessageType::Error, seq_id, &err).await?;
+                    writer.lock().await.send(MessageType::Error, header.seq_id, &err).await?;
                 }
-            }
-
-            MessageType::Heartbeat => {
-                let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload)?;
-                let ack = HeartbeatAckPayload {
-                    timestamp_echo: hb.timestamp_ns,
-                    nonce_echo: hb.nonce,
-                    gpu_memory_used: node.engine().backend().total_memory() as u64
-                        - node.engine().backend().available_memory() as u64,
-                    active_sequences: handles.len() as u32,
-                    free_blocks: paged_cache.num_free_blocks() as u32,
-                };
-                conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
+                // Update stats after free
+                stats.active_sequences.store(handles.len() as u32, Ordering::Relaxed);
+                stats.free_blocks.store(paged_cache.num_free_blocks() as u32, Ordering::Relaxed);
             }
 
             MessageType::Reconfigure => {
@@ -320,7 +416,7 @@ async fn main() -> Result<()> {
                     FramedConnection::deserialize_payload(&payload)?;
                 let new_range = reconf.layer_start as usize..reconf.layer_end as usize;
                 tracing::info!(
-                    "reconfiguring: layers {:?} → {:?}",
+                    "reconfiguring: layers {:?} -> {:?}",
                     node.config().layer_range,
                     new_range
                 );
@@ -376,12 +472,21 @@ async fn main() -> Result<()> {
                     num_blocks, new_range
                 );
 
-                conn.send_empty(MessageType::WorkerReady, 0).await?;
+                // Update stats
+                stats.active_sequences.store(0, Ordering::Relaxed);
+                stats.free_blocks.store(paged_cache.num_free_blocks() as u32, Ordering::Relaxed);
+                stats.gpu_memory_used.store(
+                    node.engine().backend().total_memory() as u64
+                        - node.engine().backend().available_memory() as u64,
+                    Ordering::Relaxed,
+                );
+
+                writer.lock().await.send_empty(MessageType::WorkerReady, 0).await?;
                 tracing::info!("ready after reconfigure");
             }
 
             MessageType::Shutdown => {
-                tracing::info!("received Shutdown — exiting");
+                tracing::info!("received Shutdown -- exiting");
                 for (_, h) in handles.drain() {
                     let _ = cache.free(h, node.engine().backend());
                 }
@@ -400,9 +505,10 @@ async fn main() -> Result<()> {
                     &mut paged_cache,
                     &paged_handles,
                 );
+                let mut w = writer.lock().await;
                 match result {
                     Ok(result_payload) => {
-                        conn.send(
+                        w.send(
                             MessageType::BatchedForwardResult,
                             header.seq_id,
                             &result_payload,
@@ -415,7 +521,7 @@ async fn main() -> Result<()> {
                             error_code: ErrorCode::Internal,
                             message: e.to_string(),
                         };
-                        conn.send(MessageType::Error, header.seq_id, &err).await?;
+                        w.send(MessageType::Error, header.seq_id, &err).await?;
                     }
                 }
             }
@@ -426,18 +532,19 @@ async fn main() -> Result<()> {
                     error_code: ErrorCode::ProtocolViolation,
                     message: format!("unexpected message type: {other:?}"),
                 };
-                conn.send(MessageType::Error, header.seq_id, &err).await?;
+                writer.lock().await.send(MessageType::Error, header.seq_id, &err).await?;
             }
         }
     }
 
+    router_handle.abort();
     tracing::info!("worker shut down");
     Ok(())
 }
 
 /// Handle a Forward message: deserialize input, run forward pass, serialize output.
 fn handle_forward(
-    header: &fracture_protocol::FrameHeader,
+    header: &FrameHeader,
     payload: &[u8],
     node: &ComputeNodeImpl<CudaBackend>,
     cache: &mut KvCacheManager,
@@ -446,7 +553,7 @@ fn handle_forward(
     let req: ForwardPayload = FramedConnection::deserialize_payload(payload)?;
     let seq_id = header.seq_id;
 
-    // Get cache handle — require prior CacheAlloc
+    // Get cache handle -- require prior CacheAlloc
     let handle = if let Some(&h) = handles.get(&seq_id) {
         h
     } else {
@@ -506,7 +613,7 @@ fn handle_forward(
 /// Handle a BatchedForward message: deserialize input, run batched forward through
 /// this node's layers with paged KV cache, serialize output.
 fn handle_batched_forward(
-    _header: &fracture_protocol::FrameHeader,
+    _header: &FrameHeader,
     payload: &[u8],
     node: &ComputeNodeImpl<CudaBackend>,
     paged_cache: &mut PagedKvCacheManager,
@@ -609,7 +716,7 @@ fn run_calibration(
     model_path: &str,
     config: &fracture_core::ModelConfig,
 ) -> Result<(f32, f32)> {
-    // Use a temporary backend for calibration — it will be dropped when done
+    // Use a temporary backend for calibration -- it will be dropped when done
     let mut cal_backend = CudaBackend::new(gpu_device)?;
     cal_backend.precompute_rope_freqs(config.head_dim, config.rope_theta)?;
 
