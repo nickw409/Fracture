@@ -19,7 +19,7 @@ Pipeline-parallel execution over TCP. OpenAI-compatible API. Zero engine changes
 
 Fracture is a from-scratch LLM inference engine (~41k lines of Rust, ~1300 lines of CUDA) designed around one principle: **the engine never knows what GPU it's running on**. All compute flows through a `Backend` trait, making the core engine, generation loop, HTTP server, and wire protocol completely backend-agnostic. Today that backend is CUDA; tomorrow it's Metal, and a single inference cluster can mix both.
 
-The system runs Llama 3.1 8B with full numerical validation against PyTorch — greedy generation is token-for-token identical. It has been validated across heterogeneous hardware (RTX 5090 + RTX 3090) in multi-machine distributed inference. KV cache compression via [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) (ICLR 2026) reduces memory consumption by 5x with 0.999 cosine similarity to FP16 output. The cluster is self-healing: workers reconnect after coordinator death, any worker can win a leader election, and nodes can join or leave without restarting the cluster.
+The system runs Llama 3.1 8B with full numerical validation against PyTorch — greedy generation is token-for-token identical. It has been validated across heterogeneous hardware (RTX 5090 + RTX 3090) in multi-machine distributed inference. KV cache compression via [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) (ICLR 2026) reduces memory consumption by 5x with 0.999 cosine similarity to FP16 output. The cluster is self-healing: workers reconnect after coordinator death, any worker can win a leader election via priority-based bully algorithm, and new nodes can join or leave at runtime via seed discovery without restarting the cluster.
 
 ## Architecture
 
@@ -425,7 +425,8 @@ If CUDA tests segfault, verify `nvidia-smi` works and `.cargo/config.toml` is pr
 | 4 | Production (paged KV cache, continuous batching, distributed batching) | **Complete** |
 | 4.5 | [TurboQuant](docs/turboquant.md) KV cache compression (5x memory reduction, ICLR 2026) | **Complete** |
 | 5 | Network resilience (leader election, worker reconnection, seed discovery, dynamic join/leave) | **Complete** |
-| 6 | Cross-platform (Metal backend for Apple Silicon — heterogeneous clusters) | Planned |
+| 6 | Pipeline micro-batching (overlap pipeline stages for ~100% utilization) | Planned |
+| 7 | Cross-platform (Metal backend for Apple Silicon — heterogeneous clusters) | Planned |
 
 ## License
 
