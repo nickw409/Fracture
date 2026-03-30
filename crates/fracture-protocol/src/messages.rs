@@ -156,6 +156,28 @@ pub struct CacheAllocPayload {
 // ── 0x08 CacheFree — no payload (seq_id in frame header) ────────────────
 // ── 0x09 Shutdown — no payload ──────────────────────────────────────────
 
+// ── 0x14 ReRegister (Worker → Coordinator) ──────────────────────────────
+
+/// Worker re-registration payload sent after reconnecting to the coordinator.
+/// Carries the worker's current state so the coordinator can restore it
+/// without a full re-setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReRegisterPayload {
+    /// Same fields as RegisterPayload (capabilities).
+    pub node_id: String,
+    pub gpu_model: String,
+    pub gpu_memory_total: u64,
+    pub gpu_memory_available: u64,
+    pub compute_capability: (u32, u32),
+    pub decode_ms_per_layer: f32,
+    pub prefill_ms_per_layer_128: f32,
+    /// Current layer assignment (if Ready before disconnect).
+    pub current_layer_start: Option<u32>,
+    pub current_layer_end: Option<u32>,
+    /// Sequence IDs with active KV cache allocations.
+    pub active_cache_seq_ids: Vec<u64>,
+}
+
 // ── 0x0A Error (Bidirectional) ──────────────────────────────────────────
 
 /// Error codes for the Error message type.
@@ -486,6 +508,46 @@ mod tests {
         let payload = CacheAllocPayload { max_seq_len: 4096 };
         let decoded: CacheAllocPayload = bincode_roundtrip(&payload);
         assert_eq!(decoded.max_seq_len, 4096);
+    }
+
+    #[test]
+    fn test_reregister_payload_roundtrip() {
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu0".into(),
+            gpu_model: "NVIDIA RTX 3090".into(),
+            gpu_memory_total: 24 * 1024 * 1024 * 1024,
+            gpu_memory_available: 8 * 1024 * 1024 * 1024,
+            compute_capability: (8, 6),
+            decode_ms_per_layer: 1.1,
+            prefill_ms_per_layer_128: 3.5,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![1, 5, 42],
+        };
+        let decoded: ReRegisterPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.node_id, "worker-gpu0");
+        assert_eq!(decoded.current_layer_start, Some(0));
+        assert_eq!(decoded.current_layer_end, Some(16));
+        assert_eq!(decoded.active_cache_seq_ids, vec![1, 5, 42]);
+    }
+
+    #[test]
+    fn test_reregister_payload_no_assignment_roundtrip() {
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu1".into(),
+            gpu_model: "NVIDIA RTX 5090".into(),
+            gpu_memory_total: 32 * 1024 * 1024 * 1024,
+            gpu_memory_available: 30 * 1024 * 1024 * 1024,
+            compute_capability: (12, 0),
+            decode_ms_per_layer: 0.8,
+            prefill_ms_per_layer_128: 2.1,
+            current_layer_start: None,
+            current_layer_end: None,
+            active_cache_seq_ids: vec![],
+        };
+        let decoded: ReRegisterPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.current_layer_start, None);
+        assert!(decoded.active_cache_seq_ids.is_empty());
     }
 
     #[test]

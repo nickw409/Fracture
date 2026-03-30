@@ -20,6 +20,7 @@ use fracture_protocol::{
     tensor::{make_header, wire_to_dtype},
 };
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
 
@@ -244,8 +245,8 @@ async fn main() -> Result<()> {
     let mut state = WorkerState::Ready;
     tracing::info!("ready — entering serve loop (state: {state})");
 
-    // Macro to send a message, transitioning to DisconnectedStandby on failure
-    // instead of propagating the error up to main().
+    // Macro to send a message, transitioning to DisconnectedStandby on failure.
+    // `break` exits the innermost loop (the 'serve loop where these are invoked).
     macro_rules! send_or_standby {
         ($conn:expr, $msg_type:expr, $seq_id:expr, $payload:expr, $state:expr) => {
             if let Err(e) = $conn.send($msg_type, $seq_id, $payload).await {
@@ -265,8 +266,14 @@ async fn main() -> Result<()> {
         };
     }
 
-    // Serve loop — returns DisconnectedStandby on connection loss, Exited on Shutdown.
-    loop {
+    // Outer loop: cycles between serving and reconnection until Exited.
+    while state != WorkerState::Exited {
+
+    // Serve loop — sets state to DisconnectedStandby or Exited, then breaks.
+    'serve: loop {
+        if state != WorkerState::Ready {
+            break;
+        }
         let (header, payload) = match conn.recv().await {
             Ok(frame) => frame,
             Err(e) => {
@@ -462,7 +469,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = paged_cache.destroy(node.engine().backend());
                 state = WorkerState::Exited;
-                break;
+                break 'serve;
             }
 
             MessageType::BatchedForward => {
@@ -499,26 +506,162 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Handle post-serve-loop state
-    match state {
-        WorkerState::DisconnectedStandby => {
-            tracing::warn!(
-                "coordinator connection lost — entering standby \
-                 (GPU state retained, {} cached sequences preserved)",
-                handles.len()
+    // Reconnection: on disconnect, attempt to reconnect with backoff.
+    if state == WorkerState::DisconnectedStandby {
+        tracing::warn!(
+            "coordinator connection lost — entering standby \
+             (GPU state retained, {} cached sequences preserved)",
+            handles.len()
+        );
+
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+        let backoff_factor = 2u32;
+
+        loop {
+            // Apply +/-25% jitter to prevent thundering herd
+            let jitter_range = backoff.as_millis() as f64 * 0.25;
+            let jitter_ms = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
+            let sleep_ms = (backoff.as_millis() as f64 + jitter_ms).max(100.0);
+            tracing::info!(
+                "reconnecting to coordinator at {coordinator_addr} in {:.1}s...",
+                sleep_ms / 1000.0
             );
-            // FT-2 will add reconnection with exponential backoff here.
-            // For now the worker stays alive but idle — this prevents the
-            // process from exiting and releasing GPU resources.
-            tracing::info!("standby: waiting for reconnection (not yet implemented)");
+            tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+
+            match TcpStream::connect(&coordinator_addr).await {
+                Ok(stream) => {
+                    tracing::info!("reconnected to coordinator");
+                    conn = FramedConnection::new(stream);
+
+                    // Send ReRegister with current state
+                    let layer_range = node.config().layer_range.clone();
+                    let reregister = ReRegisterPayload {
+                        node_id: node_id.clone(),
+                        gpu_model: node.engine().backend().device_name().to_string(),
+                        gpu_memory_total: node.engine().backend().total_memory() as u64,
+                        gpu_memory_available: node.engine().backend().available_memory() as u64,
+                        compute_capability: (0, 0),
+                        decode_ms_per_layer: decode_ms,
+                        prefill_ms_per_layer_128: prefill_ms,
+                        current_layer_start: Some(layer_range.start as u32),
+                        current_layer_end: Some(layer_range.end as u32),
+                        active_cache_seq_ids: handles.keys().copied().collect(),
+                    };
+                    if let Err(e) = conn.send(MessageType::ReRegister, 0, &reregister).await {
+                        tracing::error!("failed to send ReRegister: {e}");
+                        backoff = (backoff * backoff_factor).min(max_backoff);
+                        continue;
+                    }
+                    tracing::info!("sent ReRegister, waiting for coordinator response...");
+
+                    // Wait for response: RegisterAck (unchanged) or Reconfigure (new assignment)
+                    match conn.recv().await {
+                        Ok((hdr, pay)) => match hdr.msg_type {
+                            MessageType::RegisterAck => {
+                                tracing::info!("coordinator accepted re-registration (assignment unchanged)");
+                                if let Err(e) = conn.send_empty(MessageType::WorkerReady, 0).await {
+                                    tracing::error!("failed to send WorkerReady: {e}");
+                                    backoff = (backoff * backoff_factor).min(max_backoff);
+                                    continue;
+                                }
+                                state = WorkerState::Ready;
+                                break;
+                            }
+                            MessageType::Reconfigure => {
+                                let reconf: RegisterAckPayload = match FramedConnection::deserialize_payload(&pay) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        tracing::error!("reconfigure deserialize error: {e}");
+                                        backoff = (backoff * backoff_factor).min(max_backoff);
+                                        continue;
+                                    }
+                                };
+                                let new_range = reconf.layer_start as usize..reconf.layer_end as usize;
+                                tracing::info!("coordinator assigned new layers {:?} (was {:?})", new_range, node.config().layer_range);
+
+                                for (_, h) in handles.drain() {
+                                    let _ = cache.free(h, node.engine().backend());
+                                }
+                                for (_, ph) in paged_handles.drain() {
+                                    let _ = paged_cache.free(ph);
+                                }
+                                let _ = paged_cache.destroy(node.engine().backend());
+
+                                let new_weights = WeightStore::load(
+                                    std::path::Path::new(&model_path),
+                                    node.engine().backend(),
+                                    Some(new_range.clone()),
+                                )?;
+                                let new_node_config = NodeConfig::new(new_range.clone(), reconf.total_layers as usize)?;
+                                let reused_backend = node.into_backend();
+                                node = ComputeNodeImpl::new(
+                                    Engine::new(reused_backend, new_weights, new_range.clone()),
+                                    new_node_config,
+                                );
+
+                                cache = KvCacheManager::new(
+                                    new_range.len(),
+                                    reconf.model_config.num_kv_heads,
+                                    reconf.model_config.head_dim,
+                                    reconf.max_seq_len as usize,
+                                );
+                                let gpu_avail = node.engine().backend().available_memory();
+                                let num_blocks = compute_num_blocks(
+                                    gpu_avail, 2 * 1024 * 1024 * 1024,
+                                    new_range.len(),
+                                    reconf.model_config.num_kv_heads,
+                                    reconf.model_config.head_dim,
+                                );
+                                paged_cache = PagedKvCacheManager::new(
+                                    num_blocks, new_range.len(),
+                                    reconf.model_config.num_kv_heads,
+                                    reconf.model_config.head_dim,
+                                    node.engine().backend(),
+                                )?;
+                                tracing::info!("reconfigured after reconnect: {} blocks, layers {:?}", num_blocks, new_range);
+
+                                if let Err(e) = conn.send_empty(MessageType::WorkerReady, 0).await {
+                                    tracing::error!("failed to send WorkerReady: {e}");
+                                    backoff = (backoff * backoff_factor).min(max_backoff);
+                                    continue;
+                                }
+                                state = WorkerState::Ready;
+                                break;
+                            }
+                            MessageType::Shutdown => {
+                                tracing::info!("received Shutdown during reconnection — exiting");
+                                state = WorkerState::Exited;
+                                break;
+                            }
+                            other => {
+                                tracing::error!("unexpected response to ReRegister: {other:?}");
+                                backoff = (backoff * backoff_factor).min(max_backoff);
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("failed to receive response to ReRegister: {e}");
+                            backoff = (backoff * backoff_factor).min(max_backoff);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("reconnection attempt failed: {e}");
+                    backoff = (backoff * backoff_factor).min(max_backoff);
+                }
+            }
         }
-        WorkerState::Exited => {
-            tracing::info!("worker shut down (explicit Shutdown)");
-        }
-        _ => {
-            tracing::warn!("unexpected post-loop state: {state}");
+
+        if state == WorkerState::Ready {
+            tracing::info!("re-entering serve loop after reconnection");
         }
     }
+
+    } // end outer while state != Exited
+
+    tracing::info!("worker shut down");
     Ok(())
 }
 

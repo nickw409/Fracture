@@ -51,6 +51,8 @@ pub enum MessageType {
     /// Coordinator tells a worker to reconfigure with a new layer range.
     /// Payload is RegisterAckPayload (same fields).
     Reconfigure = 0x0F,
+    /// Worker re-registration after reconnection (carries current state).
+    ReRegister = 0x14,
 }
 
 impl MessageType {
@@ -71,6 +73,7 @@ impl MessageType {
             0x0D => Ok(Self::BatchedForwardResult),
             0x0E => Ok(Self::WorkerReady),
             0x0F => Ok(Self::Reconfigure),
+            0x14 => Ok(Self::ReRegister),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -177,6 +180,7 @@ mod tests {
             MessageType::BatchedForwardResult,
             MessageType::WorkerReady,
             MessageType::Reconfigure,
+            MessageType::ReRegister,
         ];
         for mt in types {
             let v = mt as u8;
@@ -188,7 +192,6 @@ mod tests {
     #[test]
     fn test_message_type_unknown() {
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x10).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 
