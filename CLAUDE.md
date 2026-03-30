@@ -44,6 +44,7 @@ Tests are serialized by GPU memory sensitivity via `.config/nextest.toml`:
 
 ## Conventions
 
+- **Architecture docs are the spec.** When `docs/fracture_phase*_architecture.md` specifies a design (trait, concurrency model, module boundary), implement that design. Do not substitute a simpler ad-hoc pattern because the correct approach is harder. If the specified approach feels too complex, flag it — don't silently downgrade.
 - FP16 storage, FP32 accumulation for all compute
 - Row-major tensor convention everywhere (cuBLAS column-major handled inside CUDA backend only)
 - DeviceTensor is an opaque handle (TensorId + shape + dtype) — engine never touches device pointers. Use `try_new()` for validated construction, `new()` for infallible (test/internal) use
