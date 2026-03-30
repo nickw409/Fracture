@@ -7,6 +7,14 @@
 //! Heartbeat handling runs in a dedicated router task so that heartbeat
 //! responses are never blocked by long-running forward passes.
 
+/// Always-on status output for production monitoring.
+/// Prints to stderr regardless of RUST_LOG level.
+macro_rules! status {
+    ($($arg:tt)*) => {
+        eprintln!("[worker] {}", format!($($arg)*));
+    };
+}
+
 use anyhow::Result;
 use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
@@ -86,6 +94,8 @@ async fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| format!("worker-gpu{gpu_device}"));
 
+    status!("{node_id} starting (gpu {gpu_device})");
+
     tracing::info!("Fracture worker (CUDA backend)");
     tracing::info!("node_id: {node_id}");
     tracing::info!("coordinator: {coordinator_addr}");
@@ -100,6 +110,7 @@ async fn main() -> Result<()> {
     let gpu_model = backend.device_name().to_string();
     let gpu_memory_total = backend.total_memory() as u64;
     let gpu_memory_available = backend.available_memory() as u64;
+    status!("gpu: {} ({:.1} GB)", gpu_model, gpu_memory_total as f64 / 1e9);
     tracing::info!(
         "GPU: {} ({:.1} GB total, {:.1} GB available)",
         gpu_model,
@@ -107,6 +118,7 @@ async fn main() -> Result<()> {
         gpu_memory_available as f64 / 1e9,
     );
 
+    status!("calibrating...");
     // Run calibration benchmark on a temporary backend instance
     tracing::info!("running calibration benchmark...");
     let (decode_ms, prefill_ms) =
@@ -133,10 +145,12 @@ async fn main() -> Result<()> {
     // Update available memory after calibration
     let gpu_memory_available = backend.available_memory() as u64;
 
+    status!("connecting to {coordinator_addr}");
     // Connect to coordinator
     tracing::info!("connecting to coordinator at {coordinator_addr}...");
     let stream = TcpStream::connect(&coordinator_addr).await?;
     let mut conn = FramedConnection::new(stream);
+    status!("connected");
 
     // Send Register
     let register = RegisterPayload {
@@ -158,6 +172,7 @@ async fn main() -> Result<()> {
     }
     let ack: RegisterAckPayload = FramedConnection::deserialize_payload(&payload)?;
     let layer_range = ack.layer_start as usize..ack.layer_end as usize;
+    status!("assigned layers {:?} of {}", layer_range, ack.total_layers);
     tracing::info!(
         "assigned layers {:?} (total {}), max_seq_len={}",
         layer_range,
@@ -165,6 +180,7 @@ async fn main() -> Result<()> {
         ack.max_seq_len
     );
 
+    status!("loading weights...");
     // Load assigned layer weights
     tracing::info!("loading weights for layers {:?}...", layer_range);
     let weights = WeightStore::load(
@@ -239,6 +255,11 @@ async fn main() -> Result<()> {
 
     // Signal the coordinator that weight loading is complete.
     writer.lock().await.send_empty(MessageType::WorkerReady, 0).await?;
+    status!(
+        "ready ({} cache blocks, {:.1} GB used)",
+        num_blocks,
+        (node.engine().backend().total_memory() - node.engine().backend().available_memory()) as f64 / 1e9,
+    );
     tracing::info!("ready -- entering serve loop");
 
     // Spawn message router: reads all messages, handles heartbeats immediately,
@@ -252,13 +273,13 @@ async fn main() -> Result<()> {
             let (header, payload) = match reader.recv().await {
                 Ok(frame) => frame,
                 Err(e) => {
+                    status!("connection lost: {e}");
                     tracing::error!("connection lost: {e}");
                     break;
                 }
             };
 
             if header.msg_type == MessageType::Heartbeat {
-                // Respond immediately -- never blocked by forward passes.
                 let ack = match FramedConnection::deserialize_payload::<HeartbeatPayload>(&payload) {
                     Ok(hb) => HeartbeatAckPayload {
                         timestamp_echo: hb.timestamp_ns,
@@ -415,6 +436,7 @@ async fn main() -> Result<()> {
                 let reconf: RegisterAckPayload =
                     FramedConnection::deserialize_payload(&payload)?;
                 let new_range = reconf.layer_start as usize..reconf.layer_end as usize;
+                status!("reconfiguring: layers {:?} -> {:?}", node.config().layer_range, new_range);
                 tracing::info!(
                     "reconfiguring: layers {:?} -> {:?}",
                     node.config().layer_range,
@@ -482,10 +504,12 @@ async fn main() -> Result<()> {
                 );
 
                 writer.lock().await.send_empty(MessageType::WorkerReady, 0).await?;
+                status!("ready after reconfigure ({} blocks, layers {:?})", num_blocks, new_range);
                 tracing::info!("ready after reconfigure");
             }
 
             MessageType::Shutdown => {
+                status!("shutting down");
                 tracing::info!("received Shutdown -- exiting");
                 for (_, h) in handles.drain() {
                     let _ = cache.free(h, node.engine().backend());
