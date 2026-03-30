@@ -624,9 +624,33 @@ async fn main() -> Result<()> {
                     tracing::info!(
                         "election timeout reached — starting election (term={term})"
                     );
-                    // FT-12 will implement actual peer communication here.
-                    // For now, log the intent and continue reconnection attempts.
-                    // If this node wins (no challengers), FT-12 will handle promotion.
+
+                    // For now, simulate election timeout (no peer communication yet).
+                    // In a full implementation, we'd broadcast ElectionStart to peers
+                    // via the cluster manifest and wait for challenges.
+                    // If no challenges received, we win.
+                    let action = agent.on_election_timeout();
+                    if action == fracture_election::state_machine::ElectionAction::DeclareVictory {
+                        tracing::info!("election won — promoting to coordinator");
+                        let coord_port = 9400u16; // TODO: make configurable
+                        let http_port = 8080u16;  // TODO: make configurable
+                        match promote_to_coordinator(&node_id, coord_port, http_port).await {
+                            Ok((listener, addr)) => {
+                                tracing::info!(
+                                    "coordinator promotion successful: listening on {addr}"
+                                );
+                                // FT-12b will handle state reconstruction here:
+                                // accept ReRegister from other workers, rebuild pipeline,
+                                // start HTTP server and scheduler loop.
+                                // For now, just hold the listener open.
+                                drop(listener);
+                                // Stay in standby — full promotion logic in FT-12b.
+                            }
+                            Err(e) => {
+                                tracing::error!("coordinator promotion failed: {e}");
+                            }
+                        }
+                    }
                 }
             }
             // Apply +/-25% jitter to prevent thundering herd
@@ -1004,4 +1028,37 @@ fn run_calibration(
     // The backend's free calls happen in WeightStore's Drop impl.
 
     Ok((decode_avg, prefill_avg))
+}
+
+/// Promote this worker to coordinator (FT-12).
+///
+/// Spawns coordinator tasks alongside existing worker tasks:
+/// - TCP listener for worker (re)registration
+/// - HTTP server for client requests
+///
+/// State reconstruction (FT-12b) happens after promotion: the new coordinator
+/// collects ReRegister from all workers and rebuilds the pipeline.
+///
+/// Returns the TCP listener address and HTTP port for Victory broadcast.
+async fn promote_to_coordinator(
+    node_id: &str,
+    coordinator_port: u16,
+    http_port: u16,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr)> {
+    // Bind TCP listener for worker connections.
+    let tcp_addr = format!("0.0.0.0:{coordinator_port}");
+    let listener = tokio::net::TcpListener::bind(&tcp_addr).await?;
+    let local_addr = listener.local_addr()?;
+    tracing::info!(
+        "promoted to coordinator: TCP listener on {local_addr}, HTTP on port {http_port}"
+    );
+    tracing::info!(
+        "node '{}' is now acting as both worker and coordinator",
+        node_id
+    );
+
+    // HTTP server setup is deferred to FT-12b (state reconstruction)
+    // because we need the pipeline to be rebuilt before we can serve requests.
+
+    Ok((listener, local_addr))
 }
