@@ -70,6 +70,8 @@ cargo nextest run    # Run all tests (636 tests: unit + GPU kernel + integration
 cargo clippy         # Lint
 ```
 
+**Always use `cargo nextest run`, never `cargo test`.** Nextest enforces test groups in `.config/nextest.toml` that serialize GPU-memory-sensitive and e2e tests. `cargo test` ignores these groups and will cause OOM or port conflicts.
+
 CUDA backend requires NVIDIA GPU + CUDA toolkit. The workspace compiles without CUDA for non-GPU crates.
 
 **No manual `export LD_LIBRARY_PATH` is needed.** The `.cargo/config.toml` sets it automatically for all cargo commands (including nextest). This is required on WSL2 where the CUDA driver lives in `/usr/lib/wsl/lib/`.
