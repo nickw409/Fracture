@@ -13,8 +13,9 @@ use fracture_coordinator::pipeline::DistributedPipeline;
 use fracture_coordinator::registry::PeerRegistry;
 use fracture_engine::{GenerationEvent, PendingRequest};
 use fracture_generate::{Sampler, SamplingParams, StopReason};
+use fracture_protocol::connection::FramedConnection;
 use fracture_protocol::frame::MessageType;
-use fracture_protocol::messages::{HeartbeatPayload, SequenceMetadataWire};
+use fracture_protocol::messages::{HeartbeatAckPayload, HeartbeatPayload, SequenceMetadataWire};
 use fracture_server::SchedulerHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -450,7 +451,7 @@ async fn distributed_loop_task(
     }
 }
 
-/// Send heartbeats to all workers and check for dead ones.
+/// Send heartbeats to all workers, wait for acks, and check for dead ones.
 /// Returns the list of newly-dead worker node IDs.
 async fn send_heartbeat_round(
     registry: &Mutex<PeerRegistry>,
@@ -481,7 +482,41 @@ async fn send_heartbeat_round(
         }
     }
 
-    // Increment missed counters and detect dead workers.
+    // Wait for acks with a timeout, then process them.
+    let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut acks_received = 0usize;
+
+    while acks_received < node_ids.len() {
+        // Try to recv an ack from each worker that hasn't responded yet.
+        let mut got_one = false;
+        for node_id in &node_ids {
+            if let Some(entry) = reg.get_mut(node_id) {
+                match tokio::time::timeout(
+                    Duration::from_millis(100),
+                    entry.connection.recv(),
+                ).await {
+                    Ok(Ok((header, payload_bytes))) => {
+                        if header.msg_type == MessageType::HeartbeatAck {
+                            if let Ok(ack) = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload_bytes) {
+                                tracker.process_ack(&mut reg, node_id, &ack);
+                                acks_received += 1;
+                                got_one = true;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("heartbeat ack recv from '{node_id}' failed: {e}");
+                    }
+                    Err(_) => {} // timeout, try next worker
+                }
+            }
+        }
+        if !got_one || tokio::time::Instant::now() >= ack_deadline {
+            break;
+        }
+    }
+
+    // Increment missed counters for workers that didn't respond and detect dead ones.
     let timed_out = tracker.increment_missed(&node_ids, max_missed);
     heartbeat::mark_dead_workers(&mut reg, &timed_out);
 
