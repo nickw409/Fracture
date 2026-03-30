@@ -335,8 +335,6 @@ async fn main() -> Result<()> {
     });
 
     // Pipeline watch channel for fault-tolerant reconfiguration.
-    // The distributed loop holds a Receiver and swaps to the new pipeline
-    // when a worker dies and the pipeline is rebuilt with surviving workers.
     let (pipeline_tx, pipeline_rx) = tokio::sync::watch::channel(Arc::clone(&pipeline));
 
     // Build HTTP router — either batched (Phase 4) or sequential.

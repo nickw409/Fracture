@@ -6,8 +6,7 @@
 //! managed on workers via `alloc_cache`/`free_cache`.
 //!
 //! Heartbeats are sent inline between batch iterations. On worker death,
-//! all active sequences are aborted and the pipeline is flagged as degraded
-//! until reconfiguration completes.
+//! all active sequences are aborted and the pipeline is flagged as degraded.
 
 use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
 use fracture_coordinator::pipeline::DistributedPipeline;
@@ -19,7 +18,7 @@ use fracture_protocol::messages::{HeartbeatPayload, SequenceMetadataWire};
 use fracture_server::SchedulerHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
 
 /// An active distributed sequence.
@@ -47,6 +46,10 @@ pub struct DistributedLoopConfig {
     pub max_prefill_tokens: usize,
     /// Minimum free blocks on the bottleneck worker before admitting new sequences.
     pub min_free_blocks_reserve: u32,
+    /// Heartbeat interval.
+    pub heartbeat_interval: Duration,
+    /// Max missed heartbeats before marking a worker dead.
+    pub heartbeat_max_missed: usize,
 }
 
 impl Default for DistributedLoopConfig {
@@ -56,6 +59,8 @@ impl Default for DistributedLoopConfig {
             max_batch_tokens: 4096,
             max_prefill_tokens: 512,
             min_free_blocks_reserve: 4,
+            heartbeat_interval: heartbeat::DEFAULT_INTERVAL,
+            heartbeat_max_missed: heartbeat::DEFAULT_MAX_MISSED,
         }
     }
 }
@@ -92,8 +97,6 @@ async fn distributed_loop_task(
     let mut heartbeat_tracker = HeartbeatTracker::new();
     let mut last_heartbeat = Instant::now();
     let mut pipeline_degraded = false;
-    let heartbeat_interval = heartbeat::DEFAULT_INTERVAL;
-    let heartbeat_max_missed = heartbeat::DEFAULT_MAX_MISSED;
 
     loop {
         // Check for pipeline reconfiguration.
@@ -118,11 +121,11 @@ async fn distributed_loop_task(
         }
 
         // Send heartbeats periodically (inline, between batch iterations).
-        if last_heartbeat.elapsed() >= heartbeat_interval {
+        if last_heartbeat.elapsed() >= config.heartbeat_interval {
             let dead_workers = send_heartbeat_round(
                 &registry,
                 &mut heartbeat_tracker,
-                heartbeat_max_missed,
+                config.heartbeat_max_missed,
             ).await;
 
             if !dead_workers.is_empty() {
@@ -162,9 +165,6 @@ async fn distributed_loop_task(
             }
             if active.is_empty() {
                 // Wait for pipeline reconfiguration or new requests.
-                let heartbeat_deadline = tokio::time::Instant::from(
-                    last_heartbeat + heartbeat_interval,
-                );
                 tokio::select! {
                     _ = pipeline_rx.changed() => {
                         pipeline = pipeline_rx.borrow_and_update().clone();
@@ -177,7 +177,6 @@ async fn distributed_loop_task(
                             None => return,
                         }
                     }
-                    _ = tokio::time::sleep_until(heartbeat_deadline) => {}
                 }
                 continue;
             }
@@ -187,9 +186,7 @@ async fn distributed_loop_task(
 
         // If no work, wait for the next request (with heartbeat timeout).
         if pending.is_empty() && active.is_empty() {
-            let heartbeat_deadline = tokio::time::Instant::from(
-                last_heartbeat + heartbeat_interval,
-            );
+            let heartbeat_deadline = last_heartbeat + config.heartbeat_interval;
             tokio::select! {
                 req = request_rx.recv() => {
                     match req {
@@ -197,18 +194,23 @@ async fn distributed_loop_task(
                         None => return,
                     }
                 }
-                _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                _ = tokio::time::sleep_until(heartbeat_deadline.into()) => {
+                    // Heartbeat timer fired while idle — loop back to send heartbeat.
                     continue;
                 }
                 _ = pipeline_rx.changed() => {
                     pipeline = pipeline_rx.borrow_and_update().clone();
                     pipeline_degraded = false;
+                    tracing::info!("distributed loop received reconfigured pipeline");
                     continue;
                 }
             }
         }
 
         // Admission: check distributed free blocks before admitting new sequences.
+        // min_free_blocks() returns 0 when no heartbeat data is available yet,
+        // so we always admit at least one request (the alloc will fail with OOM
+        // if the worker truly has no blocks).
         let free_blocks = {
             let reg = registry.lock().await;
             reg.min_free_blocks()
@@ -219,6 +221,7 @@ async fn distributed_loop_task(
             let req = pending.remove(0);
             let seq_id = req.seq_id;
 
+            // Allocate cache on all workers.
             let alloc_result = {
                 let mut reg = registry.lock().await;
                 pipeline.alloc_cache(&mut reg, seq_id, 0).await
@@ -251,6 +254,7 @@ async fn distributed_loop_task(
                     ));
                 }
             }
+            // Only admit one per iteration to re-check free blocks.
             break;
         }
 
@@ -272,8 +276,7 @@ async fn distributed_loop_task(
             if seq.prefill_done || seq.remaining_prefill.is_empty() {
                 continue;
             }
-            if total_tokens >= config.max_batch_tokens
-                || batch_seq_ids.len() >= config.max_batch_size
+            if total_tokens >= config.max_batch_tokens || batch_seq_ids.len() >= config.max_batch_size
             {
                 break;
             }
@@ -292,8 +295,8 @@ async fn distributed_loop_task(
                 seq_id: seq.seq_id,
                 num_tokens: chunk_size,
                 positions: chunk_positions.clone(),
-                block_table: Vec::new(),
-                cache_seq_len: 0,
+                block_table: Vec::new(), // Workers manage their own block tables.
+                cache_seq_len: 0,        // Workers track this locally.
                 last_block_tokens: 0,
             });
             all_token_ids.extend_from_slice(&chunk_tokens);
@@ -308,13 +311,16 @@ async fn distributed_loop_task(
             if !seq.prefill_done {
                 continue;
             }
-            if total_tokens >= config.max_batch_tokens
-                || batch_seq_ids.len() >= config.max_batch_size
+            if total_tokens >= config.max_batch_tokens || batch_seq_ids.len() >= config.max_batch_size
             {
                 break;
             }
 
-            let last_token = seq.generated_tokens.last().copied().unwrap_or(0);
+            let last_token = seq
+                .generated_tokens
+                .last()
+                .copied()
+                .unwrap_or(0);
 
             seq_metas.push(SequenceMetadataWire {
                 seq_id: seq.seq_id,
@@ -341,15 +347,14 @@ async fn distributed_loop_task(
         let forward_result = {
             let mut reg = registry.lock().await;
             pipeline
-                .batched_forward(
-                    &mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill,
-                )
+                .batched_forward(&mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill)
                 .await
         };
 
         let per_seq_logits = match forward_result {
             Ok(logits) => logits,
             Err(e) => {
+                // Forward failed — could be a dead worker. Abort all sequences in batch.
                 let mut reg = registry.lock().await;
                 for seq_id in &batch_seq_ids {
                     if let Some(seq) = active.remove(seq_id) {
@@ -373,9 +378,11 @@ async fn distributed_loop_task(
             };
 
             if is_prefill {
+                // Advance chunked prefill.
                 let chunk_size = seq_metas[i].num_tokens;
                 seq.remaining_prefill.drain(..chunk_size);
                 if !seq.remaining_prefill.is_empty() {
+                    // More chunks to go — don't sample yet.
                     continue;
                 }
                 seq.prefill_done = true;
@@ -393,6 +400,9 @@ async fn distributed_loop_task(
                 Ok(token) => {
                     seq.generated_tokens.push(token);
 
+                    // Increment position only for decode steps. After prefill,
+                    // current_pos is already prompt_len (the correct position for
+                    // the first decode). Each decode then advances by 1.
                     if !is_prefill {
                         seq.current_pos += 1;
                     }
@@ -420,12 +430,13 @@ async fn distributed_loop_task(
         // Cleanup completed sequences.
         for seq_id in &completed_seq_ids {
             if let Some(seq) = active.remove(seq_id) {
-                let stop_reason =
-                    if seq.stop_tokens.contains(seq.generated_tokens.last().unwrap_or(&0)) {
-                        StopReason::Stop
-                    } else {
-                        StopReason::Length
-                    };
+                let stop_reason = if seq.stop_tokens.contains(
+                    seq.generated_tokens.last().unwrap_or(&0),
+                ) {
+                    StopReason::Stop
+                } else {
+                    StopReason::Length
+                };
 
                 let _ = seq.event_tx.send(GenerationEvent::Finished {
                     stop_reason,
@@ -461,6 +472,7 @@ async fn send_heartbeat_round(
 
     let node_ids = reg.pipeline_order();
 
+    // Send heartbeats (best-effort).
     for node_id in &node_ids {
         if let Some(entry) = reg.get_mut(node_id) {
             if let Err(e) = entry.connection.send(MessageType::Heartbeat, 0, &payload).await {
@@ -469,6 +481,7 @@ async fn send_heartbeat_round(
         }
     }
 
+    // Increment missed counters and detect dead workers.
     let timed_out = tracker.increment_missed(&node_ids, max_missed);
     heartbeat::mark_dead_workers(&mut reg, &timed_out);
 

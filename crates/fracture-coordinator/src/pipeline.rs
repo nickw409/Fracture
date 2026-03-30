@@ -10,9 +10,27 @@
 use crate::registry::PeerRegistry;
 use crate::scheduler::LayerAssignment;
 use fracture_core::{FractureError, Result};
-use fracture_protocol::{frame::MessageType, messages::*, FramedConnection};
+use fracture_protocol::{frame::{FrameHeader, MessageType}, messages::*, FramedConnection};
 use std::collections::HashSet;
 use std::sync::Mutex;
+
+/// Receive the next message from a connection, skipping HeartbeatAck messages.
+///
+/// The heartbeat task sends Heartbeat messages on the same connection used
+/// for Forward/CacheAlloc. Workers respond with HeartbeatAck in their serve
+/// loop, so acks can arrive interleaved with forward results. This helper
+/// transparently skips them.
+async fn recv_skipping_heartbeat_acks(conn: &mut FramedConnection) -> Result<(FrameHeader, Vec<u8>)> {
+    loop {
+        let (header, payload) = conn.recv().await?;
+        if header.msg_type == MessageType::HeartbeatAck {
+            // Silently skip — the heartbeat tracker will detect missed acks
+            // via its own timeout mechanism.
+            continue;
+        }
+        return Ok((header, payload));
+    }
+}
 
 /// Orchestrates forward passes across distributed workers.
 ///
@@ -144,7 +162,7 @@ impl DistributedPipeline {
                 .await?;
 
             // Wait for CacheAllocAck or Error from the worker
-            let (header, resp_payload) = entry.connection.recv().await?;
+            let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
@@ -192,8 +210,9 @@ impl DistributedPipeline {
         Ok(())
     }
 
-    /// Best-effort cache free: send CacheFree to all reachable workers.
-    /// Skips dead/disconnected workers. Used during fault recovery.
+    /// Best-effort cache free: send CacheFree to all workers that are still
+    /// reachable. Skips dead/disconnected workers. Used during fault recovery
+    /// when some workers may have already died.
     pub async fn free_cache_best_effort(
         &self,
         registry: &mut PeerRegistry,
@@ -272,7 +291,7 @@ impl DistributedPipeline {
                 .await?;
 
             // Receive ForwardResult
-            let (header, payload) = entry.connection.recv().await?;
+            let (header, payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&payload)?;
@@ -392,7 +411,7 @@ impl DistributedPipeline {
                 .send(MessageType::BatchedForward, frame_seq_id, &payload)
                 .await?;
 
-            let (header, resp_payload) = entry.connection.recv().await?;
+            let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
