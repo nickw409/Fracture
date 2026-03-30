@@ -70,6 +70,7 @@ pub trait Backend: Send + Sync {
     /// out: [N, num_q_heads, head_dim]
     ///
     /// Default returns an error — backends must opt in by overriding.
+    #[allow(clippy::too_many_arguments)]
     fn attention_paged(
         &self,
         _q: &DeviceTensor,

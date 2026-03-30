@@ -61,11 +61,12 @@ pub async fn health_handler() -> impl IntoResponse {
     )
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_model_name(
     model: Option<&str>,
 ) -> std::result::Result<(), axum::response::Response> {
-    if let Some(name) = model {
-        if name != LOADED_MODEL_NAME {
+    if let Some(name) = model
+        && name != LOADED_MODEL_NAME {
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(error_body(&format!(
@@ -74,10 +75,10 @@ pub fn validate_model_name(
             )
                 .into_response());
         }
-    }
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_completion_request(
     req: &CompletionRequest,
 ) -> std::result::Result<(), axum::response::Response> {
@@ -91,6 +92,7 @@ pub fn validate_completion_request(
     validate_sampling_params(req.temperature, req.top_p, req.top_k, req.max_tokens)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_chat_request(
     req: &ChatCompletionRequest,
 ) -> std::result::Result<(), axum::response::Response> {
@@ -123,6 +125,7 @@ pub fn validate_chat_request(
     validate_sampling_params(req.temperature, req.top_p, req.top_k, req.max_tokens)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_sampling_params(
     temperature: f32,
     top_p: f32,
@@ -136,7 +139,7 @@ pub fn validate_sampling_params(
         )
             .into_response());
     }
-    if top_p < 0.0 || top_p > 1.0 {
+    if !(0.0..=1.0).contains(&top_p) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(error_body("top_p must be in [0, 1]")),

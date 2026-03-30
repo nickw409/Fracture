@@ -8,7 +8,7 @@ impl Backend for CudaBackend {
     fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
         let numel: usize = shape.iter().product();
         let size = if dtype.is_packed() {
-            (numel + 1) / 2
+            numel.div_ceil(2)
         } else {
             numel * dtype.size_bytes()
         };
@@ -176,7 +176,7 @@ impl Backend for CudaBackend {
         let num_kv_heads = k.shape[1] as c_int;
 
         // Copy positions to device
-        let pos_size = positions.len() * std::mem::size_of::<u32>();
+        let pos_size = std::mem::size_of_val(positions);
         let mut pos_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut pos_dev, pos_size));
         cuda_check!(cudaMemcpy(
@@ -188,8 +188,8 @@ impl Backend for CudaBackend {
 
         let result = unsafe {
             launch_rope(
-                q_ptr as *mut c_void,
-                k_ptr as *mut c_void,
+                q_ptr,
+                k_ptr,
                 pos_dev as *const u32,
                 freq_ptr as *const f32,
                 num_tokens,
@@ -282,7 +282,7 @@ impl Backend for CudaBackend {
             .collect::<Result<Vec<_>>>()?;
 
         // Copy block_table to device
-        let bt_size = block_table.len() * std::mem::size_of::<i32>();
+        let bt_size = std::mem::size_of_val(block_table);
         let mut bt_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut bt_dev, bt_size));
         cuda_check!(cudaMemcpy(
@@ -385,7 +385,7 @@ impl Backend for CudaBackend {
         let vocab_size = embedding_table.shape[0] as c_int;
 
         // Copy token IDs to device
-        let ids_size = token_ids.len() * std::mem::size_of::<u32>();
+        let ids_size = std::mem::size_of_val(token_ids);
         let mut ids_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut ids_dev, ids_size));
         cuda_check!(cudaMemcpy(

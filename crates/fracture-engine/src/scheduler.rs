@@ -2,7 +2,7 @@ use crate::kv_cache::CacheHandle;
 use crate::paged_kv_cache::PagedKvCacheManager;
 use fracture_core::StopReason;
 use std::collections::{HashMap, VecDeque};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Events sent from the scheduler to a client's response stream.
 #[derive(Debug, Clone)]
@@ -237,7 +237,7 @@ impl BatchScheduler {
 
             // Memory check: estimate blocks needed for this prompt.
             let prompt_len = req.prompt_tokens.len();
-            let blocks_needed = (prompt_len + 15) / 16; // ceil(prompt_len / BLOCK_SIZE)
+            let blocks_needed = prompt_len.div_ceil(16); // ceil(prompt_len / BLOCK_SIZE)
             let available = free_blocks.saturating_sub(reserved_blocks);
             if blocks_needed > available {
                 break; // not enough memory

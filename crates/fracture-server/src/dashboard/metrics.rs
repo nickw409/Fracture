@@ -85,7 +85,7 @@ impl MetricsCollector {
         while inner
             .token_window
             .front()
-            .map_or(false, |(t, _)| *t < cutoff)
+            .is_some_and(|(t, _)| *t < cutoff)
         {
             inner.token_window.pop_front();
         }

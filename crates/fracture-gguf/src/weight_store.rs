@@ -242,6 +242,7 @@ impl WeightStore {
             (0..layer_count).map(|_| LayerWeightsBuilder::new()).collect();
 
         // Layer tensor name suffixes and their corresponding builder fields
+        #[allow(clippy::type_complexity)]
         let layer_fields: &[(&str, fn(&mut LayerWeightsBuilder, DeviceTensor))] = &[
             ("attn_q.weight", |b, t| b.q_proj = Some(t)),
             ("attn_k.weight", |b, t| b.k_proj = Some(t)),

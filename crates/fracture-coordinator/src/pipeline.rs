@@ -232,11 +232,10 @@ impl DistributedPipeline {
     ) {
         self.allocated_seqs.lock().unwrap().remove(&seq_id);
         for node_id in &self.pipeline_order {
-            if let Some(entry) = registry.get_mut(node_id) {
-                if entry.status == crate::registry::WorkerStatus::Ready {
+            if let Some(entry) = registry.get_mut(node_id)
+                && entry.status == crate::registry::WorkerStatus::Ready {
                     let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
                 }
-            }
         }
     }
 
@@ -249,11 +248,10 @@ impl DistributedPipeline {
         let seq_ids: Vec<u64> = self.allocated_seqs.lock().unwrap().drain().collect();
         for &seq_id in &seq_ids {
             for node_id in &self.pipeline_order {
-                if let Some(entry) = registry.get_mut(node_id) {
-                    if entry.status == crate::registry::WorkerStatus::Ready {
+                if let Some(entry) = registry.get_mut(node_id)
+                    && entry.status == crate::registry::WorkerStatus::Ready {
                         let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
                     }
-                }
             }
         }
         seq_ids
@@ -350,14 +348,13 @@ impl DistributedPipeline {
                         )));
                     }
                     // Validate activation shape: last dimension must be hidden_size
-                    if let Some(&last_dim) = tensor_header.shape.last() {
-                        if last_dim as usize != self.hidden_size {
+                    if let Some(&last_dim) = tensor_header.shape.last()
+                        && last_dim as usize != self.hidden_size {
                             return Err(FractureError::Pipeline(format!(
                                 "worker '{}' returned activation with last dim {}, expected hidden_size {}",
                                 node_id, last_dim, self.hidden_size
                             )));
                         }
-                    }
                     // Pass activations as input to the next worker
                     current_input = ForwardInputWire::Activations {
                         tensor_header,
@@ -381,7 +378,6 @@ impl DistributedPipeline {
         registry: &mut PeerRegistry,
         sequences: &[SequenceMetadataWire],
         all_token_ids: &[u32],
-        all_positions: &[u32],
         is_prefill: bool,
     ) -> Result<Vec<Vec<f32>>> {
         // Verify all sequences have allocated caches.

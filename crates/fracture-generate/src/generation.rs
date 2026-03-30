@@ -1,6 +1,5 @@
 use fracture_core::{Backend, FractureError, RequestMetrics, Result};
 use fracture_engine::{CacheHandle, Engine, KvCacheManager};
-use rand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -138,12 +137,11 @@ impl GenerationLoop {
         // Decode loop
         for _ in 1..config.max_tokens {
             // Check for cooperative cancellation
-            if let Some(flag) = cancel {
-                if flag.load(Ordering::Relaxed) {
+            if let Some(flag) = cancel
+                && flag.load(Ordering::Relaxed) {
                     stop_reason = StopReason::Stop;
                     break;
                 }
-            }
             let decode_start = Instant::now();
             let logits = engine.forward(&[next_token], &[pos], cache, cache_handle, None)?;
             decode_times.push(decode_start.elapsed().as_secs_f64() * 1000.0);
@@ -165,6 +163,7 @@ impl GenerationLoop {
         Ok(GenerationResult { tokens: generated, stop_reason })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_metrics<B: Backend>(
         engine: &Engine<B>,
         prompt_tokens: usize,

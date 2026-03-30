@@ -1656,10 +1656,9 @@ async fn test_batched_forward_two_nodes_returns_per_sequence_logits() {
     ];
 
     let all_token_ids = vec![128000, 791, 1401, 42]; // 3 tokens seq1, 1 token seq2
-    let all_positions = vec![0, 1, 2, 5];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &all_token_ids, &all_positions, true)
+        .batched_forward(&mut registry, &sequences, &all_token_ids, true)
         .await
         .unwrap();
 
@@ -1704,7 +1703,6 @@ async fn test_batched_forward_single_sequence() {
             &mut registry,
             &sequences,
             &[1, 2, 3, 4, 5],
-            &[0, 1, 2, 3, 4],
             true,
         )
         .await
@@ -1730,7 +1728,7 @@ async fn test_batched_forward_without_cache_is_error() {
     }];
 
     let result = pipeline
-        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .batched_forward(&mut registry, &sequences, &[1], false)
         .await;
 
     assert!(result.is_err());
@@ -1808,7 +1806,7 @@ async fn test_batched_forward_single_node_pipeline() {
     }];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2], &[0, 1], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2], true)
         .await
         .unwrap();
 
@@ -1921,7 +1919,7 @@ async fn test_batched_forward_three_node_pipeline() {
     ];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 3], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], true)
         .await
         .unwrap();
 
@@ -2093,7 +2091,7 @@ async fn test_batched_forward_fallback_to_forward_result() {
     // Workers respond with ForwardResult (not BatchedForwardResult) —
     // coordinator should handle this fallback gracefully.
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 0], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], true)
         .await
         .unwrap();
 
@@ -2213,7 +2211,7 @@ async fn test_batched_forward_worker_error_propagates() {
     }];
 
     let result = pipeline
-        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .batched_forward(&mut registry, &sequences, &[1], false)
         .await;
 
     assert!(result.is_err());

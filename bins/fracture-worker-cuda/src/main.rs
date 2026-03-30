@@ -240,19 +240,10 @@ async fn main() -> Result<()> {
 
             MessageType::CacheAlloc => {
                 let seq_id = header.seq_id;
-                if handles.contains_key(&seq_id) {
-                    let err = ErrorPayload {
-                        error_code: ErrorCode::InvalidSequence,
-                        message: format!(
-                            "CacheAlloc for seq {seq_id}: cache already allocated"
-                        ),
-                    };
-                    tracing::warn!("duplicate CacheAlloc for seq {seq_id}");
-                    conn.send(MessageType::Error, seq_id, &err).await?;
-                } else {
+                if let std::collections::hash_map::Entry::Vacant(e) = handles.entry(seq_id) {
                     match cache.alloc(node.engine().backend()) {
                         Ok(h) => {
-                            handles.insert(seq_id, h);
+                            e.insert(h);
                             // Also allocate in paged cache for BatchedForward support
                             match paged_cache.alloc() {
                                 Ok(ph) => {
@@ -279,6 +270,15 @@ async fn main() -> Result<()> {
                             conn.send(MessageType::Error, seq_id, &err).await?;
                         }
                     }
+                } else {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::InvalidSequence,
+                        message: format!(
+                            "CacheAlloc for seq {seq_id}: cache already allocated"
+                        ),
+                    };
+                    tracing::warn!("duplicate CacheAlloc for seq {seq_id}");
+                    conn.send(MessageType::Error, seq_id, &err).await?;
                 }
             }
 

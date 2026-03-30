@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tokenizers::Tokenizer;
 
 /// Accept workers, run scheduler, set up pipeline, and broadcast via watch channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn accept_and_setup_pipeline(
     listener: &TcpListener,
     registry: &Mutex<PeerRegistry>,
@@ -50,8 +51,8 @@ pub async fn accept_and_setup_pipeline(
             }
         }
 
-        if let Some(timeout) = timeout_duration {
-            if accept_start.elapsed() >= timeout {
+        if let Some(timeout) = timeout_duration
+            && accept_start.elapsed() >= timeout {
                 let reg = registry.lock().await;
                 anyhow::bail!(
                     "timed out waiting for workers: got {}/{} after {}s",
@@ -60,7 +61,6 @@ pub async fn accept_and_setup_pipeline(
                     timeout.as_secs()
                 );
             }
-        }
 
         let accept_future = listener.accept();
         let (stream, addr) = if let Some(timeout) = timeout_duration {
@@ -352,7 +352,7 @@ pub async fn reconnection_listener(
         // RegisterAck, not Reconfigure, since it just sent Register).
         // Any already-running workers get Reconfigure.
         let result = {
-            let mut reg = registry.lock().await;
+            let reg = registry.lock().await;
             let caps = reg.all_capabilities();
             if caps.is_empty() {
                 tracing::error!("no workers available after re-registration");

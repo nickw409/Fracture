@@ -118,6 +118,7 @@ pub async fn completions_handler(
 ///
 /// This is the async equivalent of `GenerationLoop::generate`, using
 /// network forward passes instead of local engine calls.
+#[allow(clippy::too_many_arguments)]
 async fn distributed_generate(
     pipeline: &DistributedPipeline,
     registry: &Mutex<PeerRegistry>,

@@ -53,7 +53,7 @@ impl DeviceTensor {
     pub fn size_bytes(&self) -> usize {
         if self.dtype.is_packed() {
             // INT4: 2 elements per byte
-            (self.numel() + 1) / 2
+            self.numel().div_ceil(2)
         } else {
             self.numel() * self.dtype.size_bytes()
         }

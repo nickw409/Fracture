@@ -8,7 +8,7 @@
 //! Heartbeats are sent inline between batch iterations. On worker death,
 //! all active sequences are aborted and the pipeline is flagged as degraded.
 
-use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
+use fracture_coordinator::heartbeat;
 use fracture_coordinator::pipeline::DistributedPipeline;
 use fracture_coordinator::registry::PeerRegistry;
 use fracture_engine::{GenerationEvent, PendingRequest};
@@ -95,7 +95,6 @@ async fn distributed_loop_task(
 ) {
     let mut pending: Vec<PendingRequest> = Vec::new();
     let mut active: HashMap<u64, DistributedSequence> = HashMap::new();
-    let mut heartbeat_tracker = HeartbeatTracker::new();
     let mut last_heartbeat = Instant::now();
     let mut pipeline_degraded = false;
 
@@ -283,7 +282,6 @@ async fn distributed_loop_task(
         let mut batch_seq_ids: Vec<u64> = Vec::new();
         let mut batch_is_prefill: Vec<bool> = Vec::new();
         let mut all_token_ids: Vec<u32> = Vec::new();
-        let mut all_positions: Vec<u32> = Vec::new();
         let mut seq_metas: Vec<SequenceMetadataWire> = Vec::new();
         let mut total_tokens = 0usize;
 
@@ -316,7 +314,6 @@ async fn distributed_loop_task(
                 last_block_tokens: 0,
             });
             all_token_ids.extend_from_slice(&chunk_tokens);
-            all_positions.extend_from_slice(&chunk_positions);
             batch_seq_ids.push(seq.seq_id);
             batch_is_prefill.push(true);
             total_tokens += chunk_size;
@@ -347,7 +344,6 @@ async fn distributed_loop_task(
                 last_block_tokens: 0,
             });
             all_token_ids.push(last_token);
-            all_positions.push(seq.current_pos as u32);
             batch_seq_ids.push(seq.seq_id);
             batch_is_prefill.push(false);
             total_tokens += 1;
@@ -363,7 +359,7 @@ async fn distributed_loop_task(
         let forward_result = {
             let mut reg = registry.lock().await;
             pipeline
-                .batched_forward(&mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill)
+                .batched_forward(&mut reg, &seq_metas, &all_token_ids, is_prefill)
                 .await
         };
 
@@ -492,23 +488,18 @@ async fn poll_worker_acks(registry: &Mutex<PeerRegistry>) {
     let mut reg = registry.lock().await;
     let node_ids = reg.pipeline_order();
     for node_id in &node_ids {
-        if let Some(entry) = reg.get_mut(node_id) {
-            match tokio::time::timeout(
+        if let Some(entry) = reg.get_mut(node_id)
+            && let Ok(Ok((header, payload))) = tokio::time::timeout(
                 Duration::from_millis(500),
                 entry.connection.recv(),
             ).await {
-                Ok(Ok((header, payload))) => {
-                    entry.last_heartbeat = Instant::now();
-                    if header.msg_type == MessageType::HeartbeatAck {
-                        if let Ok(ack) = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload) {
-                            entry.free_blocks = ack.free_blocks;
-                            entry.gpu_memory_used = ack.gpu_memory_used;
-                        }
+                entry.last_heartbeat = Instant::now();
+                if header.msg_type == MessageType::HeartbeatAck
+                    && let Ok(ack) = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload) {
+                        entry.free_blocks = ack.free_blocks;
+                        entry.gpu_memory_used = ack.gpu_memory_used;
                     }
-                }
-                _ => {}
             }
-        }
     }
 }
 

@@ -55,6 +55,7 @@ unsafe impl Send for CudaState {}
 /// Manages CUDA device, stream, cuBLAS handle, and a registry mapping
 /// TensorId values to device pointers.
 pub struct CudaBackend {
+    #[allow(dead_code)] // retained for multi-GPU support
     device_id: c_int,
     stream: cudaStream_t,
     cublas_handle: cublasHandle_t,
@@ -127,8 +128,8 @@ impl CudaBackend {
     pub fn precompute_rope_freqs(&mut self, head_dim: usize, theta: f64) -> Result<()> {
         let half_dim = head_dim / 2;
         let mut freqs = vec![0.0f32; half_dim];
-        for i in 0..half_dim {
-            freqs[i] = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64) as f32;
+        for (i, freq) in freqs.iter_mut().enumerate().take(half_dim) {
+            *freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64) as f32;
         }
 
         let size = half_dim * std::mem::size_of::<f32>();

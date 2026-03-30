@@ -329,9 +329,9 @@ fn handle_command(
                 .active
                 .values()
                 .map(|s| {
-                    let state = if !s.remaining_prefill.is_empty() {
-                        "prefilling"
-                    } else if s.generated_tokens.is_empty() {
+                    let state = if !s.remaining_prefill.is_empty()
+                        || s.generated_tokens.is_empty()
+                    {
                         "prefilling"
                     } else {
                         "decoding"
