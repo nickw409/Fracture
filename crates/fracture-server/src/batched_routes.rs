@@ -107,12 +107,14 @@ async fn completions_handler(
             .into_response();
     }
 
+    let temperature = req.temperature;
+
     if req.stream {
-        return handle_streaming(state, event_rx, prompt_len, true).into_response();
+        return handle_streaming(state, event_rx, prompt_len, true, temperature).into_response();
     }
 
     // Non-streaming: collect all tokens and return.
-    handle_non_streaming(state, event_rx, prompt_len, true).await.into_response()
+    handle_non_streaming(state, event_rx, prompt_len, true, temperature).await.into_response()
 }
 
 async fn chat_completions_handler(
@@ -162,11 +164,13 @@ async fn chat_completions_handler(
             .into_response();
     }
 
+    let temperature = req.temperature;
+
     if req.stream {
-        return handle_streaming(state, event_rx, prompt_len, false).into_response();
+        return handle_streaming(state, event_rx, prompt_len, false, temperature).into_response();
     }
 
-    handle_non_streaming(state, event_rx, prompt_len, false).await.into_response()
+    handle_non_streaming(state, event_rx, prompt_len, false, temperature).await.into_response()
 }
 
 fn handle_streaming(
@@ -174,13 +178,14 @@ fn handle_streaming(
     mut event_rx: mpsc::UnboundedReceiver<GenerationEvent>,
     prompt_len: usize,
     is_completion: bool,
+    temperature: f32,
 ) -> Sse<impl futures_core::Stream<Item = std::result::Result<Event, Infallible>>> {
     state.dashboard.metrics.request_started();
     let dashboard_for_stream = Arc::clone(&state.dashboard);
 
     let stream = async_stream::stream! {
         // Guard: ensures active_requests is decremented even if the stream is dropped.
-        struct MetricsGuard(Arc<DashboardState>, bool);
+        struct MetricsGuard(Arc<DashboardState>, bool, f32);
         impl Drop for MetricsGuard {
             fn drop(&mut self) {
                 if !self.1 {
@@ -196,13 +201,13 @@ fn handle_streaming(
                         total_duration_ms: 0.0,
                         tokens_per_second: 0.0,
                         finish_reason: "cancelled",
-                        temperature: 0.0,
+                        temperature: self.2,
                         created_at: String::new(),
                     });
                 }
             }
         }
-        let mut metrics_guard = MetricsGuard(dashboard_for_stream, false);
+        let mut metrics_guard = MetricsGuard(dashboard_for_stream, false, temperature);
 
         let id = gen_id();
         let created = unix_timestamp();
@@ -292,7 +297,7 @@ fn handle_streaming(
             total_duration_ms,
             tokens_per_second: tps,
             finish_reason: final_reason,
-            temperature: 0.0,
+            temperature,
             created_at: String::new(),
         };
         state.dashboard.metrics.record_completion(&record);
@@ -310,12 +315,14 @@ async fn handle_non_streaming(
     mut event_rx: mpsc::UnboundedReceiver<GenerationEvent>,
     prompt_len: usize,
     is_completion: bool,
+    temperature: f32,
 ) -> axum::response::Response {
     state.dashboard.metrics.request_started();
     let t_start = Instant::now();
     let mut t_first_token: Option<Instant> = None;
     let mut tokens = Vec::new();
     let mut finish_reason: &'static str = "length";
+    let req_id = gen_id();
 
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -335,7 +342,7 @@ async fn handle_non_streaming(
             GenerationEvent::Error(msg) => {
                 let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
                 let record = RequestRecord {
-                    id: gen_id(),
+                    id: req_id.clone(),
                     request_type: if is_completion { "completion" } else { "chat" },
                     status: "error",
                     prompt_tokens: prompt_len,
@@ -345,7 +352,7 @@ async fn handle_non_streaming(
                     total_duration_ms,
                     tokens_per_second: 0.0,
                     finish_reason: "error",
-                    temperature: 0.0,
+                    temperature,
                     created_at: String::new(),
                 };
                 state.dashboard.metrics.record_completion(&record);
@@ -363,7 +370,6 @@ async fn handle_non_streaming(
     let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = t_first_token.map(|t| (t - t_start).as_secs_f64() * 1000.0).unwrap_or(0.0);
     let tps = if total_duration_ms > 0.0 { tokens.len() as f64 / (total_duration_ms / 1000.0) } else { 0.0 };
-    let req_id = gen_id();
 
     {
         let record = RequestRecord {
@@ -377,7 +383,7 @@ async fn handle_non_streaming(
             total_duration_ms,
             tokens_per_second: tps,
             finish_reason,
-            temperature: 0.0,
+            temperature,
             created_at: String::new(),
         };
         state.dashboard.metrics.record_completion(&record);
@@ -388,7 +394,7 @@ async fn handle_non_streaming(
 
     let response = if is_completion {
         CompletionResponse {
-            id: gen_id(),
+            id: req_id.clone(),
             object: "text_completion".to_string(),
             created: unix_timestamp(),
             choices: vec![Choice {
@@ -405,7 +411,7 @@ async fn handle_non_streaming(
         }
     } else {
         CompletionResponse {
-            id: gen_id(),
+            id: req_id,
             object: "chat.completion".to_string(),
             created: unix_timestamp(),
             choices: vec![Choice {

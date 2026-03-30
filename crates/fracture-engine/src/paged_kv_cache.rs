@@ -61,25 +61,59 @@ impl BlockPool {
         let mut k_blocks = Vec::with_capacity(num_blocks);
         let mut v_blocks = Vec::with_capacity(num_blocks);
 
-        for block_id in 0..num_blocks {
+        let mut alloc_err: Option<FractureError> = None;
+
+        'outer: for block_id in 0..num_blocks {
             let mut k_layers = Vec::with_capacity(num_layers);
             let mut v_layers = Vec::with_capacity(num_layers);
 
             for _ in 0..num_layers {
-                let k = backend.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16)
-                    .map_err(|e| FractureError::KvCache(format!(
-                        "block pool alloc failed at block {block_id}: {e}"
-                    )))?;
-                let v = backend.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16)
-                    .map_err(|e| FractureError::KvCache(format!(
-                        "block pool alloc failed at block {block_id}: {e}"
-                    )))?;
+                let k = match backend.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        // Push partial block so cleanup frees these tensors too
+                        k_blocks.push(k_layers);
+                        v_blocks.push(v_layers);
+                        alloc_err = Some(FractureError::KvCache(format!(
+                            "block pool alloc failed at block {block_id}: {e}"
+                        )));
+                        break 'outer;
+                    }
+                };
+                let v = match backend.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Free the unpaired K tensor, then push partial block for cleanup
+                        let _ = backend.free(&k);
+                        k_blocks.push(k_layers);
+                        v_blocks.push(v_layers);
+                        alloc_err = Some(FractureError::KvCache(format!(
+                            "block pool alloc failed at block {block_id}: {e}"
+                        )));
+                        break 'outer;
+                    }
+                };
                 k_layers.push(k);
                 v_layers.push(v);
             }
 
             k_blocks.push(k_layers);
             v_blocks.push(v_layers);
+        }
+
+        if let Some(e) = alloc_err {
+            // Free all successfully allocated tensors before returning the error
+            for k_layer in k_blocks.drain(..) {
+                for t in &k_layer {
+                    let _ = backend.free(t);
+                }
+            }
+            for v_layer in v_blocks.drain(..) {
+                for t in &v_layer {
+                    let _ = backend.free(t);
+                }
+            }
+            return Err(e);
         }
 
         // All blocks start free.
