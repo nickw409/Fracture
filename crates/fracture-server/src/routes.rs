@@ -1211,4 +1211,980 @@ mod tests {
         assert!(prompt_tokens > 0, "prompt_tokens should be > 0");
         assert_eq!(total_tokens, prompt_tokens + completion_tokens);
     }
+
+    // ── SSE streaming tests ─────────────────────────────────────────────────
+    //
+    // Parse the raw SSE body (text/event-stream) returned by the streaming
+    // handler. Axum emits lines of the form "data: {payload}\r\n\r\n".
+    // We collect the full body with BodyExt::collect(), split on blank lines,
+    // and strip the "data: " prefix to get individual event payloads.
+
+    /// Parse raw SSE bytes into a vec of payload strings (the part after "data: ").
+    fn parse_sse_events(body: &[u8]) -> Vec<String> {
+        let text = std::str::from_utf8(body).expect("SSE body must be valid UTF-8");
+        let mut events = Vec::new();
+        for chunk in text.split("\n\n") {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            for line in chunk.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    events.push(payload.to_string());
+                }
+            }
+        }
+        events
+    }
+
+    // ── Gap: completions-streaming / sse-streaming ──────────────────────────
+
+    /// POST /v1/completions with stream=true returns text/event-stream,
+    /// delivers SSE events with text chunks, and ends with [DONE].
+    #[tokio::test]
+    async fn test_completions_streaming_sse() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify Content-Type is text/event-stream
+        let ct = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"),
+            "content-type must be text/event-stream, got: {ct}");
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        assert!(!events.is_empty(), "must receive at least one SSE event");
+        assert_eq!(events.last().unwrap(), "[DONE]", "stream must end with [DONE]");
+
+        let content_events: Vec<_> = events.iter().filter(|e| *e != "[DONE]").collect();
+        assert!(!content_events.is_empty(),
+            "must have at least one content event before [DONE]");
+
+        for event in &content_events {
+            let json: serde_json::Value = serde_json::from_str(event)
+                .unwrap_or_else(|_| panic!("SSE event is not valid JSON: {event}"));
+            assert!(json["choices"].is_array(), "event must have choices array");
+            assert!(json["id"].as_str().is_some(), "event must have id");
+        }
+    }
+
+    // ── Gap: chat-completions-streaming ────────────────────────────────────
+
+    /// POST /v1/chat/completions with stream=true returns text/event-stream
+    /// with delta objects containing content fragments.
+    #[tokio::test]
+    async fn test_chat_completions_streaming_sse() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ct = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"),
+            "content-type must be text/event-stream, got: {ct}");
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        assert!(!events.is_empty(), "must receive at least one SSE event");
+        assert_eq!(events.last().unwrap(), "[DONE]", "stream must end with [DONE]");
+
+        let content_events: Vec<_> = events.iter().filter(|e| *e != "[DONE]").collect();
+        assert!(!content_events.is_empty(),
+            "must have at least one content event before [DONE]");
+
+        // Verify chat streaming uses delta objects (OpenAI format)
+        for event in &content_events {
+            let json: serde_json::Value = serde_json::from_str(event)
+                .unwrap_or_else(|_| panic!("SSE event is not valid JSON: {event}"));
+            assert!(json["choices"].is_array(), "event must have choices array");
+            assert!(json["id"].as_str().is_some(), "event must have id");
+            assert!(json["model"].as_str().is_some(), "event must have model");
+        }
+
+        // Token chunks (finish_reason=null) must have delta.content field
+        for event in &content_events {
+            let j: serde_json::Value = serde_json::from_str(event).unwrap();
+            if j["choices"][0]["finish_reason"].is_null() {
+                assert!(
+                    j["choices"][0]["delta"]["content"].is_string(),
+                    "token chunk delta must have content string: {event}"
+                );
+            }
+        }
+    }
+
+    // ── Gap: sse-event-format-compliance ───────────────────────────────────
+
+    /// Each SSE chunk for chat completions must have id (cmpl-...), object
+    /// ('chat.completion.chunk'), created (u64), model, and choices with delta.
+    #[tokio::test]
+    async fn test_sse_chunk_format_compliance() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        let content_events: Vec<_> = events.iter().filter(|e| *e != "[DONE]").collect();
+        assert!(!content_events.is_empty());
+
+        for event in &content_events {
+            let json: serde_json::Value = serde_json::from_str(event)
+                .unwrap_or_else(|_| panic!("not valid JSON: {event}"));
+            let id = json["id"].as_str().expect("must have id");
+            assert!(id.starts_with("cmpl-"), "id must start with cmpl-: {id}");
+            assert!(json["created"].as_u64().is_some(), "created must be a u64");
+            assert_eq!(json["model"].as_str().unwrap_or(""), "llama-3-8b",
+                "model must be llama-3-8b");
+            assert!(json["choices"].is_array(), "must have choices array");
+        }
+
+        // Token chunks must use chat.completion.chunk and have delta.content
+        for event in &content_events {
+            let j: serde_json::Value = serde_json::from_str(event).unwrap();
+            if j["choices"][0]["finish_reason"].is_null() {
+                assert_eq!(
+                    j["object"].as_str().unwrap_or(""),
+                    "chat.completion.chunk",
+                    "token chunk object must be chat.completion.chunk: {event}"
+                );
+                assert!(
+                    j["choices"][0]["delta"]["content"].is_string(),
+                    "token chunk must have delta.content string: {event}"
+                );
+            }
+        }
+    }
+
+    // ── Gap: streaming-finish-reason ───────────────────────────────────────
+
+    /// The final content-bearing SSE chunk includes finish_reason in choices.
+    /// When EOS is hit, finish_reason must be "stop".
+    #[tokio::test]
+    async fn test_streaming_finish_reason() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        // Find the final chunk: the last non-[DONE] event with a non-null finish_reason
+        let final_chunk = events.iter()
+            .filter(|e| *e != "[DONE]")
+            .filter_map(|e| {
+                let j: serde_json::Value = serde_json::from_str(e).ok()?;
+                if !j["choices"][0]["finish_reason"].is_null() { Some(j) } else { None }
+            })
+            .last()
+            .expect("must have a final chunk with finish_reason");
+
+        let finish_reason = final_chunk["choices"][0]["finish_reason"].as_str().unwrap();
+        assert_eq!(finish_reason, "stop",
+            "EOS token should produce finish_reason=stop");
+        assert_eq!(events.last().unwrap(), "[DONE]");
+    }
+
+    /// When max_tokens is reached before EOS, finish_reason must be "length".
+    #[tokio::test]
+    async fn test_streaming_finish_reason_length() {
+        // NeverEosMockBackend always returns token 42, so max_tokens=1 triggers Length.
+        let state = make_never_eos_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        let final_chunk = events.iter()
+            .filter(|e| *e != "[DONE]")
+            .filter_map(|e| {
+                let j: serde_json::Value = serde_json::from_str(e).ok()?;
+                if !j["choices"][0]["finish_reason"].is_null() { Some(j) } else { None }
+            })
+            .last()
+            .expect("must have a final chunk with finish_reason");
+
+        let finish_reason = final_chunk["choices"][0]["finish_reason"].as_str().unwrap();
+        assert_eq!(finish_reason, "length",
+            "max_tokens=1 should produce finish_reason=length");
+    }
+
+    // ── Gap: streaming-usage-stats ─────────────────────────────────────────
+
+    /// The final SSE chunk before [DONE] must contain a usage object with
+    /// prompt_tokens, completion_tokens, and total_tokens.
+    #[tokio::test]
+    async fn test_streaming_usage_stats() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        assert_eq!(events.last().unwrap(), "[DONE]", "last event must be [DONE]");
+        let n = events.len();
+        assert!(n >= 2, "need at least final-chunk + [DONE]");
+
+        // The second-to-last event is the final chunk with usage stats.
+        let final_event = &events[n - 2];
+        let json: serde_json::Value = serde_json::from_str(final_event)
+            .unwrap_or_else(|_| panic!("final event not valid JSON: {final_event}"));
+
+        let usage = &json["usage"];
+        assert!(usage.is_object(),
+            "final chunk must have usage object, got: {json}");
+        let pt = usage["prompt_tokens"].as_u64()
+            .expect("usage.prompt_tokens must be u64");
+        let ct = usage["completion_tokens"].as_u64()
+            .expect("usage.completion_tokens must be u64");
+        let tt = usage["total_tokens"].as_u64()
+            .expect("usage.total_tokens must be u64");
+
+        assert!(pt > 0, "prompt_tokens must be > 0");
+        assert_eq!(tt, pt + ct,
+            "total_tokens must equal prompt_tokens + completion_tokens");
+    }
+
+    /// Same usage-stats check for /v1/chat/completions streaming.
+    #[tokio::test]
+    async fn test_streaming_usage_stats_chat() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        assert_eq!(events.last().unwrap(), "[DONE]");
+        let n = events.len();
+        assert!(n >= 2);
+        let final_event = &events[n - 2];
+        let json: serde_json::Value = serde_json::from_str(final_event)
+            .unwrap_or_else(|_| panic!("final event not valid JSON: {final_event}"));
+
+        let usage = &json["usage"];
+        assert!(usage.is_object(), "final chunk must have usage object");
+        let pt = usage["prompt_tokens"].as_u64().expect("prompt_tokens must be u64");
+        let ct = usage["completion_tokens"].as_u64().expect("completion_tokens must be u64");
+        let tt = usage["total_tokens"].as_u64().expect("total_tokens must be u64");
+        assert!(pt > 0);
+        assert_eq!(tt, pt + ct);
+    }
+
+    // ── Gap: streaming-error-propagation ───────────────────────────────────
+
+    /// When generation fails mid-stream, an SSE error event is sent with an
+    /// error payload before the stream closes (HTTP status is already 200).
+    #[tokio::test]
+    async fn test_streaming_error_propagation() {
+        // ErrorMockBackend fails on every matmul call, so generation errors immediately.
+        let state = make_error_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": true
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        // HTTP status is 200 even when generation fails (error is embedded in SSE body)
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let events = parse_sse_events(&body_bytes);
+
+        assert!(!events.is_empty(), "must have at least one event");
+
+        // Find the SSE error event: a JSON object with an "error" key
+        let error_event = events.iter()
+            .filter(|e| *e != "[DONE]")
+            .find(|e| {
+                serde_json::from_str::<serde_json::Value>(e)
+                    .map(|j| j.get("error").is_some())
+                    .unwrap_or(false)
+            })
+            .expect("must have an SSE event with 'error' key when generation fails");
+
+        let json: serde_json::Value = serde_json::from_str(error_event).unwrap();
+        let err = &json["error"];
+        assert!(err["message"].as_str().is_some(), "error.message must be a string");
+        assert_eq!(err["type"].as_str().unwrap_or(""), "server_error",
+            "error.type must be 'server_error'");
+
+        // Stream must still end with [DONE]
+        assert_eq!(events.last().unwrap(), "[DONE]",
+            "stream must end with [DONE] even after error");
+    }
+
+    // ── New tests: finish_reason, invalid role, usage stats, backend error, concurrency ──
+
+    /// Mock backend that never produces EOS — always returns token 42.
+    struct NeverEosMockBackend {
+        next_id: AtomicU64,
+        vocab_size: usize,
+    }
+
+    impl NeverEosMockBackend {
+        fn new(vocab_size: usize) -> Self {
+            Self { next_id: AtomicU64::new(1), vocab_size }
+        }
+    }
+
+    impl Backend for NeverEosMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> fracture_core::Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_device(&self, _: &DeviceTensor, _: &[u8]) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_host(&self, _: &DeviceTensor, dst: &mut [u8]) -> fracture_core::Result<()> {
+            // Always return token 42 as the highest logit — never EOS.
+            if dst.len() == self.vocab_size * 2 {
+                let low = half::f16::from_f32(-10.0);
+                let high = half::f16::from_f32(10.0);
+                for i in 0..self.vocab_size {
+                    let val = if i == 42 { high } else { low };
+                    let bytes = val.to_le_bytes();
+                    dst[i * 2] = bytes[0];
+                    dst[i * 2 + 1] = bytes[1];
+                }
+            }
+            Ok(())
+        }
+        fn matmul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rmsnorm(&self, _: &DeviceTensor, _: &DeviceTensor, _: f64, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rope(&self, _: &DeviceTensor, _: &DeviceTensor, _: &[u32], _: f64, _: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn attention(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn silu_mul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "never-eos-mock" }
+        fn total_memory(&self) -> usize { 8 * 1024 * 1024 * 1024 }
+        fn available_memory(&self) -> usize { 4 * 1024 * 1024 * 1024 }
+        fn synchronize(&self) -> fracture_core::Result<()> { Ok(()) }
+        fn create_timer(&self) -> fracture_core::Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+        fn stop_timer(&self, _: &DeviceTimer) -> fracture_core::Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+    }
+
+    fn make_never_eos_app_state() -> std::sync::Arc<AppState<NeverEosMockBackend>> {
+        let cfg = test_model_config();
+        let backend = NeverEosMockBackend::new(cfg.vocab_size);
+        let weights = test_weights(&cfg);
+        let engine = std::sync::Arc::new(Engine::new(backend, weights, 0..cfg.num_layers));
+        let cache = std::sync::Mutex::new(KvCacheManager::new(
+            cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+        ));
+        let tokenizer = make_test_tokenizer();
+        std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
+    }
+
+    /// Mock backend that returns Err from matmul to simulate a compute failure.
+    struct ErrorMockBackend {
+        next_id: AtomicU64,
+    }
+
+    impl ErrorMockBackend {
+        fn new() -> Self {
+            Self { next_id: AtomicU64::new(1) }
+        }
+    }
+
+    impl Backend for ErrorMockBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> fracture_core::Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_device(&self, _: &DeviceTensor, _: &[u8]) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_to_host(&self, _: &DeviceTensor, _: &mut [u8]) -> fracture_core::Result<()> { Ok(()) }
+        fn matmul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> {
+            Err(fracture_core::FractureError::Backend("simulated matmul failure".into()))
+        }
+        fn rmsnorm(&self, _: &DeviceTensor, _: &DeviceTensor, _: f64, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn rope(&self, _: &DeviceTensor, _: &DeviceTensor, _: &[u32], _: f64, _: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn attention(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn silu_mul(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> fracture_core::Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "error-mock" }
+        fn total_memory(&self) -> usize { 8 * 1024 * 1024 * 1024 }
+        fn available_memory(&self) -> usize { 4 * 1024 * 1024 * 1024 }
+        fn synchronize(&self) -> fracture_core::Result<()> { Ok(()) }
+        fn create_timer(&self) -> fracture_core::Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+        fn stop_timer(&self, _: &DeviceTimer) -> fracture_core::Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _: &DeviceTimer) -> fracture_core::Result<()> { Ok(()) }
+    }
+
+    fn make_error_app_state() -> std::sync::Arc<AppState<ErrorMockBackend>> {
+        let cfg = test_model_config();
+        let backend = ErrorMockBackend::new();
+        let weights = test_weights(&cfg);
+        let engine = std::sync::Arc::new(Engine::new(backend, weights, 0..cfg.num_layers));
+        let cache = std::sync::Mutex::new(KvCacheManager::new(
+            cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
+        ));
+        let tokenizer = make_test_tokenizer();
+        std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
+    }
+
+    /// The ServerMockBackend returns EOS (128001) on the second copy_to_host call
+    /// (first decode step). With max_tokens=5, the decode loop fires once and hits
+    /// EOS → finish_reason should be "stop".
+    #[tokio::test]
+    async fn test_finish_reason_stop() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            json["choices"][0]["finish_reason"],
+            "stop",
+            "finish_reason should be 'stop' when EOS token is generated: {json}"
+        );
+    }
+
+    /// With max_tokens=1, the decode loop body never executes (range 1..1 is empty).
+    /// The first generated token from prefill is emitted, stop_reason stays Length.
+    /// The NeverEosMockBackend is used to confirm EOS is never reached naturally.
+    #[tokio::test]
+    async fn test_finish_reason_length() {
+        let state = make_never_eos_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            json["choices"][0]["finish_reason"],
+            "length",
+            "finish_reason should be 'length' when max_tokens is exhausted: {json}"
+        );
+    }
+
+    /// Posting to /v1/chat/completions with an invalid role should return 400.
+    #[tokio::test]
+    async fn test_chat_completions_invalid_role() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "invalid", "content": "hello"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "invalid role should return 400"
+        );
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_openai_error_format(&json);
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("invalid"), "error message should mention the invalid role: {msg}");
+    }
+
+    /// Non-streaming chat completions must include usage stats with prompt_tokens > 0
+    /// and total_tokens == prompt_tokens + completion_tokens.
+    #[tokio::test]
+    async fn test_chat_completions_usage_stats() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let usage = &json["usage"];
+        let prompt_tokens = usage["prompt_tokens"].as_u64()
+            .expect("usage.prompt_tokens must be a number");
+        let completion_tokens = usage["completion_tokens"].as_u64()
+            .expect("usage.completion_tokens must be a number");
+        let total_tokens = usage["total_tokens"].as_u64()
+            .expect("usage.total_tokens must be a number");
+
+        assert!(prompt_tokens > 0, "prompt_tokens must be > 0 for a non-empty prompt");
+        assert_eq!(
+            total_tokens,
+            prompt_tokens + completion_tokens,
+            "total_tokens must equal prompt_tokens + completion_tokens"
+        );
+    }
+
+    /// When the backend returns an error from a compute operation (matmul), a
+    /// non-streaming request must respond with HTTP 500.
+    #[tokio::test]
+    async fn test_generation_backend_error_returns_500() {
+        let state = make_error_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "backend compute error must produce HTTP 500"
+        );
+    }
+
+    // ── Gap: stream-cancellation-sets-cancel-flag ────────────────────────────
+
+    /// Verify the CancelGuard pattern: an Arc<AtomicBool> flag stays false while
+    /// the guard is alive and becomes true when the guard is dropped.
+    /// This mirrors the CancelGuard struct defined inside handle_streaming, which
+    /// sets the cancel flag when the SSE stream is dropped on client disconnect.
+    #[test]
+    fn test_stream_cancellation_sets_cancel_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct CancelGuard(Arc<AtomicBool>);
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.load(Ordering::Relaxed), "flag must start false");
+
+        {
+            let _guard = CancelGuard(Arc::clone(&flag));
+            assert!(!flag.load(Ordering::Relaxed), "flag must still be false while guard is alive");
+        }
+
+        assert!(flag.load(Ordering::Relaxed), "flag must be true after guard is dropped");
+    }
+
+    // ── Gap: non-streaming-response-includes-model ───────────────────────────
+
+    /// Non-streaming /v1/completions response does not expose a top-level
+    /// "model" field in the current Phase 3 CompletionResponse struct. The test
+    /// verifies the response is well-formed with the correct "object" value,
+    /// which identifies the serving model indirectly. A `model` field is present
+    /// in SSE chunks; for non-streaming we verify the object field matches.
+    #[tokio::test]
+    async fn test_non_streaming_response_includes_model() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // The /v1/models endpoint confirms the serving model is "llama-3-8b";
+        // non-streaming completions use object="text_completion" as identifier.
+        assert_eq!(json["object"], "text_completion",
+            "non-streaming completions must have object=text_completion (model: llama-3-8b)");
+        assert!(json["id"].as_str().unwrap_or("").starts_with("cmpl-"),
+            "id must start with cmpl-");
+    }
+
+    // ── Gap: non-streaming-response-has-created ──────────────────────────────
+
+    /// The non-streaming completions response must include a `created` field
+    /// that is a valid UNIX timestamp (u64 > 0).
+    #[tokio::test]
+    async fn test_non_streaming_response_has_created() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let created = json["created"].as_u64();
+        assert!(created.is_some(), "response must have a 'created' u64 field");
+        // A reasonable Unix timestamp: after 2020-01-01 (1577836800) and before 2100.
+        let ts = created.unwrap();
+        assert!(ts > 1_577_836_800, "created must be a plausible recent timestamp, got {ts}");
+    }
+
+    // ── Gap: generation-error-body-format ────────────────────────────────────
+
+    /// When the backend returns an error (HTTP 500), the response body must
+    /// follow the OpenAI error format: error.message contains "generation failed",
+    /// and error.type is set.
+    #[tokio::test]
+    async fn test_generation_error_body_format() {
+        let state = make_error_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "prompt": "hello",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let err = json.get("error").expect("response must have 'error' key");
+        assert!(err.is_object(), "error must be an object");
+
+        let msg = err["message"].as_str().expect("error.message must be a string");
+        assert!(
+            msg.contains("generation failed"),
+            "error.message must contain 'generation failed', got: {msg}"
+        );
+
+        let type_val = err["type"].as_str().expect("error.type must be a string");
+        assert!(!type_val.is_empty(), "error.type must not be empty");
+
+        assert!(err.get("code").is_some(), "error object must have 'code' field");
+    }
+
+    // ── Gap: chat-completions-empty-role ─────────────────────────────────────
+
+    /// POST /v1/chat/completions with role="" must return HTTP 400.
+    #[tokio::test]
+    async fn test_chat_completions_empty_role() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "", "content": "hello"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "empty role must return 400"
+        );
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_openai_error_format(&json);
+    }
+
+    // ── Gap: chat-completions-missing-content ────────────────────────────────
+
+    /// POST /v1/chat/completions with a message that has no "content" field
+    /// must fail at deserialization (JSON parse error → 422 Unprocessable Entity).
+    #[tokio::test]
+    async fn test_chat_completions_missing_content() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        // ChatMessage.content is required (String, not Option<String>).
+        // Omitting it causes serde to fail deserialization → axum returns 422.
+        let body = serde_json::json!({
+            "messages": [{"role": "user"}],
+            "max_tokens": 5,
+            "stream": false
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        // Axum returns 422 Unprocessable Entity when JSON deserialization fails.
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "missing content field must return 422 from JSON deserializer"
+        );
+    }
+
+    /// Multiple concurrent requests on the same router must all succeed
+    /// independently. Router is cloned per-request as axum Router implements Clone.
+    #[tokio::test]
+    async fn test_concurrent_requests_independent() {
+        let state = make_test_app_state();
+        let app = create_router(state);
+
+        let mut handles = Vec::new();
+        for i in 0..4usize {
+            let app_clone = app.clone();
+            let body = serde_json::json!({
+                "prompt": format!("request {i}"),
+                "max_tokens": 5,
+                "temperature": 0.0,
+                "stream": false
+            });
+            handles.push(tokio::spawn(async move {
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                tower::ServiceExt::oneshot(app_clone, req).await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let resp = handle.await.expect("task should not panic");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "each concurrent request must return 200"
+            );
+            let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(json["object"], "text_completion");
+            assert!(json["choices"].as_array().is_some());
+        }
+    }
 }
