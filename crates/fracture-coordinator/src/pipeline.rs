@@ -120,7 +120,6 @@ impl DistributedPipeline {
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
-        max_seq_len: u32,
     ) -> Result<()> {
         {
             let seqs = self.allocated_seqs.lock().unwrap();
@@ -131,11 +130,10 @@ impl DistributedPipeline {
             }
         }
 
-        let payload = CacheAllocPayload { max_seq_len };
         let mut succeeded: Vec<String> = Vec::new();
 
         let result = self
-            .try_alloc_all(registry, seq_id, &payload, &mut succeeded)
+            .try_alloc_all(registry, seq_id, &mut succeeded)
             .await;
 
         if result.is_err() {
@@ -161,7 +159,6 @@ impl DistributedPipeline {
         &self,
         registry: &mut PeerRegistry,
         seq_id: u64,
-        payload: &CacheAllocPayload,
         succeeded: &mut Vec<String>,
     ) -> Result<()> {
         for node_id in &self.pipeline_order {
@@ -170,7 +167,7 @@ impl DistributedPipeline {
             })?;
             entry
                 .writer
-                .send(MessageType::CacheAlloc, seq_id, payload)
+                .send_empty(MessageType::CacheAlloc, seq_id)
                 .await?;
 
             // Wait for CacheAllocAck or Error from the worker

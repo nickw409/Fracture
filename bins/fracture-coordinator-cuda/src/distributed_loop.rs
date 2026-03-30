@@ -253,7 +253,7 @@ async fn distributed_loop_task(
             // Allocate cache on all workers.
             let alloc_result = {
                 let mut reg = registry.lock().await;
-                pipeline.alloc_cache(&mut reg, seq_id, 0).await
+                pipeline.alloc_cache(&mut reg, seq_id).await
             };
 
             match alloc_result {

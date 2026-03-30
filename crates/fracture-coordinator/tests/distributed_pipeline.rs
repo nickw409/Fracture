@@ -228,7 +228,7 @@ async fn test_two_node_forward_returns_logits() {
 
     // Allocate cache
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -257,7 +257,7 @@ async fn test_two_node_multi_step_decode() {
     let seq_id = 42;
 
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -293,7 +293,7 @@ async fn test_cache_alloc_and_free() {
     // Allocate and free multiple sequences
     for seq_id in 1..=5 {
         pipeline
-            .alloc_cache(&mut registry, seq_id, 4096)
+            .alloc_cache(&mut registry, seq_id)
             .await
             .unwrap();
     }
@@ -454,7 +454,7 @@ async fn test_three_node_pipeline() {
     let seq_id = 99;
 
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -608,7 +608,7 @@ async fn test_worker_error_propagates() {
     registry.assign("err-worker", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1, 2], &[0, 1], true).await;
     assert!(result.is_err());
@@ -644,7 +644,7 @@ async fn test_non_tail_returning_logits_is_error() {
     for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
 
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -669,7 +669,7 @@ async fn test_tail_returning_activations_is_error() {
     registry.assign("tail", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -779,7 +779,7 @@ async fn test_worker_cache_alloc_free_via_protocol() {
 
     // Alloc 3 caches
     for seq_id in 1..=3u64 {
-        conn.send(MessageType::CacheAlloc, seq_id, &CacheAllocPayload { max_seq_len: 4096 }).await.unwrap();
+        conn.send_empty(MessageType::CacheAlloc, seq_id).await.unwrap();
         let (ack_header, _) = conn.recv().await.unwrap();
         assert_eq!(ack_header.msg_type, MessageType::CacheAllocAck);
     }
@@ -1327,7 +1327,7 @@ async fn test_pipeline_unexpected_message_type_is_error() {
     registry.assign("bad", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -1411,7 +1411,7 @@ async fn test_activation_shape_mismatch_detected() {
     for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
 
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -1447,7 +1447,7 @@ async fn test_alloc_cache_unknown_worker_is_error() {
     };
     let pipeline = DistributedPipeline::new(&[assignment, missing_assignment], 4096).unwrap();
 
-    let result = pipeline.alloc_cache(&mut registry, 1, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, 1).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("missing"));
 }
@@ -1545,7 +1545,7 @@ async fn test_single_worker_forward_returns_logits() {
     let (pipeline, mut registry) = setup_single_node_pipeline().await;
     let seq_id = 1;
 
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     // Prefill
     let logits = pipeline
@@ -1586,10 +1586,10 @@ async fn test_duplicate_cache_alloc_is_error() {
     let seq_id = 10;
 
     // First alloc succeeds
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     // Second alloc for same seq_id fails
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -1620,7 +1620,7 @@ async fn test_double_free_is_error() {
     let (pipeline, mut registry) = setup_single_node_pipeline().await;
     let seq_id = 20;
 
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 
     // Second free fails
@@ -1639,7 +1639,7 @@ async fn test_cache_reuse_after_free() {
     let seq_id = 30;
 
     // Alloc, use, free
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     let logits = pipeline
         .forward(&mut registry, seq_id, &[1], &[0], false)
         .await
@@ -1648,7 +1648,7 @@ async fn test_cache_reuse_after_free() {
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 
     // Re-alloc same seq_id succeeds
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     let logits = pipeline
         .forward(&mut registry, seq_id, &[2], &[0], false)
         .await
@@ -1664,8 +1664,8 @@ async fn test_multiple_sequence_isolation() {
     let seq_b = 200;
 
     // Allocate both sequences
-    pipeline.alloc_cache(&mut registry, seq_a, 4096).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq_b, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_a).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_b).await.unwrap();
 
     // Forward sequence A
     let logits_a = pipeline
@@ -1836,7 +1836,7 @@ async fn test_partial_cache_alloc_rollback() {
     let seq_id = 42;
 
     // alloc_cache should fail because the tail worker returns OOM
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -1915,7 +1915,7 @@ async fn test_partial_cache_alloc_rollback_three_nodes() {
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
     let seq_id = 77;
 
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     assert!(!pipeline.is_allocated(seq_id));
 
@@ -1951,8 +1951,8 @@ async fn test_batched_forward_two_nodes_returns_per_sequence_logits() {
     let seq2 = 101;
 
     // Allocate caches
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     // Build batch metadata
     let sequences = vec![
@@ -2006,7 +2006,7 @@ async fn test_batched_forward_single_sequence() {
     let (pipeline, mut registry) = setup_two_node_pipeline().await;
 
     let seq_id = 200;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,
@@ -2113,7 +2113,7 @@ async fn test_batched_forward_single_node_pipeline() {
     .unwrap();
 
     let seq_id = 1;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,
@@ -2215,8 +2215,8 @@ async fn test_batched_forward_three_node_pipeline() {
 
     let seq1 = 10;
     let seq2 = 11;
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     let sequences = vec![
         SequenceMetadataWire {
@@ -2385,8 +2385,8 @@ async fn test_batched_forward_fallback_to_forward_result() {
 
     let seq1 = 50;
     let seq2 = 51;
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     let sequences = vec![
         SequenceMetadataWire {
@@ -2518,7 +2518,7 @@ async fn test_batched_forward_worker_error_propagates() {
     .unwrap();
 
     let seq_id = 1;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,

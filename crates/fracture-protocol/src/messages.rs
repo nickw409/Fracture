@@ -146,12 +146,7 @@ pub struct HeartbeatAckPayload {
 
 // ── 0x07 CacheAlloc (Coordinator → Worker) ──────────────────────────────
 
-/// Instructs worker to allocate KV cache for a sequence.
-/// The seq_id is carried in the frame header.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheAllocPayload {
-    pub max_seq_len: u32,
-}
+// ── 0x07 CacheAlloc — no payload (seq_id in frame header) ──────────────
 
 // ── 0x08 CacheFree — no payload (seq_id in frame header) ────────────────
 // ── 0x09 Shutdown — no payload ──────────────────────────────────────────
@@ -482,12 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_alloc_roundtrip() {
-        let payload = CacheAllocPayload { max_seq_len: 4096 };
-        let decoded: CacheAllocPayload = bincode_roundtrip(&payload);
-        assert_eq!(decoded.max_seq_len, 4096);
-    }
-
     #[test]
     fn test_error_payload_roundtrip() {
         let payload = ErrorPayload {
