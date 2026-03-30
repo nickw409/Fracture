@@ -1735,3 +1735,106 @@ fn test_kv_cache_backend_cross_variant_errors() {
         "error should mention 'alloc_paged', got: {err}"
     );
 }
+
+/// Construct a QuantizedPaged KvCacheBackend, verify alloc/seq_len/free work
+/// and is_paged()/is_quantized() return correct values.
+#[test]
+fn test_kv_cache_backend_quantized_paged() {
+    let cfg = test_config();
+    let backend = MockBackend::new();
+    let tq_config = fracture_core::TurboQuantConfig::default();
+
+    let mut kv_backend = KvCacheBackend::QuantizedPaged(
+        crate::quantized_paged_kv_cache::QuantizedKvCacheManager::new(
+            10,
+            cfg.num_layers,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            16,
+            tq_config,
+            &backend,
+        )
+        .expect("QuantizedKvCacheManager::new should succeed"),
+    );
+
+    assert!(
+        kv_backend.is_paged(),
+        "QuantizedPaged should return true for is_paged()"
+    );
+    assert!(
+        kv_backend.is_quantized(),
+        "QuantizedPaged should return true for is_quantized()"
+    );
+
+    // alloc_paged should succeed.
+    let handle = kv_backend
+        .alloc_paged()
+        .expect("alloc_paged should succeed on QuantizedPaged variant");
+
+    // Generic alloc should also succeed.
+    let handle2 = kv_backend
+        .alloc(&backend)
+        .expect("alloc should succeed on QuantizedPaged variant");
+
+    // seq_len should be 0 after alloc.
+    let len = kv_backend
+        .seq_len(handle)
+        .expect("seq_len should succeed");
+    assert_eq!(len, 0);
+
+    // free should succeed.
+    kv_backend
+        .free(handle, &backend)
+        .expect("free should succeed");
+    kv_backend
+        .free(handle2, &backend)
+        .expect("free should succeed");
+}
+
+/// QuantizedPaged rejects alloc_contiguous.
+#[test]
+fn test_kv_cache_backend_quantized_paged_rejects_contiguous() {
+    let cfg = test_config();
+    let backend = MockBackend::new();
+    let tq_config = fracture_core::TurboQuantConfig::default();
+
+    let mut kv_backend = KvCacheBackend::QuantizedPaged(
+        crate::quantized_paged_kv_cache::QuantizedKvCacheManager::new(
+            4,
+            cfg.num_layers,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            16,
+            tq_config,
+            &backend,
+        )
+        .unwrap(),
+    );
+
+    let err = kv_backend.alloc_contiguous(&backend).unwrap_err();
+    assert!(
+        matches!(err, FractureError::KvCache(_)),
+        "alloc_contiguous on QuantizedPaged should return KvCache error, got: {err:?}"
+    );
+}
+
+/// Contiguous and Paged variants return false for is_quantized().
+#[test]
+fn test_kv_cache_backend_is_quantized() {
+    let cfg = test_config();
+    let backend = MockBackend::new();
+
+    let contiguous = KvCacheBackend::Contiguous(KvCacheManager::new(
+        cfg.num_layers,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        cfg.max_seq_len,
+    ));
+    assert!(!contiguous.is_quantized());
+
+    let paged = KvCacheBackend::Paged(
+        PagedKvCacheManager::new(4, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend)
+            .unwrap(),
+    );
+    assert!(!paged.is_quantized());
+}

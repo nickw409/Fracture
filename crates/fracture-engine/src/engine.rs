@@ -7,6 +7,7 @@ use fracture_gguf::WeightStore;
 use std::ops::Range;
 
 /// Runtime-selected KV cache implementation.
+#[allow(clippy::large_enum_variant)]
 pub enum KvCacheBackend {
     Contiguous(KvCacheManager),
     Paged(PagedKvCacheManager),

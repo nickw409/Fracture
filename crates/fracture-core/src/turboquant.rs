@@ -750,6 +750,474 @@ mod tests {
 
     // ── Integration test: compress round-trip in pure Rust ───────────
 
+    // ── Config edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn test_config_validate_all_valid_bits() {
+        for bits in [2, 4, 8] {
+            let cfg = TurboQuantConfig {
+                key_bits: bits,
+                value_bits: bits,
+                protected_bits: bits,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "bits={bits} should be valid");
+        }
+    }
+
+    #[test]
+    fn test_config_validate_protected_bits_invalid() {
+        let cfg = TurboQuantConfig {
+            protected_bits: 3,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_protection_more_than_half_layers() {
+        // protected_layers=20 with num_layers=32: all layers become protected
+        let cfg = TurboQuantConfig {
+            protected_layers: 20,
+            ..Default::default()
+        };
+        for layer in 0..32 {
+            assert!(
+                cfg.is_protected(layer, 32),
+                "layer {layer} should be protected when protected_layers=20 and num_layers=32"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_protection_single_layer_model() {
+        let cfg = TurboQuantConfig {
+            protected_layers: 1,
+            ..Default::default()
+        };
+        // num_layers=1: layer 0 is both first and last
+        assert!(cfg.is_protected(0, 1));
+    }
+
+    #[test]
+    fn test_config_protection_zero_layers() {
+        let cfg = TurboQuantConfig {
+            protected_layers: 0,
+            ..Default::default()
+        };
+        assert!(!cfg.is_protected(0, 32));
+        assert!(!cfg.is_protected(31, 32));
+    }
+
+    #[test]
+    fn test_packed_dim_per_head_alignment() {
+        // head_dim=1, 4-bit: 1*4/8 = 0.5, rounds up to 1 byte
+        assert_eq!(TurboQuantConfig::packed_dim_per_head(1, 4), 1);
+        // head_dim=3, 2-bit: 3*2/8 = 0.75, rounds up to 1 byte
+        assert_eq!(TurboQuantConfig::packed_dim_per_head(3, 2), 1);
+        // head_dim=5, 4-bit: 5*4/8 = 2.5, rounds up to 3 bytes
+        assert_eq!(TurboQuantConfig::packed_dim_per_head(5, 4), 3);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_zero_budget() {
+        let cfg = TurboQuantConfig::default();
+        // scratch_reserve >= gpu_available => 0 blocks
+        assert_eq!(cfg.compute_num_blocks(1000, 2000, 32, 8, 128), 0);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_exact_fit() {
+        let cfg = TurboQuantConfig::default();
+        let block_bytes = cfg.bytes_per_block_total(32, 8, 128);
+        // Exactly 3 blocks worth of memory
+        let budget = block_bytes * 3;
+        assert_eq!(cfg.compute_num_blocks(budget, 0, 32, 8, 128), 3);
+        // Slightly less than 4 blocks
+        assert_eq!(cfg.compute_num_blocks(budget + block_bytes - 1, 0, 32, 8, 128), 3);
+    }
+
+    #[test]
+    fn test_bytes_per_block_layer_8bit() {
+        // 8-bit K+V, 8 heads, d=128
+        let bytes = TurboQuantConfig::bytes_per_block_layer(8, 128, 8, 8);
+        // k_packed = 16 * 8 * 128 = 16384
+        // v_packed = 16 * 8 * 128 = 16384
+        // k_norms = 16 * 8 * 2 = 256
+        // v_norms = 16 * 8 * 2 = 256
+        // Total = 33280
+        assert_eq!(bytes, 33280);
+    }
+
+    #[test]
+    fn test_distinct_bit_widths_same_k_v() {
+        let cfg = TurboQuantConfig {
+            key_bits: 4,
+            value_bits: 4,
+            ..Default::default()
+        };
+        let bits = cfg.distinct_bit_widths();
+        assert_eq!(bits, vec![4]); // deduplicated
+    }
+
+    // ── Lloyd-Max additional tests ───────────────────────────────
+
+    #[test]
+    fn test_lloyd_max_4bit_symmetry() {
+        let cb = LloydMaxCodebook::compute(128, 4);
+        // 16 centroids should be symmetric around 0
+        for i in 0..8 {
+            let pos = cb.centroids[15 - i];
+            let neg = cb.centroids[i];
+            assert!(
+                (pos + neg).abs() < 1e-5,
+                "4-bit centroids should be symmetric: c[{}]={} vs c[{}]={}",
+                i, neg, 15 - i, pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_lloyd_max_distortion_decreases_with_bits() {
+        // More bits = lower distortion
+        let cb_2 = LloydMaxCodebook::compute(128, 2);
+        let cb_4 = LloydMaxCodebook::compute(128, 4);
+
+        // Proxy for distortion: measure MSE on random samples
+        let mut rng = Xoshiro256::new(999);
+        let sigma = 1.0 / (128.0f64).sqrt();
+        let n_samples = 10000;
+
+        let mut mse_2 = 0.0f64;
+        let mut mse_4 = 0.0f64;
+
+        for _ in 0..n_samples {
+            let (z, _) = box_muller(&mut rng);
+            let x = z as f64 * sigma;
+
+            // Quantize with 2-bit
+            let q2 = cb_2.centroids.iter()
+                .min_by(|a, b| (x as f32 - *a).abs().partial_cmp(&(x as f32 - *b).abs()).unwrap())
+                .unwrap();
+            mse_2 += (x - *q2 as f64) * (x - *q2 as f64);
+
+            // Quantize with 4-bit
+            let q4 = cb_4.centroids.iter()
+                .min_by(|a, b| (x as f32 - *a).abs().partial_cmp(&(x as f32 - *b).abs()).unwrap())
+                .unwrap();
+            mse_4 += (x - *q4 as f64) * (x - *q4 as f64);
+        }
+
+        mse_2 /= n_samples as f64;
+        mse_4 /= n_samples as f64;
+
+        assert!(
+            mse_4 < mse_2,
+            "4-bit MSE ({mse_4}) should be less than 2-bit MSE ({mse_2})"
+        );
+        // 4-bit should be roughly 10x lower than 2-bit for Gaussian
+        assert!(
+            mse_4 < mse_2 / 2.0,
+            "4-bit MSE should be significantly less than 2-bit: {mse_4} vs {mse_2}"
+        );
+    }
+
+    #[test]
+    fn test_lloyd_max_centroids_within_range() {
+        let cb = LloydMaxCodebook::compute(128, 4);
+        let sigma = 1.0 / (128.0f32).sqrt();
+        // All centroids should be within ~4*sigma of 0
+        let bound = 4.0 * sigma;
+        for (i, &c) in cb.centroids.iter().enumerate() {
+            assert!(
+                c.abs() < bound,
+                "centroid[{i}]={c} exceeds expected range ±{bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lloyd_max_different_dims() {
+        // Should work for various practical head dimensions
+        for d in [64, 96, 128, 256] {
+            let cb = LloydMaxCodebook::compute(d, 4);
+            assert_eq!(cb.centroids.len(), 16);
+            assert_eq!(cb.dim, d);
+            assert_eq!(cb.bits, 4);
+            // Sorted
+            for i in 1..16 {
+                assert!(cb.centroids[i] > cb.centroids[i - 1]);
+            }
+        }
+    }
+
+    // ── Rotation matrix additional tests ─────────────────────────
+
+    #[test]
+    fn test_rotation_preserves_norm() {
+        let d = 64;
+        let pi = generate_rotation_matrix(d, 42);
+
+        // Create a random vector
+        let mut rng = Xoshiro256::new(77);
+        let x: Vec<f32> = (0..d).map(|_| {
+            let (z, _) = box_muller(&mut rng);
+            z
+        }).collect();
+
+        let norm_before: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        // Rotate: y = Pi @ x
+        let mut y = vec![0.0f32; d];
+        for i in 0..d {
+            y[i] = (0..d).map(|j| pi[i * d + j] * x[j]).sum();
+        }
+
+        let norm_after: f32 = y.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        assert!(
+            (norm_before - norm_after).abs() < 1e-3,
+            "rotation should preserve norm: {norm_before} vs {norm_after}"
+        );
+    }
+
+    #[test]
+    fn test_rotation_unrotation_roundtrip() {
+        let d = 32;
+        let pi = generate_rotation_matrix(d, 42);
+
+        let mut rng = Xoshiro256::new(88);
+        let x: Vec<f32> = (0..d).map(|_| {
+            let (z, _) = box_muller(&mut rng);
+            z
+        }).collect();
+
+        // Rotate: y = Pi @ x
+        let mut y = vec![0.0f32; d];
+        for i in 0..d {
+            y[i] = (0..d).map(|j| pi[i * d + j] * x[j]).sum();
+        }
+
+        // Unrotate: x' = Pi^T @ y (since Pi is orthogonal, Pi^T = Pi^{-1})
+        let mut x_back = vec![0.0f32; d];
+        for i in 0..d {
+            x_back[i] = (0..d).map(|j| pi[j * d + i] * y[j]).sum();
+        }
+
+        // Should recover original vector
+        for i in 0..d {
+            assert!(
+                (x[i] - x_back[i]).abs() < 1e-4,
+                "roundtrip failed at [{i}]: {} vs {}",
+                x[i], x_back[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_rotation_distributes_coordinates() {
+        // After rotating a unit vector, coordinates should be roughly N(0, 1/d)
+        let d = 128;
+        let pi = generate_rotation_matrix(d, 42);
+        let expected_sigma = 1.0 / (d as f32).sqrt();
+
+        // Create a unit vector (e.g., [1, 0, 0, ...])
+        let mut x = vec![0.0f32; d];
+        x[0] = 1.0;
+
+        // Rotate
+        let mut y = vec![0.0f32; d];
+        for i in 0..d {
+            y[i] = (0..d).map(|j| pi[i * d + j] * x[j]).sum();
+        }
+
+        // Compute mean and std of rotated coordinates
+        let mean: f32 = y.iter().sum::<f32>() / d as f32;
+        let var: f32 = y.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+        let std = var.sqrt();
+
+        // Mean should be near 0, std should be near 1/sqrt(d)
+        assert!(
+            mean.abs() < 0.05,
+            "mean of rotated unit vector should be near 0, got {mean}"
+        );
+        assert!(
+            (std - expected_sigma).abs() < expected_sigma * 0.5,
+            "std should be near {expected_sigma}, got {std}"
+        );
+    }
+
+    // ── Quantize round-trip additional tests ─────────────────────
+
+    #[test]
+    fn test_quantize_dequantize_2bit_roundtrip() {
+        let d = 128;
+        let cb = LloydMaxCodebook::compute(d, 2);
+        let pi = generate_rotation_matrix(d, 42);
+
+        let mut rng = Xoshiro256::new(456);
+        let x: Vec<f32> = (0..d).map(|_| {
+            let (z, _) = box_muller(&mut rng);
+            z
+        }).collect();
+
+        let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let x_norm: Vec<f32> = x.iter().map(|v| v / (norm + 1e-8)).collect();
+
+        let mut y = vec![0.0f32; d];
+        for i in 0..d {
+            y[i] = (0..d).map(|j| pi[i * d + j] * x_norm[j]).sum();
+        }
+
+        let indices: Vec<usize> = y.iter().map(|&yi| {
+            cb.centroids.iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (yi - *a).abs().partial_cmp(&(yi - *b).abs()).unwrap())
+                .unwrap().0
+        }).collect();
+
+        let y_hat: Vec<f32> = indices.iter().map(|&i| cb.centroids[i]).collect();
+
+        let mut x_hat = vec![0.0f32; d];
+        for i in 0..d {
+            x_hat[i] = (0..d).map(|j| pi[j * d + i] * y_hat[j]).sum();
+        }
+
+        let x_recon: Vec<f32> = x_hat.iter().map(|v| v * norm).collect();
+
+        let dot: f32 = x.iter().zip(x_recon.iter()).map(|(a, b)| a * b).sum();
+        let norm_orig: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let norm_recon: f32 = x_recon.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cosine_sim = dot / (norm_orig * norm_recon + 1e-8);
+
+        // 2-bit should still give reasonable fidelity (lower than 4-bit)
+        assert!(
+            cosine_sim > 0.90,
+            "2-bit round-trip cosine similarity should be > 0.90, got {cosine_sim}"
+        );
+    }
+
+    #[test]
+    fn test_quantize_zero_vector() {
+        let d = 128;
+        let cb = LloydMaxCodebook::compute(d, 4);
+        let pi = generate_rotation_matrix(d, 42);
+
+        let x = vec![0.0f32; d];
+        let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        // With epsilon guard, normalization produces near-zero
+        let x_norm: Vec<f32> = x.iter().map(|v| v / (norm + 1e-8)).collect();
+
+        let mut y = vec![0.0f32; d];
+        for i in 0..d {
+            y[i] = (0..d).map(|j| pi[i * d + j] * x_norm[j]).sum();
+        }
+
+        // Quantize (should not panic)
+        let _indices: Vec<usize> = y.iter().map(|&yi| {
+            cb.centroids.iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (yi - *a).abs().partial_cmp(&(yi - *b).abs()).unwrap())
+                .unwrap().0
+        }).collect();
+
+        // Reconstruction should be near zero since norm ≈ 0
+        // (norm * anything ≈ 0)
+        assert!(
+            norm < 1e-7,
+            "zero vector norm should be ~0, got {norm}"
+        );
+    }
+
+    #[test]
+    fn test_query_prerotation_optimization() {
+        // Verify: dot(q, Pi^T @ y_hat) * norm == dot(Pi @ q, y_hat) * norm
+        // This is the key optimization in the TQ attention kernel
+        let d = 64;
+        let pi = generate_rotation_matrix(d, 42);
+
+        let mut rng = Xoshiro256::new(777);
+        let q: Vec<f32> = (0..d).map(|_| {
+            let (z, _) = box_muller(&mut rng);
+            z
+        }).collect();
+        let y_hat: Vec<f32> = (0..d).map(|_| {
+            let (z, _) = box_muller(&mut rng);
+            z * 0.1 // simulate quantized rotated values
+        }).collect();
+        let norm = 2.5f32;
+
+        // Method 1: unrotate K, then dot with q
+        let mut k_unrot = vec![0.0f32; d];
+        for i in 0..d {
+            k_unrot[i] = (0..d).map(|j| pi[j * d + i] * y_hat[j]).sum();
+        }
+        let score_1: f32 = q.iter().zip(k_unrot.iter()).map(|(a, b)| a * b).sum::<f32>() * norm;
+
+        // Method 2: pre-rotate q, then dot directly in rotated space
+        let mut q_rot = vec![0.0f32; d];
+        for i in 0..d {
+            q_rot[i] = (0..d).map(|j| pi[i * d + j] * q[j]).sum();
+        }
+        let score_2: f32 = q_rot.iter().zip(y_hat.iter()).map(|(a, b)| a * b).sum::<f32>() * norm;
+
+        assert!(
+            (score_1 - score_2).abs() < 1e-3,
+            "pre-rotation optimization should produce same score: {score_1} vs {score_2}"
+        );
+    }
+
+    #[test]
+    fn test_v_accumulation_optimization() {
+        // Verify: Pi^T @ sum(prob_i * y_hat_i * norm_i) == sum(prob_i * Pi^T @ y_hat_i * norm_i)
+        // This is the V accumulation optimization in the TQ attention kernel
+        let d = 32;
+        let pi = generate_rotation_matrix(d, 42);
+        let n_kv = 5;
+
+        let mut rng = Xoshiro256::new(888);
+        let probs: Vec<f32> = (0..n_kv).map(|_| rng.next_f64() as f32).collect();
+        let y_hats: Vec<Vec<f32>> = (0..n_kv)
+            .map(|_| (0..d).map(|_| { let (z, _) = box_muller(&mut rng); z * 0.1 }).collect())
+            .collect();
+        let norms: Vec<f32> = (0..n_kv).map(|_| rng.next_f64() as f32 * 3.0).collect();
+
+        // Method 1: unrotate each, then accumulate
+        let mut out_1 = vec![0.0f32; d];
+        for kv in 0..n_kv {
+            let mut unrot = vec![0.0f32; d];
+            for i in 0..d {
+                unrot[i] = (0..d).map(|j| pi[j * d + i] * y_hats[kv][j]).sum();
+            }
+            for i in 0..d {
+                out_1[i] += probs[kv] * unrot[i] * norms[kv];
+            }
+        }
+
+        // Method 2: accumulate in rotated space, then unrotate once
+        let mut acc_rot = vec![0.0f32; d];
+        for kv in 0..n_kv {
+            for i in 0..d {
+                acc_rot[i] += probs[kv] * y_hats[kv][i] * norms[kv];
+            }
+        }
+        let mut out_2 = vec![0.0f32; d];
+        for i in 0..d {
+            out_2[i] = (0..d).map(|j| pi[j * d + i] * acc_rot[j]).sum();
+        }
+
+        for i in 0..d {
+            assert!(
+                (out_1[i] - out_2[i]).abs() < 1e-3,
+                "V accumulation optimization mismatch at [{i}]: {} vs {}",
+                out_1[i], out_2[i]
+            );
+        }
+    }
+
+    // ── Integration test: compress round-trip in pure Rust ───────────
+
     #[test]
     fn test_quantize_dequantize_roundtrip() {
         let d = 128;

@@ -820,4 +820,256 @@ mod tests {
     fn test_block_size_consistency() {
         assert_eq!(BLOCK_SIZE, 16, "quantized cache must use same BLOCK_SIZE as FP16 cache");
     }
+
+    #[test]
+    fn test_pool_packed_tensor_shapes() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default(); // K4/V2
+        let pool = QuantizedBlockPool::new(2, 2, 8, 128, &config, &backend).unwrap();
+
+        // K packed: 8 heads * 64 bytes/head (128 coords * 4 bits / 8) = 512
+        let k = pool.k_packed(0, 0);
+        assert_eq!(k.shape, vec![BLOCK_SIZE, 8 * 64]);
+        assert_eq!(k.dtype, DType::INT8);
+
+        // V packed: 8 heads * 32 bytes/head (128 coords * 2 bits / 8) = 256
+        let v = pool.v_packed(0, 0);
+        assert_eq!(v.shape, vec![BLOCK_SIZE, 8 * 32]);
+        assert_eq!(v.dtype, DType::INT8);
+
+        // Norms: [BLOCK_SIZE, num_kv_heads]
+        let kn = pool.k_norms(0, 0);
+        assert_eq!(kn.shape, vec![BLOCK_SIZE, 8]);
+        assert_eq!(kn.dtype, DType::FP16);
+
+        let vn = pool.v_norms(0, 0);
+        assert_eq!(vn.shape, vec![BLOCK_SIZE, 8]);
+    }
+
+    #[test]
+    fn test_pool_protected_layer_packed_shapes() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig {
+            key_bits: 4,
+            value_bits: 2,
+            protected_bits: 8,
+            protected_layers: 1,
+            ..Default::default()
+        };
+        // 4 layers: layer 0 protected (8-bit), layers 1-2 normal, layer 3 protected
+        let pool = QuantizedBlockPool::new(1, 4, 8, 128, &config, &backend).unwrap();
+
+        // Protected layer 0: K packed = 8 * 128 = 1024
+        let k_prot = pool.k_packed(0, 0);
+        assert_eq!(k_prot.shape, vec![BLOCK_SIZE, 8 * 128]);
+
+        // Normal layer 1: K packed = 8 * 64 = 512
+        let k_norm = pool.k_packed(0, 1);
+        assert_eq!(k_norm.shape, vec![BLOCK_SIZE, 8 * 64]);
+
+        // Protected layer 3: V packed = 8 * 128 = 1024
+        let v_prot = pool.v_packed(0, 3);
+        assert_eq!(v_prot.shape, vec![BLOCK_SIZE, 8 * 128]);
+
+        // Normal layer 2: V packed = 8 * 32 = 256
+        let v_norm = pool.v_packed(0, 2);
+        assert_eq!(v_norm.shape, vec![BLOCK_SIZE, 8 * 32]);
+    }
+
+    #[test]
+    fn test_pool_rotation_matrices_per_layer() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let pool = QuantizedBlockPool::new(1, 4, 8, 128, &config, &backend).unwrap();
+
+        // Each layer should have distinct rotation matrices
+        let k0 = pool.k_rotation(0);
+        let k1 = pool.k_rotation(1);
+        assert_ne!(k0.id, k1.id, "different layers should have different K rotations");
+
+        let v0 = pool.v_rotation(0);
+        let v1 = pool.v_rotation(1);
+        assert_ne!(v0.id, v1.id, "different layers should have different V rotations");
+    }
+
+    #[test]
+    fn test_pool_centroid_tables_with_protection() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig {
+            key_bits: 4,
+            value_bits: 2,
+            protected_bits: 8,
+            protected_layers: 1,
+            ..Default::default()
+        };
+        let pool = QuantizedBlockPool::new(1, 4, 8, 128, &config, &backend).unwrap();
+
+        // Should have tables for 2, 4, and 8 bits
+        assert_eq!(pool.centroids(2).shape, vec![4]);
+        assert_eq!(pool.centroids(4).shape, vec![16]);
+        assert_eq!(pool.centroids(8).shape, vec![256]);
+    }
+
+    #[test]
+    fn test_pool_bytes_per_block() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let pool = QuantizedBlockPool::new(1, 2, 8, 128, &config, &backend).unwrap();
+
+        let expected = TurboQuantConfig::bytes_per_block_layer(8, 128, 4, 2) * 2; // 2 layers
+        assert_eq!(pool.bytes_per_block(), expected);
+    }
+
+    #[test]
+    fn test_pool_free_block_reuse() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mut pool = QuantizedBlockPool::new(2, 1, 8, 128, &config, &backend).unwrap();
+
+        let b0 = pool.alloc_block().unwrap();
+        let b1 = pool.alloc_block().unwrap();
+        assert_eq!(pool.num_free(), 0);
+
+        pool.free_block(b0);
+        assert_eq!(pool.num_free(), 1);
+
+        // Re-allocate should return the freed block
+        let b2 = pool.alloc_block().unwrap();
+        assert_eq!(b2, b0, "freed block should be reused");
+        assert_eq!(pool.num_free(), 0);
+
+        pool.free_block(b1);
+        pool.free_block(b2);
+        assert_eq!(pool.num_free(), 2);
+    }
+
+    #[test]
+    fn test_manager_multi_sequence_isolation() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mut mgr =
+            QuantizedKvCacheManager::new(8, 1, 8, 128, 16, config, &backend).unwrap();
+
+        let h0 = mgr.alloc().unwrap();
+        let h1 = mgr.alloc().unwrap();
+        let h2 = mgr.alloc().unwrap();
+
+        // Each has independent state
+        assert_eq!(mgr.seq_len(h0).unwrap(), 0);
+        assert_eq!(mgr.seq_len(h1).unwrap(), 0);
+        assert_eq!(mgr.seq_len(h2).unwrap(), 0);
+
+        // Block tables are independent
+        let bt0 = mgr.block_table(h0).unwrap();
+        let bt1 = mgr.block_table(h1).unwrap();
+        assert_ne!(bt0[0], bt1[0], "sequences should have different block IDs");
+
+        // Free one doesn't affect others
+        mgr.free(h1).unwrap();
+        assert_eq!(mgr.seq_len(h0).unwrap(), 0);
+        assert_eq!(mgr.seq_len(h2).unwrap(), 0);
+        assert!(mgr.seq_len(h1).is_err(), "freed handle should be invalid");
+
+        mgr.free(h0).unwrap();
+        mgr.free(h2).unwrap();
+    }
+
+    #[test]
+    fn test_manager_available_token_capacity() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mgr =
+            QuantizedKvCacheManager::new(4, 1, 8, 128, 16, config, &backend).unwrap();
+
+        // 4 blocks, but 0 allocated to sequences yet (manager hasn't alloc'd any)
+        // Wait — new() doesn't alloc any sequences, but blocks are all free
+        assert_eq!(mgr.available_token_capacity(), 4 * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn test_manager_alloc_until_oom() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mut mgr =
+            QuantizedKvCacheManager::new(3, 1, 8, 128, 16, config, &backend).unwrap();
+
+        // Each alloc takes 1 block
+        let _h0 = mgr.alloc().unwrap();
+        let _h1 = mgr.alloc().unwrap();
+        let _h2 = mgr.alloc().unwrap();
+
+        // 4th alloc should fail — all 3 blocks taken
+        assert!(mgr.alloc().is_err(), "should OOM when all blocks allocated");
+    }
+
+    #[test]
+    fn test_manager_double_free() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mut mgr =
+            QuantizedKvCacheManager::new(4, 1, 8, 128, 16, config, &backend).unwrap();
+
+        let h = mgr.alloc().unwrap();
+        mgr.free(h).unwrap();
+
+        // Second free should fail
+        assert!(mgr.free(h).is_err(), "double free should return error");
+    }
+
+    #[test]
+    fn test_manager_scratch_tensor_shapes() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig {
+            key_bits: 4,
+            value_bits: 2,
+            protected_bits: 8,
+            protected_layers: 1,
+            ..Default::default()
+        };
+        // max_compress_tokens = 32, 4 layers
+        let mgr =
+            QuantizedKvCacheManager::new(2, 4, 8, 128, 32, config, &backend).unwrap();
+
+        // Scratch K packed should be sized for max bits (8-bit protected)
+        // max_k_packed_dim = 8 * 128 = 1024 (8-bit, since protected_layers > 0)
+        assert_eq!(mgr.scratch.k_packed.shape, vec![32, 8 * 128]);
+        assert_eq!(mgr.scratch.k_norms.shape, vec![32, 8]);
+
+        // Scratch V packed: max is also 8-bit for protected layers
+        assert_eq!(mgr.scratch.v_packed.shape, vec![32, 8 * 128]);
+        assert_eq!(mgr.scratch.v_norms.shape, vec![32, 8]);
+    }
+
+    #[test]
+    fn test_manager_scratch_no_protection() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default(); // K4/V2, no protection
+        let mgr =
+            QuantizedKvCacheManager::new(2, 2, 8, 128, 16, config, &backend).unwrap();
+
+        // K scratch: max is 4-bit → 8 * 64 = 512
+        assert_eq!(mgr.scratch.k_packed.shape, vec![16, 8 * 64]);
+        // V scratch: max is 2-bit → 8 * 32 = 256
+        assert_eq!(mgr.scratch.v_packed.shape, vec![16, 8 * 32]);
+    }
+
+    #[test]
+    fn test_pool_destroy() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let pool = QuantizedBlockPool::new(2, 2, 8, 128, &config, &backend).unwrap();
+
+        // destroy should succeed without panicking
+        pool.destroy(&backend).unwrap();
+    }
+
+    #[test]
+    fn test_manager_destroy() {
+        let backend = MockBackend::new();
+        let config = TurboQuantConfig::default();
+        let mgr =
+            QuantizedKvCacheManager::new(2, 2, 8, 128, 16, config, &backend).unwrap();
+
+        mgr.destroy(&backend).unwrap();
+    }
 }
