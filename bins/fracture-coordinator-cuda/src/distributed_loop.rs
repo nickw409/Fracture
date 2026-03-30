@@ -52,6 +52,12 @@ pub struct DistributedLoopConfig {
     pub heartbeat_interval: Duration,
     /// Max missed heartbeats before marking a worker dead.
     pub heartbeat_max_missed: usize,
+    /// Model config (needed for rebalancing after worker death).
+    pub model_config: Option<fracture_core::ModelConfig>,
+    /// Scheduling mode (needed for rebalancing).
+    pub scheduling_mode: fracture_coordinator::scheduler::SchedulingMode,
+    /// Max sequence length (needed for rebalancing).
+    pub max_seq_len: usize,
 }
 
 impl Default for DistributedLoopConfig {
@@ -63,6 +69,9 @@ impl Default for DistributedLoopConfig {
             min_free_blocks_reserve: 4,
             heartbeat_interval: heartbeat::DEFAULT_INTERVAL,
             heartbeat_max_missed: heartbeat::DEFAULT_MAX_MISSED,
+            model_config: None,
+            scheduling_mode: fracture_coordinator::scheduler::SchedulingMode::Auto,
+            max_seq_len: 4096,
         }
     }
 }
@@ -156,13 +165,17 @@ async fn distributed_loop_task(
                 );
                 if !dead_ids.is_empty() {
                     tracing::error!("dead workers detected: {dead_ids:?}");
-                    pipeline_degraded = true;
 
-                    let mut reg = registry.lock().await;
-                    heartbeat::mark_dead_workers(&mut reg, &dead_ids);
-                    let aborted = pipeline.abort_all_sequences(&mut reg).await;
-                    drop(reg);
+                    {
+                        let mut reg = registry.lock().await;
+                        heartbeat::mark_dead_workers(&mut reg, &dead_ids);
+                    }
 
+                    // Abort active sequences that used dead workers' layers.
+                    let aborted = {
+                        let mut reg = registry.lock().await;
+                        pipeline.abort_all_sequences(&mut reg).await
+                    };
                     for seq_id in &aborted {
                         if let Some(seq) = active.remove(seq_id) {
                             let _ = seq.event_tx.send(GenerationEvent::Error(
@@ -171,10 +184,47 @@ async fn distributed_loop_task(
                         }
                     }
 
-                    for req in pending.drain(..) {
-                        let _ = req.event_tx.send(GenerationEvent::Error(
-                            format!("pipeline degraded: worker(s) {dead_ids:?} died"),
-                        ));
+                    // Try to rebalance with remaining workers (FT-5).
+                    if let Some(ref model_cfg) = config.model_config {
+                        tracing::info!("attempting crash recovery rebalance without dead workers");
+                        match fracture_coordinator::rebalance::forced_rebalance(
+                            &registry,
+                            &pipeline,
+                            model_cfg,
+                            &config.scheduling_mode,
+                            config.max_seq_len,
+                            &dead_ids,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                pipeline = result.pipeline;
+                                tracing::info!(
+                                    "crash recovery rebalance succeeded: {} stages",
+                                    pipeline.pipeline_order().len()
+                                );
+                                // Pipeline recovered — not degraded.
+                                // Pending requests can proceed.
+                            }
+                            Err(e) => {
+                                tracing::error!("crash recovery rebalance failed: {e}");
+                                tracing::error!("pipeline degraded — waiting for manual intervention or worker reconnection");
+                                pipeline_degraded = true;
+                                for req in pending.drain(..) {
+                                    let _ = req.event_tx.send(GenerationEvent::Error(
+                                        format!("pipeline degraded: worker(s) {dead_ids:?} died"),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        // No model config — can't rebalance, fall back to old behavior.
+                        pipeline_degraded = true;
+                        for req in pending.drain(..) {
+                            let _ = req.event_tx.send(GenerationEvent::Error(
+                                format!("pipeline degraded: worker(s) {dead_ids:?} died"),
+                            ));
+                        }
                     }
                 }
             }

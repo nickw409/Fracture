@@ -143,10 +143,19 @@ async fn main() -> Result<()> {
     use tower_http::cors::CorsLayer;
     let router: Router = if config.batched {
         tracing::info!("using batched scheduler loop (Phase 4)");
+        let loop_config = distributed_loop::DistributedLoopConfig {
+            model_config: Some(model_config.clone()),
+            scheduling_mode: match config.scheduling_mode.as_str() {
+                "equal" => fracture_coordinator::scheduler::SchedulingMode::EqualSplit,
+                _ => fracture_coordinator::scheduler::SchedulingMode::Auto,
+            },
+            max_seq_len: config.max_seq_len,
+            ..distributed_loop::DistributedLoopConfig::default()
+        };
         let handle = distributed_loop::start_distributed_loop(
             Arc::clone(&empty_pipeline),
             Arc::clone(&registry),
-            distributed_loop::DistributedLoopConfig::default(),
+            loop_config,
             pipeline_rx,
         );
         let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
