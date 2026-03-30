@@ -3,8 +3,9 @@
 
 use crate::scheduler::{LayerAssignment, WorkerCapabilities};
 use fracture_core::{FractureError, Result};
-use fracture_protocol::FramedConnection;
+use fracture_protocol::{FramedConnection, FramedReader, FramedWriter};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Health status of a worker.
@@ -21,7 +22,8 @@ pub enum WorkerStatus {
 /// A registered worker and its associated state.
 pub struct WorkerEntry {
     pub capabilities: WorkerCapabilities,
-    pub connection: FramedConnection,
+    pub writer: FramedWriter,
+    pub reader: Arc<tokio::sync::Mutex<FramedReader>>,
     pub assignment: Option<LayerAssignment>,
     pub last_heartbeat: Instant,
     pub status: WorkerStatus,
@@ -61,6 +63,11 @@ impl PeerRegistry {
 
     /// Register a new worker. Returns error if a worker with the same
     /// node_id is already registered and not dead.
+    ///
+    /// The connection is split into independent writer and reader halves.
+    /// The writer stays in `WorkerEntry` for sending commands; the reader
+    /// is wrapped in `Arc<Mutex>` so it can be polled concurrently for
+    /// heartbeat acks without holding the registry lock.
     pub fn register(
         &mut self,
         capabilities: WorkerCapabilities,
@@ -76,11 +83,14 @@ impl PeerRegistry {
             )));
         }
 
+        let (writer, reader) = connection.into_split();
+
         self.workers.insert(
             node_id,
             WorkerEntry {
                 capabilities,
-                connection,
+                writer,
+                reader: Arc::new(tokio::sync::Mutex::new(reader)),
                 assignment: None,
                 last_heartbeat: Instant::now(),
                 status: WorkerStatus::Connected,
@@ -189,15 +199,15 @@ impl PeerRegistry {
             .count()
     }
 
-    /// Check all workers for missed heartbeats. Returns node IDs of
-    /// workers that have exceeded the timeout.
-    pub fn check_heartbeats(&self, timeout: std::time::Duration) -> Vec<String> {
-        let now = Instant::now();
+    /// Collect reader handles for all ready workers.
+    ///
+    /// Returns `(node_id, Arc<Mutex<FramedReader>>)` pairs. The caller can
+    /// release the registry lock and poll all readers concurrently.
+    pub fn reader_handles(&self) -> Vec<(String, Arc<tokio::sync::Mutex<FramedReader>>)> {
         self.workers
             .values()
-            .filter(|e| e.status == WorkerStatus::Ready)
-            .filter(|e| now.duration_since(e.last_heartbeat) > timeout)
-            .map(|e| e.capabilities.node_id.clone())
+            .filter(|e| e.status == WorkerStatus::Ready && e.assignment.is_some())
+            .map(|e| (e.capabilities.node_id.clone(), e.reader.clone()))
             .collect()
     }
 
@@ -299,29 +309,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_check() {
+    async fn test_reader_handles_returns_ready_workers() {
         let mut reg = PeerRegistry::new();
         reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        // No workers are Ready yet (only Connected), so no reader handles.
+        assert!(reg.reader_handles().is_empty());
+
         reg.assign(
             "w1",
             LayerAssignment {
                 node_id: "w1".into(),
-                layer_range: 0..32,
+                layer_range: 0..16,
                 role: NodeRole::Head,
-                expected_decode_ms: 32.0,
-                weight_memory_gb: 12.0,
-                cache_memory_gb: 2.0,
+                expected_decode_ms: 16.0,
+                weight_memory_gb: 6.0,
+                cache_memory_gb: 1.0,
             },
         )
         .unwrap();
 
-        // Just registered — should not be timed out with a 15s timeout
-        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(15));
-        assert!(timed_out.is_empty());
-
-        // With zero timeout, should immediately be detected
-        let timed_out = reg.check_heartbeats(std::time::Duration::ZERO);
-        assert_eq!(timed_out, vec!["w1"]);
+        let handles = reg.reader_handles();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].0, "w1");
     }
 
     #[tokio::test]
@@ -502,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_record_heartbeat_updates_timestamp() {
+    async fn test_record_heartbeat_updates_stats() {
         let mut reg = PeerRegistry::new();
         reg.register(test_caps("w1"), dummy_connection().await).unwrap();
         reg.assign(
@@ -513,16 +524,10 @@ mod tests {
             },
         ).unwrap();
 
-        // Should be timed out with zero timeout
-        assert!(!reg.check_heartbeats(std::time::Duration::ZERO).is_empty());
-
-        // Record heartbeat, then check with a generous timeout — should pass
-        reg.record_heartbeat("w1", 100, 0);
-        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(60));
-        assert!(timed_out.is_empty());
-
-        // Verify free_blocks was stored
+        // Record heartbeat and verify stats are stored
+        reg.record_heartbeat("w1", 100, 4_000_000_000);
         assert_eq!(reg.get("w1").unwrap().free_blocks, 100);
+        assert_eq!(reg.get("w1").unwrap().gpu_memory_used, 4_000_000_000);
     }
 
     #[tokio::test]

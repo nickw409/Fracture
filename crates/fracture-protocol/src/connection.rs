@@ -3,6 +3,14 @@
 //! Wraps a `TcpStream` with buffered I/O and provides typed send/recv
 //! for the Fracture wire protocol. Handles frame encoding, CRC32C
 //! computation, and validation transparently.
+//!
+//! ## Split connections
+//!
+//! [`FramedConnection`] can be split into independent [`FramedWriter`] and
+//! [`FramedReader`] halves via [`into_split()`](FramedConnection::into_split).
+//! This allows concurrent reads and writes on separate halves — e.g., polling
+//! heartbeat acks from all workers in parallel while the write halves remain
+//! in the registry for sending commands.
 
 use crate::frame::{
     decode_header, encode_header, verify_crc, FrameHeader, MessageType, CRC_SIZE, HEADER_SIZE,
@@ -13,10 +21,112 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
+/// Write half of a framed connection.
+///
+/// Holds the buffered writer and supports sending messages. Obtained by
+/// calling [`FramedConnection::into_split()`].
+pub struct FramedWriter {
+    writer: BufWriter<OwnedWriteHalf>,
+}
+
+impl FramedWriter {
+    /// Send a message with a bincode-serialized payload.
+    pub async fn send<P: Serialize>(
+        &mut self,
+        msg_type: MessageType,
+        seq_id: u64,
+        payload: &P,
+    ) -> Result<()> {
+        let payload_bytes =
+            bincode::serialize(payload).map_err(|e| FractureError::Protocol(e.to_string()))?;
+        self.send_raw(msg_type, seq_id, &payload_bytes).await
+    }
+
+    /// Send a message with a pre-serialized payload.
+    pub async fn send_raw(
+        &mut self,
+        msg_type: MessageType,
+        seq_id: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let header = FrameHeader {
+            msg_type,
+            seq_id,
+            payload_len: payload.len() as u32,
+        };
+
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        encode_header(&header, &mut hdr_buf);
+
+        let mut crc_input = Vec::with_capacity(HEADER_SIZE + payload.len());
+        crc_input.extend_from_slice(&hdr_buf);
+        crc_input.extend_from_slice(payload);
+        let crc = crc32c::crc32c(&crc_input);
+
+        self.writer.write_all(&hdr_buf).await?;
+        self.writer.write_all(payload).await?;
+        self.writer.write_all(&crc.to_be_bytes()).await?;
+        self.writer.flush().await?;
+
+        Ok(())
+    }
+
+    /// Send a message with no payload (e.g., Shutdown, CacheFree).
+    pub async fn send_empty(&mut self, msg_type: MessageType, seq_id: u64) -> Result<()> {
+        self.send_raw(msg_type, seq_id, &[]).await
+    }
+}
+
+impl std::fmt::Debug for FramedWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedWriter").finish()
+    }
+}
+
+/// Read half of a framed connection.
+///
+/// Holds the buffered reader and supports receiving messages. Obtained by
+/// calling [`FramedConnection::into_split()`].
+pub struct FramedReader {
+    reader: BufReader<OwnedReadHalf>,
+}
+
+impl FramedReader {
+    /// Receive the next frame. Returns the header and raw payload bytes.
+    pub async fn recv(&mut self) -> Result<(FrameHeader, Vec<u8>)> {
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        self.reader.read_exact(&mut hdr_buf).await?;
+        let header = decode_header(&hdr_buf)?;
+
+        let mut payload = vec![0u8; header.payload_len as usize];
+        if !payload.is_empty() {
+            self.reader.read_exact(&mut payload).await?;
+        }
+
+        let mut crc_buf = [0u8; CRC_SIZE];
+        self.reader.read_exact(&mut crc_buf).await?;
+        let expected_crc = u32::from_be_bytes(crc_buf);
+
+        let mut crc_input = Vec::with_capacity(HEADER_SIZE + payload.len());
+        crc_input.extend_from_slice(&hdr_buf);
+        crc_input.extend_from_slice(&payload);
+        verify_crc(&crc_input, expected_crc)?;
+
+        Ok((header, payload))
+    }
+}
+
+impl std::fmt::Debug for FramedReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedReader").finish()
+    }
+}
+
 /// Async framed connection for the Fracture wire protocol.
 ///
-/// Splits the TCP stream into independent buffered reader/writer halves
-/// so reads and writes can proceed without contention.
+/// Wraps a TCP stream with buffered I/O. Can be used as a unified
+/// send/recv handle, or split into independent [`FramedWriter`] and
+/// [`FramedReader`] halves for concurrent access.
 pub struct FramedConnection {
     reader: BufReader<OwnedReadHalf>,
     writer: BufWriter<OwnedWriteHalf>,
@@ -30,6 +140,19 @@ impl FramedConnection {
             reader: BufReader::new(read_half),
             writer: BufWriter::new(write_half),
         }
+    }
+
+    /// Split into independent writer and reader halves.
+    ///
+    /// This consumes the connection. Use this when the read and write
+    /// halves need to be accessed concurrently (e.g., the coordinator
+    /// stores writers in the registry and polls readers independently
+    /// for heartbeat acks).
+    pub fn into_split(self) -> (FramedWriter, FramedReader) {
+        (
+            FramedWriter { writer: self.writer },
+            FramedReader { reader: self.reader },
+        )
     }
 
     /// Send a message with a bincode-serialized payload.
@@ -57,17 +180,14 @@ impl FramedConnection {
             payload_len: payload.len() as u32,
         };
 
-        // Encode header
         let mut hdr_buf = [0u8; HEADER_SIZE];
         encode_header(&header, &mut hdr_buf);
 
-        // Compute CRC over header + payload
         let mut crc_input = Vec::with_capacity(HEADER_SIZE + payload.len());
         crc_input.extend_from_slice(&hdr_buf);
         crc_input.extend_from_slice(payload);
         let crc = crc32c::crc32c(&crc_input);
 
-        // Write header + payload + CRC
         self.writer.write_all(&hdr_buf).await?;
         self.writer.write_all(payload).await?;
         self.writer.write_all(&crc.to_be_bytes()).await?;

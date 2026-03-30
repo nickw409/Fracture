@@ -361,7 +361,7 @@ async fn test_shutdown_propagation() {
     // Send shutdown
     let entry = registry.get_mut("w").unwrap();
     entry
-        .connection
+        .writer
         .send_empty(MessageType::Shutdown, 0)
         .await
         .unwrap();
@@ -711,9 +711,9 @@ async fn test_heartbeat_round_trip() {
 
     let hb = HeartbeatPayload { timestamp_ns: 1234567890, nonce: 42 };
     let entry = registry.get_mut("hb-worker").unwrap();
-    entry.connection.send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    entry.writer.send(MessageType::Heartbeat, 0, &hb).await.unwrap();
 
-    let (header, payload) = entry.connection.recv().await.unwrap();
+    let (header, payload) = entry.reader.lock().await.recv().await.unwrap();
     assert_eq!(header.msg_type, MessageType::HeartbeatAck);
     let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
     assert_eq!(ack.timestamp_echo, 1234567890);
@@ -834,17 +834,16 @@ async fn test_worker_unknown_message_returns_error() {
 // ── Heartbeat module tests ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_send_heartbeats_and_check_timeout() {
-    use fracture_coordinator::heartbeat;
+async fn test_heartbeat_tracker_valid_ack_over_wire() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
 
-    // Spawn a mock worker that responds to heartbeats
+    // Spawn a mock worker that echoes heartbeat nonces.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let _worker = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut conn = FramedConnection::new(stream);
-        // Respond to one heartbeat
         let (header, payload) = conn.recv().await.unwrap();
         assert_eq!(header.msg_type, MessageType::Heartbeat);
         let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
@@ -853,7 +852,7 @@ async fn test_send_heartbeats_and_check_timeout() {
             nonce_echo: hb.nonce,
             gpu_memory_used: 0,
             active_sequences: 0,
-            free_blocks: 0,
+            free_blocks: 50,
         };
         conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
     });
@@ -869,28 +868,38 @@ async fn test_send_heartbeats_and_check_timeout() {
     };
     registry.assign("hb-test", assignment).unwrap();
 
-    // send_heartbeats with generous timeout — should return no timed-out workers
-    let timed_out = heartbeat::send_heartbeats(
-        &mut registry,
-        std::time::Duration::from_secs(60),
-    ).await;
-    assert!(timed_out.is_empty(), "no workers should be timed out");
+    let mut tracker = HeartbeatTracker::new();
+
+    // Send heartbeat with nonce 42.
+    let nonce = 42u64;
+    let hb = HeartbeatPayload { timestamp_ns: 1234, nonce };
+    registry.get_mut("hb-test").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Receive ack from worker.
+    let (header, payload) = registry.get("hb-test").unwrap()
+        .reader.lock().await.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::HeartbeatAck);
+    let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+
+    // Process through tracker — should succeed and update registry.
+    assert!(tracker.process_ack(&mut registry, "hb-test", &ack));
+    assert_eq!(tracker.missed_count("hb-test"), 0);
+    assert_eq!(registry.get("hb-test").unwrap().free_blocks, 50);
 }
 
 #[tokio::test]
-async fn test_send_heartbeats_detects_timeout() {
-    use fracture_coordinator::heartbeat;
+async fn test_heartbeat_tracker_missed_count_detects_dead() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
 
-    // Worker that does NOT respond (just accepts connection and hangs)
+    // Worker that accepts but never responds.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
     let _worker = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut conn = FramedConnection::new(stream);
-        // Read the heartbeat but don't respond
         let _ = conn.recv().await;
-        // Keep connection alive
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     });
 
@@ -905,13 +914,16 @@ async fn test_send_heartbeats_detects_timeout() {
     };
     registry.assign("slow", assignment).unwrap();
 
-    // Manually set the last heartbeat to the past so it times out
-    // We do this by calling send_heartbeats with zero timeout
-    let timed_out = heartbeat::send_heartbeats(
-        &mut registry,
-        std::time::Duration::ZERO,
-    ).await;
-    assert_eq!(timed_out, vec!["slow"]);
+    let mut tracker = HeartbeatTracker::new();
+    tracker.set_pending_nonce(1);
+
+    // Simulate 3 missed rounds — worker should be flagged.
+    assert!(tracker.increment_missed(&["slow".into()], 3).is_empty());
+    tracker.set_pending_nonce(2);
+    assert!(tracker.increment_missed(&["slow".into()], 3).is_empty());
+    tracker.set_pending_nonce(3);
+    let dead = tracker.increment_missed(&["slow".into()], 3);
+    assert_eq!(dead, vec!["slow"]);
 }
 
 #[tokio::test]
@@ -942,6 +954,313 @@ async fn test_mark_dead_workers_transitions_status() {
 
     assert_eq!(registry.get("doomed").unwrap().status, WorkerStatus::Dead);
     assert_eq!(registry.active_count(), 0);
+    assert!(registry.pipeline_order().is_empty());
+}
+
+/// Two workers over real TCP — one responds, one hangs. Verify that
+/// reader_handles() returns both and concurrent polling doesn't block
+/// the healthy worker on the slow one.
+#[tokio::test]
+async fn test_concurrent_poll_mixed_workers() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
+
+    // Worker A: responds immediately
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let _worker_a = tokio::spawn(async move {
+        let (stream, _) = listener_a.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let (_, payload) = conn.recv().await.unwrap();
+        let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+        let ack = HeartbeatAckPayload {
+            timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
+            gpu_memory_used: 4_000_000_000, active_sequences: 1, free_blocks: 100,
+        };
+        conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+    });
+
+    // Worker B: accepts but never responds
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let _worker_b = tokio::spawn(async move {
+        let (stream, _) = listener_b.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let conn_a = FramedConnection::new(tokio::net::TcpStream::connect(addr_a).await.unwrap());
+    let conn_b = FramedConnection::new(tokio::net::TcpStream::connect(addr_b).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("fast"), conn_a).unwrap();
+    registry.register(make_caps("slow"), conn_b).unwrap();
+    registry.assign("fast", LayerAssignment {
+        node_id: "fast".into(), layer_range: 0..16, role: NodeRole::Head,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    }).unwrap();
+    registry.assign("slow", LayerAssignment {
+        node_id: "slow".into(), layer_range: 16..32, role: NodeRole::Tail,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let nonce: u64 = 777;
+
+    // Send heartbeats to both
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+    registry.get_mut("fast").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    registry.get_mut("slow").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Concurrent poll — should complete quickly (not blocked by slow worker)
+    let reader_handles = registry.reader_handles();
+    assert_eq!(reader_handles.len(), 2);
+
+    let start = std::time::Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for (node_id, reader) in &reader_handles {
+        let node_id = node_id.clone();
+        let reader = reader.clone();
+        set.spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                async { reader.lock().await.recv().await },
+            ).await;
+            let ack = match result {
+                Ok(Ok((header, payload))) if header.msg_type == MessageType::HeartbeatAck => {
+                    FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok()
+                }
+                _ => None,
+            };
+            (node_id, ack)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+    let elapsed = start.elapsed();
+
+    // Should complete in ~200ms (the timeout), not 200ms × 2 = 400ms
+    assert!(elapsed < std::time::Duration::from_millis(350),
+        "concurrent poll took {elapsed:?}, expected < 350ms");
+
+    // Process results
+    for (node_id, ack) in &results {
+        if let Some(ack) = ack {
+            tracker.process_ack(&mut registry, node_id, ack);
+        }
+    }
+
+    // fast worker: ack processed, counter reset, stats updated
+    assert_eq!(tracker.missed_count("fast"), 0);
+    assert_eq!(registry.get("fast").unwrap().free_blocks, 100);
+    assert_eq!(registry.get("fast").unwrap().gpu_memory_used, 4_000_000_000);
+
+    // slow worker: no ack, counter still 0 (hasn't been incremented yet)
+    // After increment_missed, it goes to 1
+    let dead = tracker.increment_missed(&["fast".into(), "slow".into()], 3);
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("fast"), 1); // was 0 (ack), now +1
+    assert_eq!(tracker.missed_count("slow"), 1); // was 0 (never acked), now +1
+}
+
+/// Worker sends a non-HeartbeatAck message during the poll window.
+/// The poll should ignore it and treat the worker as not having acked.
+#[tokio::test]
+async fn test_poll_ignores_non_ack_messages() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Worker responds with an Error message instead of HeartbeatAck
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await;
+        let err = ErrorPayload {
+            error_code: ErrorCode::Internal,
+            message: "something went wrong".into(),
+        };
+        conn.send(MessageType::Error, 0, &err).await.unwrap();
+    });
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("confused"), conn).unwrap();
+    registry.assign("confused", LayerAssignment {
+        node_id: "confused".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let nonce = 42u64;
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+    registry.get_mut("confused").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Poll — worker sent Error, not HeartbeatAck
+    let reader_handles = registry.reader_handles();
+    let mut set = tokio::task::JoinSet::new();
+    for (node_id, reader) in &reader_handles {
+        let node_id = node_id.clone();
+        let reader = reader.clone();
+        set.spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                async { reader.lock().await.recv().await },
+            ).await;
+            let ack = match result {
+                Ok(Ok((header, payload))) if header.msg_type == MessageType::HeartbeatAck => {
+                    FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok()
+                }
+                _ => None,
+            };
+            (node_id, ack)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+
+    // Should have no valid acks
+    for (node_id, ack) in &results {
+        if let Some(ack) = ack {
+            tracker.process_ack(&mut registry, node_id, ack);
+        }
+    }
+    assert_eq!(tracker.missed_count("confused"), 0); // not incremented yet
+
+    // After increment, worker is counted as missed
+    let dead = tracker.increment_missed(&["confused".into()], 3);
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("confused"), 1);
+}
+
+/// Simulates the full cycle order over the wire for 4 rounds:
+/// worker responds to rounds 1-2, goes silent for rounds 3-4,
+/// then is flagged dead on round 5.
+#[tokio::test]
+async fn test_full_lifecycle_over_wire() {
+    use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
+    use fracture_coordinator::registry::WorkerStatus;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Worker responds to first 2 heartbeats, then stops
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        for _ in 0..2 {
+            let (_, payload) = conn.recv().await.unwrap();
+            let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+            let ack = HeartbeatAckPayload {
+                timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
+                gpu_memory_used: 0, active_sequences: 0, free_blocks: 50,
+            };
+            conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+        }
+        // Read remaining heartbeats but don't respond
+        loop {
+            if conn.recv().await.is_err() { break; }
+        }
+    });
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("lifecycle"), conn).unwrap();
+    registry.assign("lifecycle", LayerAssignment {
+        node_id: "lifecycle".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let workers = vec!["lifecycle".to_string()];
+
+    // Helper: run one heartbeat cycle (poll, increment, send)
+    async fn cycle(
+        tracker: &mut HeartbeatTracker,
+        registry: &mut PeerRegistry,
+        workers: &[String],
+        nonce: u64,
+    ) -> Vec<String> {
+        // 1. Poll acks for previous nonce
+        let reader_handles = registry.reader_handles();
+        let mut ack_result = None;
+        if !reader_handles.is_empty() {
+            let (_, reader) = &reader_handles[0];
+            if let Ok(Ok((header, payload))) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                reader.lock().await.recv(),
+            ).await {
+                if header.msg_type == MessageType::HeartbeatAck {
+                    ack_result = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok();
+                }
+            }
+        }
+        if let Some(ack) = &ack_result {
+            tracker.process_ack(registry, &workers[0], ack);
+        }
+
+        // 2. Increment missed
+        let dead = tracker.increment_missed(workers, 3);
+
+        // 3. Send new heartbeat
+        let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+        registry.get_mut(&workers[0]).unwrap().writer
+            .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+        tracker.set_pending_nonce(nonce);
+
+        dead
+    }
+
+    // Cycle 1: first heartbeat (no prior nonce, skip poll/increment)
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce: 100 };
+    registry.get_mut("lifecycle").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(100);
+
+    // Give worker time to respond
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 2: worker acked round 1 — should be healthy
+    let dead = cycle(&mut tracker, &mut registry, &workers, 200).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 1); // 0 (ack) + 1 (increment)
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 3: worker acked round 2 — still healthy
+    let dead = cycle(&mut tracker, &mut registry, &workers, 300).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 1);
+
+    // Worker stops responding after this point
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 4: no ack for round 3 — missed count rises
+    let dead = cycle(&mut tracker, &mut registry, &workers, 400).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 5: still no ack — missed count hits threshold
+    let dead = cycle(&mut tracker, &mut registry, &workers, 500).await;
+    assert_eq!(dead, vec!["lifecycle"]);
+    assert_eq!(tracker.missed_count("lifecycle"), 3);
+
+    // Mark dead
+    heartbeat::mark_dead_workers(&mut registry, &dead);
+    assert_eq!(registry.get("lifecycle").unwrap().status, WorkerStatus::Dead);
     assert!(registry.pipeline_order().is_empty());
 }
 

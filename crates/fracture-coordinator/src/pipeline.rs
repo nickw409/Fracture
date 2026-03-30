@@ -10,21 +10,22 @@
 use crate::registry::PeerRegistry;
 use crate::scheduler::LayerAssignment;
 use fracture_core::{FractureError, Result};
-use fracture_protocol::{frame::{FrameHeader, MessageType}, messages::*, FramedConnection};
+use fracture_protocol::{frame::{FrameHeader, MessageType}, messages::*, FramedConnection, FramedReader};
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::time::Instant;
 
-/// Receive the next message from a connection, skipping HeartbeatAck messages.
+/// Receive the next message from a reader, skipping HeartbeatAck messages.
 ///
 /// The heartbeat task sends Heartbeat messages on the same connection used
 /// for Forward/CacheAlloc. Workers respond with HeartbeatAck in their serve
 /// loop, so acks can arrive interleaved with forward results. This helper
-/// transparently skips them. Any successful recv (including skipped acks)
-/// proves the worker is alive, so the caller should update last_heartbeat.
-async fn recv_skipping_heartbeat_acks(conn: &mut FramedConnection) -> Result<(FrameHeader, Vec<u8>)> {
+/// transparently skips them.
+async fn recv_skipping_heartbeat_acks(
+    reader: &std::sync::Arc<tokio::sync::Mutex<FramedReader>>,
+) -> Result<(FrameHeader, Vec<u8>)> {
+    let mut r = reader.lock().await;
     loop {
-        let (header, payload) = conn.recv().await?;
+        let (header, payload) = r.recv().await?;
         if header.msg_type == MessageType::HeartbeatAck {
             continue;
         }
@@ -142,7 +143,7 @@ impl DistributedPipeline {
             for succeeded_id in &succeeded {
                 if let Some(ok_entry) = registry.get_mut(succeeded_id) {
                     let _ = ok_entry
-                        .connection
+                        .writer
                         .send_empty(MessageType::CacheFree, seq_id)
                         .await;
                 }
@@ -168,13 +169,12 @@ impl DistributedPipeline {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
             })?;
             entry
-                .connection
+                .writer
                 .send(MessageType::CacheAlloc, seq_id, payload)
                 .await?;
 
             // Wait for CacheAllocAck or Error from the worker
-            let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
-            entry.last_heartbeat = Instant::now();
+            let (header, resp_payload) = recv_skipping_heartbeat_acks(&entry.reader).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
@@ -217,7 +217,7 @@ impl DistributedPipeline {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
             })?;
-            entry.connection.send_empty(MessageType::CacheFree, seq_id).await?;
+            entry.writer.send_empty(MessageType::CacheFree, seq_id).await?;
         }
         Ok(())
     }
@@ -234,7 +234,7 @@ impl DistributedPipeline {
         for node_id in &self.pipeline_order {
             if let Some(entry) = registry.get_mut(node_id)
                 && entry.status == crate::registry::WorkerStatus::Ready {
-                    let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
+                    let _ = entry.writer.send_empty(MessageType::CacheFree, seq_id).await;
                 }
         }
     }
@@ -250,7 +250,7 @@ impl DistributedPipeline {
             for node_id in &self.pipeline_order {
                 if let Some(entry) = registry.get_mut(node_id)
                     && entry.status == crate::registry::WorkerStatus::Ready {
-                        let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
+                        let _ = entry.writer.send_empty(MessageType::CacheFree, seq_id).await;
                     }
             }
         }
@@ -296,13 +296,12 @@ impl DistributedPipeline {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
             })?;
             entry
-                .connection
+                .writer
                 .send(MessageType::Forward, seq_id, &forward_payload)
                 .await?;
 
             // Receive ForwardResult
-            let (header, payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
-            entry.last_heartbeat = Instant::now();
+            let (header, payload) = recv_skipping_heartbeat_acks(&entry.reader).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&payload)?;
@@ -416,12 +415,11 @@ impl DistributedPipeline {
             // Use the first sequence's seq_id in the frame header for compatibility
             let frame_seq_id = sequences.first().map(|s| s.seq_id).unwrap_or(0);
             entry
-                .connection
+                .writer
                 .send(MessageType::BatchedForward, frame_seq_id, &payload)
                 .await?;
 
-            let (header, resp_payload) = recv_skipping_heartbeat_acks(&mut entry.connection).await?;
-            entry.last_heartbeat = Instant::now();
+            let (header, resp_payload) = recv_skipping_heartbeat_acks(&entry.reader).await?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;

@@ -5,9 +5,9 @@
 //! consecutive heartbeats are marked as dead.
 
 use crate::registry::{PeerRegistry, WorkerStatus};
-use fracture_protocol::{frame::MessageType, messages::*};
+use fracture_protocol::messages::*;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Default heartbeat interval.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
@@ -114,41 +114,6 @@ impl HeartbeatTracker {
         }
         timed_out
     }
-}
-
-/// Send a heartbeat to all ready workers. Returns the node IDs of workers
-/// that have exceeded the heartbeat timeout.
-///
-/// This should be called periodically by the coordinator (e.g., in a
-/// tokio::interval loop).
-pub async fn send_heartbeats(
-    registry: &mut PeerRegistry,
-    timeout: Duration,
-) -> Vec<String> {
-    let now_ns = Instant::now().elapsed().as_nanos() as u64;
-    let nonce = rand::random::<u64>();
-
-    let payload = HeartbeatPayload {
-        timestamp_ns: now_ns,
-        nonce,
-    };
-
-    // Send to all workers (best-effort — connection errors are logged)
-    let node_ids: Vec<String> = registry
-        .pipeline_order()
-        .into_iter()
-        .collect();
-
-    for node_id in &node_ids {
-        if let Some(entry) = registry.get_mut(node_id)
-            && let Err(e) = entry.connection.send(MessageType::Heartbeat, 0, &payload).await
-        {
-            tracing::warn!("failed to send heartbeat to '{}': {e}", node_id);
-        }
-    }
-
-    // Check for timed-out workers
-    registry.check_heartbeats(timeout)
 }
 
 /// Mark timed-out workers as dead in the registry and log the failures.
@@ -337,6 +302,218 @@ mod tests {
         tracker.set_pending_nonce(300);
         assert!(tracker.process_ack(&mut reg, "w1", &make_ack(300)));
         assert_eq!(tracker.missed_count("w1"), 0);
+    }
+
+    /// Worker misses 2 rounds (one short of death), then acks — counter
+    /// resets and the worker survives. Verifies near-death recovery.
+    #[tokio::test]
+    async fn test_recovery_at_threshold_boundary() {
+        let mut reg = setup_registry_with_worker("w1").await;
+        let mut tracker = HeartbeatTracker::new();
+
+        // Round 1: miss
+        tracker.set_pending_nonce(10);
+        assert!(tracker.increment_missed(&["w1".into()], 3).is_empty());
+        assert_eq!(tracker.missed_count("w1"), 1);
+
+        // Round 2: miss
+        tracker.set_pending_nonce(20);
+        assert!(tracker.increment_missed(&["w1".into()], 3).is_empty());
+        assert_eq!(tracker.missed_count("w1"), 2);
+
+        // Round 3: ack arrives just in time — counter resets before increment
+        tracker.set_pending_nonce(30);
+        assert!(tracker.process_ack(&mut reg, "w1", &make_ack(30)));
+        assert_eq!(tracker.missed_count("w1"), 0);
+
+        // Subsequent increment starts from 0 again
+        let dead = tracker.increment_missed(&["w1".into()], 3);
+        assert!(dead.is_empty());
+        assert_eq!(tracker.missed_count("w1"), 1);
+    }
+
+    /// Two workers in pipeline — one acks, one doesn't. Only the
+    /// non-responding worker accumulates missed counts.
+    #[tokio::test]
+    async fn test_multi_worker_selective_ack() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("healthy"), dummy_connection().await).unwrap();
+        reg.register(test_caps("flaky"), dummy_connection().await).unwrap();
+        reg.assign("healthy", test_assignment("healthy")).unwrap();
+        reg.assign("flaky", test_assignment("flaky")).unwrap();
+
+        let mut tracker = HeartbeatTracker::new();
+        let workers: Vec<String> = vec!["healthy".into(), "flaky".into()];
+
+        // Round 1: both get heartbeat, only healthy acks
+        tracker.set_pending_nonce(100);
+        assert!(tracker.process_ack(&mut reg, "healthy", &make_ack(100)));
+        // Don't ack for flaky
+
+        // Increment: healthy was reset to 0, goes to 1; flaky starts at 0, goes to 1
+        tracker.increment_missed(&workers, 3);
+        assert_eq!(tracker.missed_count("healthy"), 1);
+        assert_eq!(tracker.missed_count("flaky"), 1);
+
+        // Round 2: healthy acks again, flaky still silent
+        tracker.set_pending_nonce(200);
+        assert!(tracker.process_ack(&mut reg, "healthy", &make_ack(200)));
+
+        tracker.increment_missed(&workers, 3);
+        assert_eq!(tracker.missed_count("healthy"), 1); // reset then +1
+        assert_eq!(tracker.missed_count("flaky"), 2);   // no reset, +1
+
+        // Round 3: flaky hits threshold
+        tracker.set_pending_nonce(300);
+        assert!(tracker.process_ack(&mut reg, "healthy", &make_ack(300)));
+
+        let dead = tracker.increment_missed(&workers, 3);
+        assert_eq!(dead, vec!["flaky"]);
+        assert_eq!(tracker.missed_count("healthy"), 1); // still fine
+        assert_eq!(tracker.missed_count("flaky"), 3);
+    }
+
+    /// Ack with a nonce from two rounds ago is rejected, even if it was
+    /// once valid. Only the current pending_nonce is accepted.
+    #[tokio::test]
+    async fn test_stale_nonce_from_earlier_round_rejected() {
+        let mut reg = setup_registry_with_worker("w1").await;
+        let mut tracker = HeartbeatTracker::new();
+
+        // Round 1: nonce 100
+        tracker.set_pending_nonce(100);
+        tracker.increment_missed(&["w1".into()], 3);
+
+        // Round 2: nonce 200 (overwrites 100)
+        tracker.set_pending_nonce(200);
+        tracker.increment_missed(&["w1".into()], 3);
+
+        // Worker finally responds with round-1 nonce — rejected
+        assert!(!tracker.process_ack(&mut reg, "w1", &make_ack(100)));
+        assert_eq!(tracker.missed_count("w1"), 2); // not reset
+    }
+
+    /// After a worker is marked dead and removed from the ready list,
+    /// increment_missed should not count it (it's no longer in the
+    /// ready_node_ids passed by the caller).
+    #[tokio::test]
+    async fn test_dead_worker_excluded_from_increment() {
+        let mut tracker = HeartbeatTracker::new();
+
+        // Worker alive for 2 rounds
+        tracker.set_pending_nonce(1);
+        tracker.increment_missed(&["w1".into()], 3);
+        tracker.set_pending_nonce(2);
+        tracker.increment_missed(&["w1".into()], 3);
+        assert_eq!(tracker.missed_count("w1"), 2);
+
+        // Worker marked dead — caller stops including it in ready list
+        // (simulating registry.pipeline_order() excluding dead workers)
+        tracker.set_pending_nonce(3);
+        let dead = tracker.increment_missed(&[], 3); // empty list
+        assert!(dead.is_empty());
+
+        // w1's counter stays at 2 — not incremented further
+        assert_eq!(tracker.missed_count("w1"), 2);
+    }
+
+    /// Nonce changes every round. A valid ack for nonce N, received
+    /// after set_pending_nonce(N+1), is rejected.
+    #[tokio::test]
+    async fn test_ack_after_nonce_rotation_rejected() {
+        let mut reg = setup_registry_with_worker("w1").await;
+        let mut tracker = HeartbeatTracker::new();
+
+        tracker.set_pending_nonce(50);
+        // Nonce rotates before the ack arrives
+        tracker.set_pending_nonce(51);
+
+        // Ack for old nonce 50 — rejected
+        assert!(!tracker.process_ack(&mut reg, "w1", &make_ack(50)));
+        // Ack for current nonce 51 — accepted
+        assert!(tracker.process_ack(&mut reg, "w1", &make_ack(51)));
+    }
+
+    /// process_ack updates free_blocks and gpu_memory_used in the registry.
+    #[tokio::test]
+    async fn test_process_ack_updates_registry_stats() {
+        let mut reg = setup_registry_with_worker("w1").await;
+        let mut tracker = HeartbeatTracker::new();
+
+        tracker.set_pending_nonce(42);
+        let ack = HeartbeatAckPayload {
+            timestamp_echo: 0,
+            nonce_echo: 42,
+            gpu_memory_used: 12_000_000_000,
+            active_sequences: 5,
+            free_blocks: 200,
+        };
+        assert!(tracker.process_ack(&mut reg, "w1", &ack));
+
+        let entry = reg.get("w1").unwrap();
+        assert_eq!(entry.free_blocks, 200);
+        assert_eq!(entry.gpu_memory_used, 12_000_000_000);
+    }
+
+    /// Simulates the full coordinator heartbeat cycle order:
+    /// poll acks → increment missed → send new heartbeat.
+    /// A healthy worker should never accumulate missed counts.
+    #[tokio::test]
+    async fn test_full_cycle_order_healthy_worker() {
+        let mut reg = setup_registry_with_worker("w1").await;
+        let mut tracker = HeartbeatTracker::new();
+
+        // --- Cycle 1: first heartbeat, no prior nonce to poll ---
+        // (pending_nonce is None, so poll+increment are skipped)
+        tracker.set_pending_nonce(100);
+
+        // --- Cycle 2: poll acks for nonce 100, then increment, then send ---
+        // Worker acked nonce 100
+        assert!(tracker.process_ack(&mut reg, "w1", &make_ack(100)));
+        let dead = tracker.increment_missed(&["w1".into()], 3);
+        assert!(dead.is_empty());
+        assert_eq!(tracker.missed_count("w1"), 1); // 0 (reset) + 1 (increment)
+        tracker.set_pending_nonce(200);
+
+        // --- Cycle 3: same pattern ---
+        assert!(tracker.process_ack(&mut reg, "w1", &make_ack(200)));
+        let dead = tracker.increment_missed(&["w1".into()], 3);
+        assert!(dead.is_empty());
+        assert_eq!(tracker.missed_count("w1"), 1); // always oscillates 0→1
+        tracker.set_pending_nonce(300);
+
+        // --- Cycle 4: same ---
+        assert!(tracker.process_ack(&mut reg, "w1", &make_ack(300)));
+        let dead = tracker.increment_missed(&["w1".into()], 3);
+        assert!(dead.is_empty());
+        assert_eq!(tracker.missed_count("w1"), 1);
+    }
+
+    /// A worker that is added to the pipeline mid-operation (new worker
+    /// appears in ready_node_ids) gets a missed counter initialized on
+    /// first increment. It should not be falsely flagged as dead.
+    #[tokio::test]
+    async fn test_new_worker_joins_mid_operation() {
+        let mut tracker = HeartbeatTracker::new();
+
+        // Round 1: only w1 exists
+        tracker.set_pending_nonce(10);
+        tracker.increment_missed(&["w1".into()], 3);
+        assert_eq!(tracker.missed_count("w1"), 1);
+        assert_eq!(tracker.missed_count("w2"), 0); // not yet tracked
+
+        // Round 2: w2 joins the pipeline
+        tracker.set_pending_nonce(20);
+        let dead = tracker.increment_missed(&["w1".into(), "w2".into()], 3);
+        assert!(dead.is_empty());
+        assert_eq!(tracker.missed_count("w1"), 2);
+        assert_eq!(tracker.missed_count("w2"), 1); // first miss, not 3
+
+        // w2 needs 2 more misses to be flagged, not instant death
+        tracker.set_pending_nonce(30);
+        let dead = tracker.increment_missed(&["w1".into(), "w2".into()], 3);
+        assert_eq!(dead, vec!["w1"]); // w1 hits 3
+        assert_eq!(tracker.missed_count("w2"), 2); // w2 still alive
     }
 
     #[test]

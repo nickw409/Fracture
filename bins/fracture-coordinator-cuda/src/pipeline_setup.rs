@@ -150,7 +150,7 @@ pub async fn accept_and_setup_pipeline(
         let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
             anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
         })?;
-        entry.connection.send(MessageType::RegisterAck, 0, &ack).await?;
+        entry.writer.send(MessageType::RegisterAck, 0, &ack).await?;
         tracing::info!("sent RegisterAck to '{}'", assignment.node_id);
     }
 
@@ -160,7 +160,7 @@ pub async fn accept_and_setup_pipeline(
         let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
             anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
         })?;
-        let (header, _) = entry.connection.recv().await?;
+        let (header, _) = entry.reader.lock().await.recv().await?;
         if header.msg_type != MessageType::WorkerReady {
             anyhow::bail!(
                 "expected WorkerReady from '{}', got {:?}",
@@ -168,15 +168,6 @@ pub async fn accept_and_setup_pipeline(
             );
         }
         tracing::info!("worker '{}' ready", assignment.node_id);
-    }
-
-    // Refresh last_heartbeat so workers aren't immediately marked dead
-    // by the distributed loop's heartbeat checker (which started earlier).
-    let now = std::time::Instant::now();
-    for assignment in &schedule_result.assignments {
-        if let Some(entry) = reg.get_mut(&assignment.node_id) {
-            entry.last_heartbeat = now;
-        }
     }
     drop(reg);
 
@@ -400,7 +391,7 @@ pub async fn reconnection_listener(
                     } else {
                         MessageType::Reconfigure
                     };
-                    if let Err(e) = entry.connection.send(msg_type, 0, &ack).await {
+                    if let Err(e) = entry.writer.send(msg_type, 0, &ack).await {
                         tracing::error!("failed to send to '{}': {e}", assignment.node_id);
                         all_ok = false;
                     }
@@ -415,10 +406,10 @@ pub async fn reconnection_listener(
 
         // Wait for WorkerReady from all workers.
         {
-            let mut reg = registry.lock().await;
+            let reg = registry.lock().await;
             for assignment in &result.assignments {
-                if let Some(entry) = reg.get_mut(&assignment.node_id) {
-                    match entry.connection.recv().await {
+                if let Some(entry) = reg.get(&assignment.node_id) {
+                    match entry.reader.lock().await.recv().await {
                         Ok((header, _)) if header.msg_type == MessageType::WorkerReady => {
                             tracing::info!("worker '{}' ready after reconnect", assignment.node_id);
                         }
