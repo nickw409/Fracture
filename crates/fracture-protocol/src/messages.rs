@@ -254,6 +254,28 @@ pub struct LeaveIntentPayload {
     pub reason: String,
 }
 
+// ── 0x16 WhoIsCoordinator (New Node → Seed Peer) ────────────────────────
+
+/// Seed discovery request: "who is the current coordinator?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoIsCoordinatorPayload {
+    /// Requester's node ID (for logging).
+    pub node_id: String,
+}
+
+// ── 0x17 WhoIsCoordinatorResponse (Seed Peer → New Node) ───────────────
+
+/// Seed discovery response with coordinator address and cluster manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoIsCoordinatorResponsePayload {
+    /// Current coordinator address, or None if unknown (mid-election).
+    pub coordinator_addr: Option<String>,
+    /// Current election term.
+    pub term: u64,
+    /// Full cluster manifest (so the joiner knows all peers immediately).
+    pub manifest: Option<ClusterManifestPayload>,
+}
+
 // ── 0x0A Error (Bidirectional) ──────────────────────────────────────────
 
 /// Error codes for the Error message type.

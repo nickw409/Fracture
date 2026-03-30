@@ -3094,3 +3094,171 @@ async fn test_pending_worker_in_capabilities_not_pipeline() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0], "head");
 }
+
+// =========================================================================
+// Seed Node Discovery Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_who_is_coordinator_over_wire() {
+    // Test WhoIsCoordinator request/response round-trip
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Simulate a seed node that knows the coordinator
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::WhoIsCoordinator);
+        let req: WhoIsCoordinatorPayload =
+            FramedConnection::deserialize_payload(&payload).unwrap();
+        assert_eq!(req.node_id, "new-worker");
+
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: Some("192.168.1.100:9400".into()),
+            term: 3,
+            manifest: Some(ClusterManifestPayload {
+                version: 5,
+                term: 3,
+                nodes: vec![
+                    NodeInfo {
+                        node_id: "coordinator".into(),
+                        address: "192.168.1.100:9400".into(),
+                        election_priority: 0,
+                        coordinator_capable: true,
+                        role: fracture_protocol::messages::NodeRole::Coordinator,
+                    },
+                ],
+            }),
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    // New worker queries the seed
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    let req = WhoIsCoordinatorPayload {
+        node_id: "new-worker".into(),
+    };
+    conn.send(MessageType::WhoIsCoordinator, 0, &req)
+        .await
+        .unwrap();
+
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::WhoIsCoordinatorResponse);
+    let resp: WhoIsCoordinatorResponsePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(resp.coordinator_addr, Some("192.168.1.100:9400".into()));
+    assert_eq!(resp.term, 3);
+    assert!(resp.manifest.is_some());
+    let manifest = resp.manifest.unwrap();
+    assert_eq!(manifest.nodes.len(), 1);
+    assert_eq!(manifest.nodes[0].node_id, "coordinator");
+
+    seed_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_who_is_coordinator_unknown() {
+    // Seed node doesn't know the coordinator (mid-election)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await.unwrap();
+
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: None,
+            term: 0,
+            manifest: None,
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    conn.send(
+        MessageType::WhoIsCoordinator,
+        0,
+        &WhoIsCoordinatorPayload {
+            node_id: "joiner".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_, payload) = conn.recv().await.unwrap();
+    let resp: WhoIsCoordinatorResponsePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert!(resp.coordinator_addr.is_none());
+
+    seed_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_seed_discovery_skips_unreachable_tries_next() {
+    // First seed is unreachable, second seed responds
+    let unreachable_addr = "127.0.0.1:1"; // port 1 is almost certainly refused
+    let good_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good_listener.local_addr().unwrap();
+
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = good_listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await.unwrap();
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: Some("10.0.0.1:9400".into()),
+            term: 1,
+            manifest: None,
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    // Use discover_coordinator-like logic inline (can't call the worker's function directly)
+    let seeds = vec![unreachable_addr.to_string(), good_addr.to_string()];
+    let mut found = None;
+
+    for seed in &seeds {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(seed),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                let mut conn = FramedConnection::new(stream);
+                conn.send(
+                    MessageType::WhoIsCoordinator,
+                    0,
+                    &WhoIsCoordinatorPayload {
+                        node_id: "test".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let (_, payload) = conn.recv().await.unwrap();
+                let resp: WhoIsCoordinatorResponsePayload =
+                    FramedConnection::deserialize_payload(&payload).unwrap();
+                if let Some(addr) = resp.coordinator_addr {
+                    found = Some(addr);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert_eq!(found, Some("10.0.0.1:9400".into()));
+    seed_task.await.unwrap();
+}

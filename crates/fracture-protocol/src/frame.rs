@@ -63,6 +63,10 @@ pub enum MessageType {
     ReRegister = 0x14,
     /// Worker announces intent to leave the cluster gracefully.
     LeaveIntent = 0x15,
+    /// Seed discovery: "who is the coordinator?" (new node → any peer).
+    WhoIsCoordinator = 0x16,
+    /// Seed discovery response (peer → new node).
+    WhoIsCoordinatorResponse = 0x17,
 }
 
 impl MessageType {
@@ -89,6 +93,8 @@ impl MessageType {
             0x13 => Ok(Self::ClusterManifest),
             0x14 => Ok(Self::ReRegister),
             0x15 => Ok(Self::LeaveIntent),
+            0x16 => Ok(Self::WhoIsCoordinator),
+            0x17 => Ok(Self::WhoIsCoordinatorResponse),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -201,6 +207,8 @@ mod tests {
             MessageType::ClusterManifest,
             MessageType::ReRegister,
             MessageType::LeaveIntent,
+            MessageType::WhoIsCoordinator,
+            MessageType::WhoIsCoordinatorResponse,
         ];
         for mt in types {
             let v = mt as u8;

@@ -275,6 +275,8 @@ pub async fn reconnection_listener(
     scheduling_mode: SchedulingMode,
     max_seq_len: usize,
     pipeline_tx: tokio::sync::watch::Sender<Arc<DistributedPipeline>>,
+    // Coordinator's own address for seed discovery responses.
+    self_addr: String,
 ) {
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -295,6 +297,18 @@ pub async fn reconnection_listener(
                 continue;
             }
         };
+
+        // Handle seed discovery queries: respond with our address and continue listening.
+        if header.msg_type == MessageType::WhoIsCoordinator {
+            tracing::info!("seed discovery query from {addr}");
+            let resp = WhoIsCoordinatorResponsePayload {
+                coordinator_addr: Some(self_addr.clone()),
+                term: 0, // TODO: track coordinator term
+                manifest: None, // TODO: include manifest when available
+            };
+            let _ = conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp).await;
+            continue;
+        }
 
         // Accept both Register (fresh worker process) and ReRegister (surviving worker).
         let (node_id, caps, is_reregister, current_assignment) = match header.msg_type {

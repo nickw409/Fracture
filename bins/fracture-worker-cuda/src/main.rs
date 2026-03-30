@@ -74,15 +74,32 @@ async fn main() -> Result<()> {
 
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
-    let coordinator_addr = args
+    let coordinator_addr_arg = args
         .iter()
         .position(|a| a == "--coordinator")
+        .and_then(|i| args.get(i + 1).cloned());
+
+    let seed_addrs: Vec<String> = args
+        .iter()
+        .position(|a| a == "--seed")
         .and_then(|i| args.get(i + 1))
-        .expect(
-            "usage: fracture-worker-cuda --coordinator <host:port> --model <path-to-gguf> \
-             [--gpu <device_id>] [--node-id <name>]",
-        )
-        .clone();
+        .map(|s| s.split(',').map(|a| a.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let peer_port: u16 = args
+        .iter()
+        .position(|a| a == "--peer-port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0); // 0 = OS-assigned
+
+    if coordinator_addr_arg.is_none() && seed_addrs.is_empty() {
+        eprintln!(
+            "usage: fracture-worker-cuda (--coordinator <host:port> | --seed <h1:p,h2:p,...>) \
+             --model <path-to-gguf> [--gpu <id>] [--node-id <name>] [--peer-port <port>]"
+        );
+        std::process::exit(1);
+    }
 
     let model_path = args
         .iter()
@@ -120,7 +137,12 @@ async fn main() -> Result<()> {
         tracing::info!("coordinator-capable: false (--no-coordinator)");
     }
     tracing::info!("node_id: {node_id}");
-    tracing::info!("coordinator: {coordinator_addr}");
+    if let Some(ref addr) = coordinator_addr_arg {
+        tracing::info!("coordinator: {addr}");
+    }
+    if !seed_addrs.is_empty() {
+        tracing::info!("seed nodes: {}", seed_addrs.join(", "));
+    }
     tracing::info!("model: {model_path}");
 
     // Parse GGUF metadata (no weight loading yet)
@@ -164,6 +186,20 @@ async fn main() -> Result<()> {
 
     // Update available memory after calibration
     let gpu_memory_available = backend.available_memory() as u64;
+
+    // Resolve coordinator address: either from --coordinator or via seed discovery.
+    let mut coordinator_addr = if let Some(addr) = coordinator_addr_arg {
+        addr
+    } else {
+        tracing::info!("discovering coordinator via seed nodes...");
+        let (addr, term, manifest) =
+            discover_coordinator(&seed_addrs, &node_id).await?;
+        tracing::info!("discovered coordinator at {addr} (term={term})");
+        // Store manifest if provided
+        // (cluster_manifest is initialized below, will be set after serve loop setup)
+        let _ = (term, manifest); // used later when we have the manifest variable
+        addr
+    };
 
     // Connect to coordinator
     tracing::info!("connecting to coordinator at {coordinator_addr}...");
@@ -282,10 +318,18 @@ async fn main() -> Result<()> {
         };
     }
 
-    // Cluster manifest — updated by coordinator broadcasts, used for election/reconnection.
-    let mut cluster_manifest: Option<ClusterManifestPayload> = None;
-    // Current known term — used to reject stale coordinators (FT-13).
-    let mut current_term: u64 = 0;
+    // Shared state for peer listener access.
+    let cluster_manifest: Arc<tokio::sync::Mutex<Option<ClusterManifestPayload>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let current_term = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Start peer listener (for seed discovery and election).
+    let _peer_addr = spawn_peer_listener(
+        peer_port,
+        Arc::clone(&cluster_manifest),
+        Arc::clone(&current_term),
+    )
+    .await?;
 
     // Election agent — initialized if coordinator-capable.
     let mut election_agent = if coordinator_capable {
@@ -564,12 +608,13 @@ async fn main() -> Result<()> {
             MessageType::Victory => {
                 match FramedConnection::deserialize_payload::<VictoryPayload>(&payload) {
                     Ok(victory) => {
-                        if victory.term > current_term {
+                        let cur_term = current_term.load(Ordering::SeqCst);
+                        if victory.term > cur_term {
                             tracing::info!(
                                 "received Victory from '{}' at term {} (coordinator: {})",
                                 victory.leader_id, victory.term, victory.coordinator_addr
                             );
-                            current_term = victory.term;
+                            current_term.store(victory.term, Ordering::SeqCst);
                             if let Some(ref mut agent) = election_agent {
                                 agent.on_victory(
                                     &victory.leader_id,
@@ -580,7 +625,7 @@ async fn main() -> Result<()> {
                         } else {
                             tracing::debug!(
                                 "ignoring stale Victory from '{}' (term {} <= {})",
-                                victory.leader_id, victory.term, current_term
+                                victory.leader_id, victory.term, cur_term
                             );
                         }
                     }
@@ -593,13 +638,14 @@ async fn main() -> Result<()> {
             MessageType::ClusterManifest => {
                 match FramedConnection::deserialize_payload::<ClusterManifestPayload>(&payload) {
                     Ok(manifest) => {
-                        let dominated = cluster_manifest.as_ref()
+                        let mut guard = cluster_manifest.lock().await;
+                        let dominated = guard.as_ref()
                             .is_some_and(|old| old.version >= manifest.version);
                         if dominated {
                             tracing::debug!(
                                 "ignoring stale manifest v{} (current v{})",
                                 manifest.version,
-                                cluster_manifest.as_ref().unwrap().version,
+                                guard.as_ref().unwrap().version,
                             );
                         } else {
                             tracing::info!(
@@ -608,11 +654,10 @@ async fn main() -> Result<()> {
                                 manifest.term,
                                 manifest.nodes.len(),
                             );
-                            // Update term from manifest (FT-13: stale coordinator rejection).
-                            if manifest.term > current_term {
-                                current_term = manifest.term;
+                            if manifest.term > current_term.load(Ordering::SeqCst) {
+                                current_term.store(manifest.term, Ordering::SeqCst);
                             }
-                            cluster_manifest = Some(manifest);
+                            *guard = Some(manifest);
                         }
                     }
                     Err(e) => {
@@ -652,7 +697,7 @@ async fn main() -> Result<()> {
             if !election_started
                 && coordinator_capable
                 && disconnect_time.elapsed() >= election_timeout
-                && cluster_manifest.is_some()
+                && cluster_manifest.lock().await.is_some()
             {
                 if let Some(ref mut agent) = election_agent {
                     let term = agent.start_election();
@@ -685,9 +730,12 @@ async fn main() -> Result<()> {
                                     decode_ms_per_layer: decode_ms,
                                     prefill_ms_per_layer_128: prefill_ms,
                                 };
-                                let peer_count = cluster_manifest.as_ref()
-                                    .map(|m| m.nodes.iter().filter(|n| n.node_id != node_id).count())
-                                    .unwrap_or(0);
+                                let peer_count = {
+                                    let guard = cluster_manifest.lock().await;
+                                    guard.as_ref()
+                                        .map(|m| m.nodes.iter().filter(|n| n.node_id != node_id).count())
+                                        .unwrap_or(0)
+                                };
 
                                 match reconstruct_state(
                                     &listener,
@@ -847,7 +895,45 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("reconnection attempt failed: {e}");
+                    tracing::debug!("reconnection to {coordinator_addr} failed: {e}");
+
+                    // Seed discovery fallback: if we have seeds, try to find the
+                    // new coordinator (may have changed due to election).
+                    if !seed_addrs.is_empty() {
+                        tracing::debug!("trying seed discovery fallback...");
+                        for seed in &seed_addrs {
+                            if let Ok(Ok(stream)) = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                TcpStream::connect(seed),
+                            ).await {
+                                let mut seed_conn = FramedConnection::new(stream);
+                                let req = WhoIsCoordinatorPayload {
+                                    node_id: node_id.clone(),
+                                };
+                                if seed_conn.send(MessageType::WhoIsCoordinator, 0, &req).await.is_ok() {
+                                    if let Ok(Ok((hdr, pay))) = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        seed_conn.recv(),
+                                    ).await {
+                                        if hdr.msg_type == MessageType::WhoIsCoordinatorResponse {
+                                            if let Ok(resp) = FramedConnection::deserialize_payload::<WhoIsCoordinatorResponsePayload>(&pay) {
+                                                if let Some(addr) = resp.coordinator_addr {
+                                                    if addr != coordinator_addr {
+                                                        tracing::info!(
+                                                            "seed discovery: coordinator moved to {addr} (was {coordinator_addr})"
+                                                        );
+                                                        coordinator_addr = addr;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     backoff = (backoff * backoff_factor).min(max_backoff);
                 }
             }
@@ -1093,6 +1179,147 @@ fn run_calibration(
     // The backend's free calls happen in WeightStore's Drop impl.
 
     Ok((decode_avg, prefill_avg))
+}
+
+// ---------------------------------------------------------------------------
+// Seed node discovery
+// ---------------------------------------------------------------------------
+
+/// Discover the coordinator address by querying seed nodes.
+///
+/// Tries each seed in order, sending WhoIsCoordinator and waiting for a response.
+/// Retries with exponential backoff if all seeds fail.
+/// Returns (coordinator_addr, term, optional_manifest).
+async fn discover_coordinator(
+    seeds: &[String],
+    node_id: &str,
+) -> Result<(String, u64, Option<ClusterManifestPayload>)> {
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+
+    loop {
+        for seed in seeds {
+            tracing::debug!("querying seed {seed} for coordinator...");
+            match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(seed)).await {
+                Ok(Ok(stream)) => {
+                    let mut conn = FramedConnection::new(stream);
+                    let req = WhoIsCoordinatorPayload {
+                        node_id: node_id.to_string(),
+                    };
+                    if let Err(e) = conn.send(MessageType::WhoIsCoordinator, 0, &req).await {
+                        tracing::debug!("failed to send WhoIsCoordinator to {seed}: {e}");
+                        continue;
+                    }
+                    match tokio::time::timeout(Duration::from_secs(3), conn.recv()).await {
+                        Ok(Ok((header, payload)))
+                            if header.msg_type == MessageType::WhoIsCoordinatorResponse =>
+                        {
+                            let resp: WhoIsCoordinatorResponsePayload =
+                                FramedConnection::deserialize_payload(&payload)?;
+                            if let Some(addr) = resp.coordinator_addr {
+                                return Ok((addr, resp.term, resp.manifest));
+                            }
+                            tracing::debug!("seed {seed} doesn't know the coordinator (mid-election?)");
+                        }
+                        Ok(Ok((header, _))) => {
+                            tracing::debug!(
+                                "unexpected response from seed {seed}: {:?}",
+                                header.msg_type
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("recv from seed {seed} failed: {e}");
+                        }
+                        Err(_) => {
+                            tracing::debug!("seed {seed} response timed out");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("failed to connect to seed {seed}: {e}");
+                }
+                Err(_) => {
+                    tracing::debug!("seed {seed} connection timed out");
+                }
+            }
+        }
+
+        // All seeds failed — backoff and retry
+        let jitter_range = backoff.as_millis() as f64 * 0.25;
+        let jitter_ms = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
+        let sleep_ms = (backoff.as_millis() as f64 + jitter_ms).max(100.0);
+        tracing::info!(
+            "all seeds unreachable or no coordinator known — retrying in {:.1}s",
+            sleep_ms / 1000.0
+        );
+        tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+/// Spawn a background task that listens for peer connections (seed queries, election).
+///
+/// Returns the bound address (for advertising in manifests).
+async fn spawn_peer_listener(
+    peer_port: u16,
+    cluster_manifest: Arc<tokio::sync::Mutex<Option<ClusterManifestPayload>>>,
+    current_term: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{peer_port}")).await?;
+    let addr = listener.local_addr()?;
+    tracing::info!("peer listener started on {addr}");
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!("peer listener accept error: {e}");
+                    continue;
+                }
+            };
+
+            let manifest = Arc::clone(&cluster_manifest);
+            let term = Arc::clone(&current_term);
+            tokio::spawn(async move {
+                let mut conn = FramedConnection::new(stream);
+                let recv = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+                match recv {
+                    Ok(Ok((header, _))) if header.msg_type == MessageType::WhoIsCoordinator => {
+                        let manifest_guard = manifest.lock().await;
+                        let coordinator_addr = manifest_guard.as_ref().and_then(|m| {
+                            m.nodes
+                                .iter()
+                                .find(|n| n.role == fracture_protocol::messages::NodeRole::Coordinator)
+                                .map(|n| n.address.clone())
+                        });
+                        let resp = WhoIsCoordinatorResponsePayload {
+                            coordinator_addr,
+                            term: term.load(Ordering::SeqCst),
+                            manifest: manifest_guard.clone(),
+                        };
+                        let _ = conn
+                            .send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+                            .await;
+                    }
+                    Ok(Ok((header, _))) => {
+                        tracing::debug!(
+                            "peer {peer_addr}: unexpected message {:?}",
+                            header.msg_type
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("peer {peer_addr}: recv error: {e}");
+                    }
+                    Err(_) => {
+                        tracing::debug!("peer {peer_addr}: recv timeout");
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(addr)
 }
 
 use fracture_coordinator::pipeline::DistributedPipeline;

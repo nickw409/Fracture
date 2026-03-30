@@ -253,6 +253,7 @@ async fn main() -> Result<()> {
                 scheduling_mode_for_recon,
                 max_seq_len,
                 pipeline_tx,
+                config.listen_address.clone(),
             ));
 
             // Periodic cluster snapshot refresh.
