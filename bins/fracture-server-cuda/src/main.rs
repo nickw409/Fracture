@@ -37,6 +37,12 @@ async fn main() -> Result<()> {
         .position(|a| a == "--tokenizer")
         .and_then(|i| args.get(i + 1).cloned());
 
+    let max_seq_len_override: Option<usize> = args
+        .iter()
+        .position(|a| a == "--max-seq-len")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok());
+
     tracing::info!("Fracture inference server (CUDA backend)");
     tracing::info!("model: {model_path}");
 
@@ -52,7 +58,19 @@ async fn main() -> Result<()> {
     // Load model weights
     tracing::info!("loading model weights...");
     let weights = WeightStore::load(std::path::Path::new(model_path), &backend, None)?;
-    let config = weights.config.clone();
+    let mut config = weights.config.clone();
+
+    // Clamp max_seq_len to avoid OOM on contiguous KV cache allocation.
+    // The GGUF may report 128K+ but the contiguous cache pre-allocates the full length.
+    if let Some(override_len) = max_seq_len_override {
+        config.max_seq_len = override_len;
+    } else if config.max_seq_len > 4096 {
+        tracing::warn!(
+            "clamping max_seq_len from {} to 4096 (use --max-seq-len to override)",
+            config.max_seq_len
+        );
+        config.max_seq_len = 4096;
+    }
     tracing::info!(
         "model loaded: {}L, d={}, vocab={}",
         config.num_layers,

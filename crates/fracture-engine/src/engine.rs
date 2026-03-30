@@ -112,6 +112,12 @@ impl<B: Backend> Engine<B> {
         &self.backend
     }
 
+    /// Consume the engine and return the backend for reuse (e.g., during
+    /// worker reconfiguration where the GPU context survives but weights change).
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
+
     pub fn config(&self) -> &fracture_core::ModelConfig {
         &self.weights.config
     }

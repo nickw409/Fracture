@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     // Create engine and node
     let node_config = NodeConfig::new(layer_range.clone(), ack.total_layers as usize)?;
     let engine = Engine::new(backend, weights, layer_range.clone());
-    let node = ComputeNodeImpl::new(engine, node_config);
+    let mut node = ComputeNodeImpl::new(engine, node_config);
 
     // Create KV cache manager for our layer range (contiguous — used by Forward)
     let mut cache = KvCacheManager::new(
@@ -313,6 +313,71 @@ async fn main() -> Result<()> {
                     free_blocks: paged_cache.num_free_blocks() as u32,
                 };
                 conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
+            }
+
+            MessageType::Reconfigure => {
+                let reconf: RegisterAckPayload =
+                    FramedConnection::deserialize_payload(&payload)?;
+                let new_range = reconf.layer_start as usize..reconf.layer_end as usize;
+                tracing::info!(
+                    "reconfiguring: layers {:?} → {:?}",
+                    node.config().layer_range,
+                    new_range
+                );
+
+                // Free all existing caches.
+                for (_, h) in handles.drain() {
+                    let _ = cache.free(h, node.engine().backend());
+                }
+                for (_, ph) in paged_handles.drain() {
+                    let _ = paged_cache.free(ph);
+                }
+                let _ = paged_cache.destroy(node.engine().backend());
+
+                // Reload weights for the new layer range.
+                tracing::info!("reloading weights for layers {:?}...", new_range);
+                let new_weights = WeightStore::load(
+                    std::path::Path::new(&model_path),
+                    node.engine().backend(),
+                    Some(new_range.clone()),
+                )?;
+                let new_node_config =
+                    NodeConfig::new(new_range.clone(), reconf.total_layers as usize)?;
+                let reused_backend = node.into_backend();
+                let new_engine =
+                    Engine::new(reused_backend, new_weights, new_range.clone());
+                node = ComputeNodeImpl::new(new_engine, new_node_config);
+
+                // Rebuild caches.
+                cache = KvCacheManager::new(
+                    new_range.len(),
+                    reconf.model_config.num_kv_heads,
+                    reconf.model_config.head_dim,
+                    reconf.max_seq_len as usize,
+                );
+                let gpu_avail = node.engine().backend().available_memory();
+                let scratch_reserve = 2 * 1024 * 1024 * 1024;
+                let num_blocks = compute_num_blocks(
+                    gpu_avail,
+                    scratch_reserve,
+                    new_range.len(),
+                    reconf.model_config.num_kv_heads,
+                    reconf.model_config.head_dim,
+                );
+                paged_cache = PagedKvCacheManager::new(
+                    num_blocks,
+                    new_range.len(),
+                    reconf.model_config.num_kv_heads,
+                    reconf.model_config.head_dim,
+                    node.engine().backend(),
+                )?;
+                tracing::info!(
+                    "reconfigured: {} blocks, layers {:?}",
+                    num_blocks, new_range
+                );
+
+                conn.send_empty(MessageType::WorkerReady, 0).await?;
+                tracing::info!("ready after reconfigure");
             }
 
             MessageType::Shutdown => {

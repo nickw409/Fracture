@@ -334,6 +334,11 @@ async fn main() -> Result<()> {
         scheduler: None,
     });
 
+    // Pipeline watch channel for fault-tolerant reconfiguration.
+    // The distributed loop holds a Receiver and swaps to the new pipeline
+    // when a worker dies and the pipeline is rebuilt with surviving workers.
+    let (pipeline_tx, pipeline_rx) = tokio::sync::watch::channel(Arc::clone(&pipeline));
+
     // Build HTTP router — either batched (Phase 4) or sequential.
     use tower_http::cors::CorsLayer;
     let router: Router = if config.batched {
@@ -342,6 +347,7 @@ async fn main() -> Result<()> {
             Arc::clone(&pipeline),
             Arc::clone(&registry),
             distributed_loop::DistributedLoopConfig::default(),
+            pipeline_rx,
         );
         let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer, Arc::clone(&dashboard_state)));
         create_batched_router(batched_state)
@@ -362,6 +368,21 @@ async fn main() -> Result<()> {
             .merge(dashboard_routes(dashboard_state))
             .layer(CorsLayer::permissive())
     };
+
+    // Spawn reconnection listener — reuses the worker TCP listener so that
+    // workers that die and restart can reconnect and trigger reconfiguration.
+    let scheduling_mode_parsed = match config.scheduling_mode.as_str() {
+        "auto" => SchedulingMode::Auto,
+        _ => SchedulingMode::EqualSplit,
+    };
+    tokio::spawn(reconnection_listener(
+        listener,
+        Arc::clone(&registry),
+        model_config.clone(),
+        scheduling_mode_parsed.clone(),
+        config.max_seq_len,
+        pipeline_tx,
+    ));
 
     // Start HTTP server
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -661,4 +682,183 @@ fn error_json(message: &str) -> serde_json::Value {
             "code": null
         }
     })
+}
+
+// ── Fault Tolerance: Reconfiguration + Reconnection ────────────────────
+
+/// Reconfigure the pipeline with whatever workers are currently alive.
+///
+/// Re-runs the scheduler, sends Reconfigure to surviving workers, waits
+/// for WorkerReady, and broadcasts the new pipeline via the watch channel.
+async fn reconfigure_pipeline(
+    registry: &Mutex<PeerRegistry>,
+    model_config: &fracture_core::ModelConfig,
+    scheduling_mode: SchedulingMode,
+    max_seq_len: usize,
+    pipeline_tx: &tokio::sync::watch::Sender<Arc<DistributedPipeline>>,
+) -> Result<()> {
+    let mut reg = registry.lock().await;
+
+    let caps = reg.all_capabilities();
+    if caps.is_empty() {
+        anyhow::bail!("no surviving workers — cannot reconfigure");
+    }
+
+    tracing::info!(
+        "reconfiguring pipeline with {} surviving worker(s)",
+        caps.len()
+    );
+
+    let input = SchedulerInput {
+        model_config: model_config.clone(),
+        workers: caps,
+        coordinator_compute: None,
+        mode: scheduling_mode,
+        max_seq_len,
+        hop_latency_ms: 2.0,
+    };
+
+    let result = scheduler::schedule(&input)?;
+
+    tracing::info!("new schedule:");
+    for a in &result.assignments {
+        tracing::info!(
+            "  {} → layers {:?} ({:?})",
+            a.node_id, a.layer_range, a.role
+        );
+    }
+
+    // Send Reconfigure (same payload as RegisterAck) to each surviving worker.
+    for assignment in &result.assignments {
+        let payload = RegisterAckPayload {
+            layer_start: assignment.layer_range.start as u32,
+            layer_end: assignment.layer_range.end as u32,
+            total_layers: model_config.num_layers as u32,
+            max_seq_len: max_seq_len as u32,
+            model_config: model_config.clone(),
+        };
+        reg.assign(&assignment.node_id, assignment.clone())?;
+        let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
+            anyhow::anyhow!("worker '{}' disappeared during reconfigure", assignment.node_id)
+        })?;
+        entry
+            .connection
+            .send(MessageType::Reconfigure, 0, &payload)
+            .await?;
+        tracing::info!("sent Reconfigure to '{}'", assignment.node_id);
+    }
+
+    // Wait for WorkerReady from each reconfigured worker.
+    for assignment in &result.assignments {
+        let entry = reg.get_mut(&assignment.node_id).ok_or_else(|| {
+            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
+        })?;
+        let (header, _) = entry.connection.recv().await?;
+        if header.msg_type != MessageType::WorkerReady {
+            anyhow::bail!(
+                "expected WorkerReady from '{}' after reconfigure, got {:?}",
+                assignment.node_id, header.msg_type
+            );
+        }
+        tracing::info!("worker '{}' ready after reconfigure", assignment.node_id);
+    }
+
+    // Build new pipeline and broadcast it.
+    let new_pipeline = DistributedPipeline::new(
+        &result.assignments,
+        model_config.hidden_size,
+    )?;
+    let new_pipeline = Arc::new(new_pipeline);
+    let _ = pipeline_tx.send(new_pipeline);
+    tracing::info!("pipeline reconfigured successfully");
+
+    Ok(())
+}
+
+/// Background task that accepts new worker connections for reconnection.
+///
+/// Workers that previously died can reconnect by opening a new TCP connection
+/// and sending Register. This task processes the registration and triggers
+/// pipeline reconfiguration.
+async fn reconnection_listener(
+    listener: TcpListener,
+    registry: Arc<Mutex<PeerRegistry>>,
+    model_config: fracture_core::ModelConfig,
+    scheduling_mode: SchedulingMode,
+    max_seq_len: usize,
+    pipeline_tx: tokio::sync::watch::Sender<Arc<DistributedPipeline>>,
+) {
+    loop {
+        let (stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("reconnection listener accept error: {e}");
+                continue;
+            }
+        };
+
+        tracing::info!("worker reconnecting from {addr}");
+        let mut conn = FramedConnection::new(stream);
+
+        let (header, payload) = match conn.recv().await {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!("failed to read Register from {addr}: {e}");
+                continue;
+            }
+        };
+
+        if header.msg_type != MessageType::Register {
+            tracing::warn!(
+                "expected Register from reconnecting {addr}, got {:?}",
+                header.msg_type
+            );
+            continue;
+        }
+
+        let reg_payload: RegisterPayload = match FramedConnection::deserialize_payload(&payload) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("failed to deserialize Register from {addr}: {e}");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            "reconnecting worker '{}': {} ({:.1} GB)",
+            reg_payload.node_id,
+            reg_payload.gpu_model,
+            reg_payload.gpu_memory_available as f64 / 1e9,
+        );
+
+        let caps = WorkerCapabilities {
+            node_id: reg_payload.node_id.clone(),
+            gpu_model: reg_payload.gpu_model,
+            gpu_memory_available: reg_payload.gpu_memory_available as usize,
+            compute_capability: reg_payload.compute_capability,
+            decode_ms_per_layer: reg_payload.decode_ms_per_layer,
+            prefill_ms_per_layer_128: reg_payload.prefill_ms_per_layer_128,
+        };
+
+        {
+            let mut reg = registry.lock().await;
+            if let Err(e) = reg.register(caps, conn) {
+                tracing::error!("failed to re-register '{}': {e}", reg_payload.node_id);
+                continue;
+            }
+        }
+
+        // Trigger reconfiguration with the new worker included.
+        if let Err(e) = reconfigure_pipeline(
+            &registry,
+            &model_config,
+            scheduling_mode.clone(),
+            max_seq_len,
+            &pipeline_tx,
+        )
+        .await
+        {
+            tracing::error!("reconfiguration after reconnect failed: {e}");
+        }
+    }
 }

@@ -192,6 +192,42 @@ impl DistributedPipeline {
         Ok(())
     }
 
+    /// Best-effort cache free: send CacheFree to all reachable workers.
+    /// Skips dead/disconnected workers. Used during fault recovery.
+    pub async fn free_cache_best_effort(
+        &self,
+        registry: &mut PeerRegistry,
+        seq_id: u64,
+    ) {
+        self.allocated_seqs.lock().unwrap().remove(&seq_id);
+        for node_id in &self.pipeline_order {
+            if let Some(entry) = registry.get_mut(node_id) {
+                if entry.status == crate::registry::WorkerStatus::Ready {
+                    let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
+                }
+            }
+        }
+    }
+
+    /// Drain all allocated sequences and free caches on surviving workers.
+    /// Returns the list of aborted seq_ids.
+    pub async fn abort_all_sequences(
+        &self,
+        registry: &mut PeerRegistry,
+    ) -> Vec<u64> {
+        let seq_ids: Vec<u64> = self.allocated_seqs.lock().unwrap().drain().collect();
+        for &seq_id in &seq_ids {
+            for node_id in &self.pipeline_order {
+                if let Some(entry) = registry.get_mut(node_id) {
+                    if entry.status == crate::registry::WorkerStatus::Ready {
+                        let _ = entry.connection.send_empty(MessageType::CacheFree, seq_id).await;
+                    }
+                }
+            }
+        }
+        seq_ids
+    }
+
     /// Run a forward pass through the entire pipeline.
     ///
     /// Sends token IDs to the head worker, chains activations through

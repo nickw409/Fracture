@@ -3,6 +3,7 @@ import { useMetricsStream } from '../hooks/useMetricsStream';
 import PipelineView from '../components/cluster/PipelineView';
 import ModelInfoCard from '../components/cluster/ModelInfo';
 import MetricsSummary from '../components/cluster/MetricsSummary';
+import LoadTest from '../components/cluster/LoadTest';
 import Skeleton from '../components/shared/Skeleton';
 
 export default function ClusterPage() {
@@ -45,6 +46,8 @@ export default function ClusterPage() {
       </div>
 
       <MetricsSummary metrics={metrics} latest={latest} />
+
+      <LoadTest />
 
       <ModelInfoCard model={cluster.model} />
     </div>

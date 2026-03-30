@@ -489,6 +489,7 @@ dependencies = [
  "fracture-gguf",
  "fracture-protocol",
  "fracture-server",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

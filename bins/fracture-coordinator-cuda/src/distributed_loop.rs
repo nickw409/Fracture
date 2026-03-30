@@ -4,16 +4,23 @@
 //! Instead of calling `batched_forward()` on a local engine, it sends
 //! `BatchedForward` messages through the distributed pipeline. Cache is
 //! managed on workers via `alloc_cache`/`free_cache`.
+//!
+//! Heartbeats are sent inline between batch iterations. On worker death,
+//! all active sequences are aborted and the pipeline is flagged as degraded
+//! until reconfiguration completes.
 
+use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
 use fracture_coordinator::pipeline::DistributedPipeline;
 use fracture_coordinator::registry::PeerRegistry;
 use fracture_engine::{GenerationEvent, PendingRequest};
 use fracture_generate::{Sampler, SamplingParams, StopReason};
-use fracture_protocol::messages::SequenceMetadataWire;
+use fracture_protocol::frame::MessageType;
+use fracture_protocol::messages::{HeartbeatPayload, SequenceMetadataWire};
 use fracture_server::SchedulerHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Instant;
+use tokio::sync::{mpsc, watch, Mutex};
 
 /// An active distributed sequence.
 struct DistributedSequence {
@@ -56,29 +63,46 @@ impl Default for DistributedLoopConfig {
 /// Start the distributed scheduler loop as a background tokio task.
 ///
 /// Returns a SchedulerHandle compatible with `BatchedAppState`.
+///
+/// The `pipeline_rx` channel receives pipeline updates when the pipeline
+/// is reconfigured after worker death/reconnection.
 pub fn start_distributed_loop(
     pipeline: Arc<DistributedPipeline>,
     registry: Arc<Mutex<PeerRegistry>>,
     config: DistributedLoopConfig,
+    pipeline_rx: watch::Receiver<Arc<DistributedPipeline>>,
 ) -> SchedulerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = SchedulerHandle::from_sender(tx);
 
-    tokio::spawn(distributed_loop_task(pipeline, registry, rx, config));
+    tokio::spawn(distributed_loop_task(pipeline, registry, rx, config, pipeline_rx));
 
     handle
 }
 
 async fn distributed_loop_task(
-    pipeline: Arc<DistributedPipeline>,
+    mut pipeline: Arc<DistributedPipeline>,
     registry: Arc<Mutex<PeerRegistry>>,
     mut request_rx: mpsc::UnboundedReceiver<PendingRequest>,
     config: DistributedLoopConfig,
+    mut pipeline_rx: watch::Receiver<Arc<DistributedPipeline>>,
 ) {
     let mut pending: Vec<PendingRequest> = Vec::new();
     let mut active: HashMap<u64, DistributedSequence> = HashMap::new();
+    let mut heartbeat_tracker = HeartbeatTracker::new();
+    let mut last_heartbeat = Instant::now();
+    let mut pipeline_degraded = false;
+    let heartbeat_interval = heartbeat::DEFAULT_INTERVAL;
+    let heartbeat_max_missed = heartbeat::DEFAULT_MAX_MISSED;
 
     loop {
+        // Check for pipeline reconfiguration.
+        if pipeline_rx.has_changed().unwrap_or(false) {
+            pipeline = pipeline_rx.borrow_and_update().clone();
+            pipeline_degraded = false;
+            tracing::info!("distributed loop received reconfigured pipeline");
+        }
+
         // Drain all pending requests from the channel.
         loop {
             match request_rx.try_recv() {
@@ -93,18 +117,98 @@ async fn distributed_loop_task(
             }
         }
 
-        // If no work, wait for the next request.
+        // Send heartbeats periodically (inline, between batch iterations).
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            let dead_workers = send_heartbeat_round(
+                &registry,
+                &mut heartbeat_tracker,
+                heartbeat_max_missed,
+            ).await;
+
+            if !dead_workers.is_empty() {
+                tracing::error!("dead workers detected: {dead_workers:?}");
+                pipeline_degraded = true;
+
+                // Abort all active sequences — their KV cache on the dead worker is lost.
+                let mut reg = registry.lock().await;
+                let aborted = pipeline.abort_all_sequences(&mut reg).await;
+                drop(reg);
+
+                for seq_id in &aborted {
+                    if let Some(seq) = active.remove(seq_id) {
+                        let _ = seq.event_tx.send(GenerationEvent::Error(
+                            format!("worker died: {dead_workers:?}"),
+                        ));
+                    }
+                }
+
+                // Also fail all pending requests.
+                for req in pending.drain(..) {
+                    let _ = req.event_tx.send(GenerationEvent::Error(
+                        format!("pipeline degraded: worker(s) {dead_workers:?} died"),
+                    ));
+                }
+            }
+
+            last_heartbeat = Instant::now();
+        }
+
+        // If pipeline is degraded, reject new requests until reconfigured.
+        if pipeline_degraded {
+            for req in pending.drain(..) {
+                let _ = req.event_tx.send(GenerationEvent::Error(
+                    "pipeline degraded: waiting for reconfiguration".to_string(),
+                ));
+            }
+            if active.is_empty() {
+                // Wait for pipeline reconfiguration or new requests.
+                let heartbeat_deadline = tokio::time::Instant::from(
+                    last_heartbeat + heartbeat_interval,
+                );
+                tokio::select! {
+                    _ = pipeline_rx.changed() => {
+                        pipeline = pipeline_rx.borrow_and_update().clone();
+                        pipeline_degraded = false;
+                        tracing::info!("distributed loop received reconfigured pipeline");
+                    }
+                    req = request_rx.recv() => {
+                        match req {
+                            Some(r) => pending.push(r),
+                            None => return,
+                        }
+                    }
+                    _ = tokio::time::sleep_until(heartbeat_deadline) => {}
+                }
+                continue;
+            }
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        // If no work, wait for the next request (with heartbeat timeout).
         if pending.is_empty() && active.is_empty() {
-            match request_rx.recv().await {
-                Some(req) => pending.push(req),
-                None => return,
+            let heartbeat_deadline = tokio::time::Instant::from(
+                last_heartbeat + heartbeat_interval,
+            );
+            tokio::select! {
+                req = request_rx.recv() => {
+                    match req {
+                        Some(r) => pending.push(r),
+                        None => return,
+                    }
+                }
+                _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                    continue;
+                }
+                _ = pipeline_rx.changed() => {
+                    pipeline = pipeline_rx.borrow_and_update().clone();
+                    pipeline_degraded = false;
+                    continue;
+                }
             }
         }
 
         // Admission: check distributed free blocks before admitting new sequences.
-        // min_free_blocks() returns 0 when no heartbeat data is available yet,
-        // so we always admit at least one request (the alloc will fail with OOM
-        // if the worker truly has no blocks).
         let free_blocks = {
             let reg = registry.lock().await;
             reg.min_free_blocks()
@@ -115,7 +219,6 @@ async fn distributed_loop_task(
             let req = pending.remove(0);
             let seq_id = req.seq_id;
 
-            // Allocate cache on all workers.
             let alloc_result = {
                 let mut reg = registry.lock().await;
                 pipeline.alloc_cache(&mut reg, seq_id, 0).await
@@ -148,7 +251,6 @@ async fn distributed_loop_task(
                     ));
                 }
             }
-            // Only admit one per iteration to re-check free blocks.
             break;
         }
 
@@ -170,7 +272,8 @@ async fn distributed_loop_task(
             if seq.prefill_done || seq.remaining_prefill.is_empty() {
                 continue;
             }
-            if total_tokens >= config.max_batch_tokens || batch_seq_ids.len() >= config.max_batch_size
+            if total_tokens >= config.max_batch_tokens
+                || batch_seq_ids.len() >= config.max_batch_size
             {
                 break;
             }
@@ -189,8 +292,8 @@ async fn distributed_loop_task(
                 seq_id: seq.seq_id,
                 num_tokens: chunk_size,
                 positions: chunk_positions.clone(),
-                block_table: Vec::new(), // Workers manage their own block tables.
-                cache_seq_len: 0,        // Workers track this locally.
+                block_table: Vec::new(),
+                cache_seq_len: 0,
                 last_block_tokens: 0,
             });
             all_token_ids.extend_from_slice(&chunk_tokens);
@@ -205,16 +308,13 @@ async fn distributed_loop_task(
             if !seq.prefill_done {
                 continue;
             }
-            if total_tokens >= config.max_batch_tokens || batch_seq_ids.len() >= config.max_batch_size
+            if total_tokens >= config.max_batch_tokens
+                || batch_seq_ids.len() >= config.max_batch_size
             {
                 break;
             }
 
-            let last_token = seq
-                .generated_tokens
-                .last()
-                .copied()
-                .unwrap_or(0);
+            let last_token = seq.generated_tokens.last().copied().unwrap_or(0);
 
             seq_metas.push(SequenceMetadataWire {
                 seq_id: seq.seq_id,
@@ -241,21 +341,22 @@ async fn distributed_loop_task(
         let forward_result = {
             let mut reg = registry.lock().await;
             pipeline
-                .batched_forward(&mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill)
+                .batched_forward(
+                    &mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill,
+                )
                 .await
         };
 
         let per_seq_logits = match forward_result {
             Ok(logits) => logits,
             Err(e) => {
-                // Abort all sequences in this batch.
                 let mut reg = registry.lock().await;
                 for seq_id in &batch_seq_ids {
                     if let Some(seq) = active.remove(seq_id) {
                         let _ = seq.event_tx.send(GenerationEvent::Error(
                             format!("forward pass failed: {e}"),
                         ));
-                        let _ = pipeline.free_cache(&mut reg, seq.seq_id).await;
+                        pipeline.free_cache_best_effort(&mut reg, seq.seq_id).await;
                     }
                 }
                 continue;
@@ -272,11 +373,9 @@ async fn distributed_loop_task(
             };
 
             if is_prefill {
-                // Advance chunked prefill.
                 let chunk_size = seq_metas[i].num_tokens;
                 seq.remaining_prefill.drain(..chunk_size);
                 if !seq.remaining_prefill.is_empty() {
-                    // More chunks to go — don't sample yet.
                     continue;
                 }
                 seq.prefill_done = true;
@@ -294,9 +393,6 @@ async fn distributed_loop_task(
                 Ok(token) => {
                     seq.generated_tokens.push(token);
 
-                    // Increment position only for decode steps. After prefill,
-                    // current_pos is already prompt_len (the correct position for
-                    // the first decode). Each decode then advances by 1.
                     if !is_prefill {
                         seq.current_pos += 1;
                     }
@@ -324,13 +420,12 @@ async fn distributed_loop_task(
         // Cleanup completed sequences.
         for seq_id in &completed_seq_ids {
             if let Some(seq) = active.remove(seq_id) {
-                let stop_reason = if seq.stop_tokens.contains(
-                    seq.generated_tokens.last().unwrap_or(&0),
-                ) {
-                    StopReason::Stop
-                } else {
-                    StopReason::Length
-                };
+                let stop_reason =
+                    if seq.stop_tokens.contains(seq.generated_tokens.last().unwrap_or(&0)) {
+                        StopReason::Stop
+                    } else {
+                        StopReason::Length
+                    };
 
                 let _ = seq.event_tx.send(GenerationEvent::Finished {
                     stop_reason,
@@ -342,4 +437,40 @@ async fn distributed_loop_task(
             }
         }
     }
+}
+
+/// Send heartbeats to all workers and check for dead ones.
+/// Returns the list of newly-dead worker node IDs.
+async fn send_heartbeat_round(
+    registry: &Mutex<PeerRegistry>,
+    tracker: &mut HeartbeatTracker,
+    max_missed: usize,
+) -> Vec<String> {
+    let mut reg = registry.lock().await;
+
+    let nonce = rand::random::<u64>();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let payload = HeartbeatPayload {
+        timestamp_ns: now_ns,
+        nonce,
+    };
+    tracker.set_pending_nonce(nonce);
+
+    let node_ids = reg.pipeline_order();
+
+    for node_id in &node_ids {
+        if let Some(entry) = reg.get_mut(node_id) {
+            if let Err(e) = entry.connection.send(MessageType::Heartbeat, 0, &payload).await {
+                tracing::warn!("heartbeat send to '{node_id}' failed: {e}");
+            }
+        }
+    }
+
+    let timed_out = tracker.increment_missed(&node_ids, max_missed);
+    heartbeat::mark_dead_workers(&mut reg, &timed_out);
+
+    timed_out
 }

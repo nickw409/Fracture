@@ -106,6 +106,15 @@ impl<B: Backend> ComputeNodeImpl<B> {
     pub fn engine(&self) -> &Engine<B> {
         &self.engine
     }
+
+    pub fn config(&self) -> &NodeConfig {
+        &self.node_config
+    }
+
+    /// Consume the node and return the backend for reuse during reconfiguration.
+    pub fn into_backend(self) -> B {
+        self.engine.into_backend()
+    }
 }
 
 impl<B: Backend> ComputeNode for ComputeNodeImpl<B> {
