@@ -228,7 +228,7 @@ async fn test_two_node_forward_returns_logits() {
 
     // Allocate cache
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -257,7 +257,7 @@ async fn test_two_node_multi_step_decode() {
     let seq_id = 42;
 
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -293,7 +293,7 @@ async fn test_cache_alloc_and_free() {
     // Allocate and free multiple sequences
     for seq_id in 1..=5 {
         pipeline
-            .alloc_cache(&mut registry, seq_id, 4096)
+            .alloc_cache(&mut registry, seq_id)
             .await
             .unwrap();
     }
@@ -361,7 +361,7 @@ async fn test_shutdown_propagation() {
     // Send shutdown
     let entry = registry.get_mut("w").unwrap();
     entry
-        .connection
+        .writer
         .send_empty(MessageType::Shutdown, 0)
         .await
         .unwrap();
@@ -454,7 +454,7 @@ async fn test_three_node_pipeline() {
     let seq_id = 99;
 
     pipeline
-        .alloc_cache(&mut registry, seq_id, 4096)
+        .alloc_cache(&mut registry, seq_id)
         .await
         .unwrap();
 
@@ -608,7 +608,7 @@ async fn test_worker_error_propagates() {
     registry.assign("err-worker", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1, 2], &[0, 1], true).await;
     assert!(result.is_err());
@@ -644,7 +644,7 @@ async fn test_non_tail_returning_logits_is_error() {
     for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
 
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -669,7 +669,7 @@ async fn test_tail_returning_activations_is_error() {
     registry.assign("tail", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -711,9 +711,9 @@ async fn test_heartbeat_round_trip() {
 
     let hb = HeartbeatPayload { timestamp_ns: 1234567890, nonce: 42 };
     let entry = registry.get_mut("hb-worker").unwrap();
-    entry.connection.send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    entry.writer.send(MessageType::Heartbeat, 0, &hb).await.unwrap();
 
-    let (header, payload) = entry.connection.recv().await.unwrap();
+    let (header, payload) = entry.reader.lock().await.recv().await.unwrap();
     assert_eq!(header.msg_type, MessageType::HeartbeatAck);
     let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
     assert_eq!(ack.timestamp_echo, 1234567890);
@@ -779,7 +779,7 @@ async fn test_worker_cache_alloc_free_via_protocol() {
 
     // Alloc 3 caches
     for seq_id in 1..=3u64 {
-        conn.send(MessageType::CacheAlloc, seq_id, &CacheAllocPayload { max_seq_len: 4096 }).await.unwrap();
+        conn.send_empty(MessageType::CacheAlloc, seq_id).await.unwrap();
         let (ack_header, _) = conn.recv().await.unwrap();
         assert_eq!(ack_header.msg_type, MessageType::CacheAllocAck);
     }
@@ -834,17 +834,16 @@ async fn test_worker_unknown_message_returns_error() {
 // ── Heartbeat module tests ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_send_heartbeats_and_check_timeout() {
-    use fracture_coordinator::heartbeat;
+async fn test_heartbeat_tracker_valid_ack_over_wire() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
 
-    // Spawn a mock worker that responds to heartbeats
+    // Spawn a mock worker that echoes heartbeat nonces.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let _worker = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut conn = FramedConnection::new(stream);
-        // Respond to one heartbeat
         let (header, payload) = conn.recv().await.unwrap();
         assert_eq!(header.msg_type, MessageType::Heartbeat);
         let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
@@ -853,7 +852,7 @@ async fn test_send_heartbeats_and_check_timeout() {
             nonce_echo: hb.nonce,
             gpu_memory_used: 0,
             active_sequences: 0,
-            free_blocks: 0,
+            free_blocks: 50,
         };
         conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
     });
@@ -869,28 +868,38 @@ async fn test_send_heartbeats_and_check_timeout() {
     };
     registry.assign("hb-test", assignment).unwrap();
 
-    // send_heartbeats with generous timeout — should return no timed-out workers
-    let timed_out = heartbeat::send_heartbeats(
-        &mut registry,
-        std::time::Duration::from_secs(60),
-    ).await;
-    assert!(timed_out.is_empty(), "no workers should be timed out");
+    let mut tracker = HeartbeatTracker::new();
+
+    // Send heartbeat with nonce 42.
+    let nonce = 42u64;
+    let hb = HeartbeatPayload { timestamp_ns: 1234, nonce };
+    registry.get_mut("hb-test").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Receive ack from worker.
+    let (header, payload) = registry.get("hb-test").unwrap()
+        .reader.lock().await.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::HeartbeatAck);
+    let ack: HeartbeatAckPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+
+    // Process through tracker — should succeed and update registry.
+    assert!(tracker.process_ack(&mut registry, "hb-test", &ack));
+    assert_eq!(tracker.missed_count("hb-test"), 0);
+    assert_eq!(registry.get("hb-test").unwrap().free_blocks, 50);
 }
 
 #[tokio::test]
-async fn test_send_heartbeats_detects_timeout() {
-    use fracture_coordinator::heartbeat;
+async fn test_heartbeat_tracker_missed_count_detects_dead() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
 
-    // Worker that does NOT respond (just accepts connection and hangs)
+    // Worker that accepts but never responds.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
     let _worker = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut conn = FramedConnection::new(stream);
-        // Read the heartbeat but don't respond
         let _ = conn.recv().await;
-        // Keep connection alive
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     });
 
@@ -905,13 +914,16 @@ async fn test_send_heartbeats_detects_timeout() {
     };
     registry.assign("slow", assignment).unwrap();
 
-    // Manually set the last heartbeat to the past so it times out
-    // We do this by calling send_heartbeats with zero timeout
-    let timed_out = heartbeat::send_heartbeats(
-        &mut registry,
-        std::time::Duration::ZERO,
-    ).await;
-    assert_eq!(timed_out, vec!["slow"]);
+    let mut tracker = HeartbeatTracker::new();
+    tracker.set_pending_nonce(1);
+
+    // Simulate 3 missed rounds — worker should be flagged.
+    assert!(tracker.increment_missed(&["slow".into()], 3).is_empty());
+    tracker.set_pending_nonce(2);
+    assert!(tracker.increment_missed(&["slow".into()], 3).is_empty());
+    tracker.set_pending_nonce(3);
+    let dead = tracker.increment_missed(&["slow".into()], 3);
+    assert_eq!(dead, vec!["slow"]);
 }
 
 #[tokio::test]
@@ -942,6 +954,313 @@ async fn test_mark_dead_workers_transitions_status() {
 
     assert_eq!(registry.get("doomed").unwrap().status, WorkerStatus::Dead);
     assert_eq!(registry.active_count(), 0);
+    assert!(registry.pipeline_order().is_empty());
+}
+
+/// Two workers over real TCP — one responds, one hangs. Verify that
+/// reader_handles() returns both and concurrent polling doesn't block
+/// the healthy worker on the slow one.
+#[tokio::test]
+async fn test_concurrent_poll_mixed_workers() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
+
+    // Worker A: responds immediately
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let _worker_a = tokio::spawn(async move {
+        let (stream, _) = listener_a.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let (_, payload) = conn.recv().await.unwrap();
+        let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+        let ack = HeartbeatAckPayload {
+            timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
+            gpu_memory_used: 4_000_000_000, active_sequences: 1, free_blocks: 100,
+        };
+        conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+    });
+
+    // Worker B: accepts but never responds
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let _worker_b = tokio::spawn(async move {
+        let (stream, _) = listener_b.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let conn_a = FramedConnection::new(tokio::net::TcpStream::connect(addr_a).await.unwrap());
+    let conn_b = FramedConnection::new(tokio::net::TcpStream::connect(addr_b).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("fast"), conn_a).unwrap();
+    registry.register(make_caps("slow"), conn_b).unwrap();
+    registry.assign("fast", LayerAssignment {
+        node_id: "fast".into(), layer_range: 0..16, role: NodeRole::Head,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    }).unwrap();
+    registry.assign("slow", LayerAssignment {
+        node_id: "slow".into(), layer_range: 16..32, role: NodeRole::Tail,
+        expected_decode_ms: 16.0, weight_memory_gb: 6.0, cache_memory_gb: 1.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let nonce: u64 = 777;
+
+    // Send heartbeats to both
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+    registry.get_mut("fast").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    registry.get_mut("slow").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Concurrent poll — should complete quickly (not blocked by slow worker)
+    let reader_handles = registry.reader_handles();
+    assert_eq!(reader_handles.len(), 2);
+
+    let start = std::time::Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for (node_id, reader) in &reader_handles {
+        let node_id = node_id.clone();
+        let reader = reader.clone();
+        set.spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                async { reader.lock().await.recv().await },
+            ).await;
+            let ack = match result {
+                Ok(Ok((header, payload))) if header.msg_type == MessageType::HeartbeatAck => {
+                    FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok()
+                }
+                _ => None,
+            };
+            (node_id, ack)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+    let elapsed = start.elapsed();
+
+    // Should complete in ~200ms (the timeout), not 200ms × 2 = 400ms
+    assert!(elapsed < std::time::Duration::from_millis(350),
+        "concurrent poll took {elapsed:?}, expected < 350ms");
+
+    // Process results
+    for (node_id, ack) in &results {
+        if let Some(ack) = ack {
+            tracker.process_ack(&mut registry, node_id, ack);
+        }
+    }
+
+    // fast worker: ack processed, counter reset, stats updated
+    assert_eq!(tracker.missed_count("fast"), 0);
+    assert_eq!(registry.get("fast").unwrap().free_blocks, 100);
+    assert_eq!(registry.get("fast").unwrap().gpu_memory_used, 4_000_000_000);
+
+    // slow worker: no ack, counter still 0 (hasn't been incremented yet)
+    // After increment_missed, it goes to 1
+    let dead = tracker.increment_missed(&["fast".into(), "slow".into()], 3);
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("fast"), 1); // was 0 (ack), now +1
+    assert_eq!(tracker.missed_count("slow"), 1); // was 0 (never acked), now +1
+}
+
+/// Worker sends a non-HeartbeatAck message during the poll window.
+/// The poll should ignore it and treat the worker as not having acked.
+#[tokio::test]
+async fn test_poll_ignores_non_ack_messages() {
+    use fracture_coordinator::heartbeat::HeartbeatTracker;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Worker responds with an Error message instead of HeartbeatAck
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await;
+        let err = ErrorPayload {
+            error_code: ErrorCode::Internal,
+            message: "something went wrong".into(),
+        };
+        conn.send(MessageType::Error, 0, &err).await.unwrap();
+    });
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("confused"), conn).unwrap();
+    registry.assign("confused", LayerAssignment {
+        node_id: "confused".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let nonce = 42u64;
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+    registry.get_mut("confused").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(nonce);
+
+    // Poll — worker sent Error, not HeartbeatAck
+    let reader_handles = registry.reader_handles();
+    let mut set = tokio::task::JoinSet::new();
+    for (node_id, reader) in &reader_handles {
+        let node_id = node_id.clone();
+        let reader = reader.clone();
+        set.spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                async { reader.lock().await.recv().await },
+            ).await;
+            let ack = match result {
+                Ok(Ok((header, payload))) if header.msg_type == MessageType::HeartbeatAck => {
+                    FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok()
+                }
+                _ => None,
+            };
+            (node_id, ack)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+
+    // Should have no valid acks
+    for (node_id, ack) in &results {
+        if let Some(ack) = ack {
+            tracker.process_ack(&mut registry, node_id, ack);
+        }
+    }
+    assert_eq!(tracker.missed_count("confused"), 0); // not incremented yet
+
+    // After increment, worker is counted as missed
+    let dead = tracker.increment_missed(&["confused".into()], 3);
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("confused"), 1);
+}
+
+/// Simulates the full cycle order over the wire for 4 rounds:
+/// worker responds to rounds 1-2, goes silent for rounds 3-4,
+/// then is flagged dead on round 5.
+#[tokio::test]
+async fn test_full_lifecycle_over_wire() {
+    use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
+    use fracture_coordinator::registry::WorkerStatus;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Worker responds to first 2 heartbeats, then stops
+    let _worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        for _ in 0..2 {
+            let (_, payload) = conn.recv().await.unwrap();
+            let hb: HeartbeatPayload = FramedConnection::deserialize_payload(&payload).unwrap();
+            let ack = HeartbeatAckPayload {
+                timestamp_echo: hb.timestamp_ns, nonce_echo: hb.nonce,
+                gpu_memory_used: 0, active_sequences: 0, free_blocks: 50,
+            };
+            conn.send(MessageType::HeartbeatAck, 0, &ack).await.unwrap();
+        }
+        // Read remaining heartbeats but don't respond
+        loop {
+            if conn.recv().await.is_err() { break; }
+        }
+    });
+
+    let conn = FramedConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("lifecycle"), conn).unwrap();
+    registry.assign("lifecycle", LayerAssignment {
+        node_id: "lifecycle".into(), layer_range: 0..32, role: NodeRole::Head,
+        expected_decode_ms: 32.0, weight_memory_gb: 12.0, cache_memory_gb: 2.0,
+    }).unwrap();
+
+    let mut tracker = HeartbeatTracker::new();
+    let workers = vec!["lifecycle".to_string()];
+
+    // Helper: run one heartbeat cycle (poll, increment, send)
+    async fn cycle(
+        tracker: &mut HeartbeatTracker,
+        registry: &mut PeerRegistry,
+        workers: &[String],
+        nonce: u64,
+    ) -> Vec<String> {
+        // 1. Poll acks for previous nonce
+        let reader_handles = registry.reader_handles();
+        let mut ack_result = None;
+        if !reader_handles.is_empty() {
+            let (_, reader) = &reader_handles[0];
+            if let Ok(Ok((header, payload))) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                reader.lock().await.recv(),
+            ).await {
+                if header.msg_type == MessageType::HeartbeatAck {
+                    ack_result = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok();
+                }
+            }
+        }
+        if let Some(ack) = &ack_result {
+            tracker.process_ack(registry, &workers[0], ack);
+        }
+
+        // 2. Increment missed
+        let dead = tracker.increment_missed(workers, 3);
+
+        // 3. Send new heartbeat
+        let hb = HeartbeatPayload { timestamp_ns: 0, nonce };
+        registry.get_mut(&workers[0]).unwrap().writer
+            .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+        tracker.set_pending_nonce(nonce);
+
+        dead
+    }
+
+    // Cycle 1: first heartbeat (no prior nonce, skip poll/increment)
+    let hb = HeartbeatPayload { timestamp_ns: 0, nonce: 100 };
+    registry.get_mut("lifecycle").unwrap().writer
+        .send(MessageType::Heartbeat, 0, &hb).await.unwrap();
+    tracker.set_pending_nonce(100);
+
+    // Give worker time to respond
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 2: worker acked round 1 — should be healthy
+    let dead = cycle(&mut tracker, &mut registry, &workers, 200).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 1); // 0 (ack) + 1 (increment)
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 3: worker acked round 2 — still healthy
+    let dead = cycle(&mut tracker, &mut registry, &workers, 300).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 1);
+
+    // Worker stops responding after this point
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 4: no ack for round 3 — missed count rises
+    let dead = cycle(&mut tracker, &mut registry, &workers, 400).await;
+    assert!(dead.is_empty());
+    assert_eq!(tracker.missed_count("lifecycle"), 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cycle 5: still no ack — missed count hits threshold
+    let dead = cycle(&mut tracker, &mut registry, &workers, 500).await;
+    assert_eq!(dead, vec!["lifecycle"]);
+    assert_eq!(tracker.missed_count("lifecycle"), 3);
+
+    // Mark dead
+    heartbeat::mark_dead_workers(&mut registry, &dead);
+    assert_eq!(registry.get("lifecycle").unwrap().status, WorkerStatus::Dead);
     assert!(registry.pipeline_order().is_empty());
 }
 
@@ -1008,7 +1327,7 @@ async fn test_pipeline_unexpected_message_type_is_error() {
     registry.assign("bad", assignment.clone()).unwrap();
 
     let pipeline = DistributedPipeline::new(&[assignment], 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -1092,7 +1411,7 @@ async fn test_activation_shape_mismatch_detected() {
     for a in &assignments { registry.assign(&a.node_id, a.clone()).unwrap(); }
 
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
-    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
 
     let result = pipeline.forward(&mut registry, 1, &[1], &[0], true).await;
     assert!(result.is_err());
@@ -1128,7 +1447,7 @@ async fn test_alloc_cache_unknown_worker_is_error() {
     };
     let pipeline = DistributedPipeline::new(&[assignment, missing_assignment], 4096).unwrap();
 
-    let result = pipeline.alloc_cache(&mut registry, 1, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, 1).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("missing"));
 }
@@ -1226,7 +1545,7 @@ async fn test_single_worker_forward_returns_logits() {
     let (pipeline, mut registry) = setup_single_node_pipeline().await;
     let seq_id = 1;
 
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     // Prefill
     let logits = pipeline
@@ -1267,10 +1586,10 @@ async fn test_duplicate_cache_alloc_is_error() {
     let seq_id = 10;
 
     // First alloc succeeds
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     // Second alloc for same seq_id fails
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -1301,7 +1620,7 @@ async fn test_double_free_is_error() {
     let (pipeline, mut registry) = setup_single_node_pipeline().await;
     let seq_id = 20;
 
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 
     // Second free fails
@@ -1320,7 +1639,7 @@ async fn test_cache_reuse_after_free() {
     let seq_id = 30;
 
     // Alloc, use, free
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     let logits = pipeline
         .forward(&mut registry, seq_id, &[1], &[0], false)
         .await
@@ -1329,7 +1648,7 @@ async fn test_cache_reuse_after_free() {
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 
     // Re-alloc same seq_id succeeds
-    pipeline.alloc_cache(&mut registry, seq_id, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
     let logits = pipeline
         .forward(&mut registry, seq_id, &[2], &[0], false)
         .await
@@ -1345,8 +1664,8 @@ async fn test_multiple_sequence_isolation() {
     let seq_b = 200;
 
     // Allocate both sequences
-    pipeline.alloc_cache(&mut registry, seq_a, 4096).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq_b, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_a).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_b).await.unwrap();
 
     // Forward sequence A
     let logits_a = pipeline
@@ -1517,7 +1836,7 @@ async fn test_partial_cache_alloc_rollback() {
     let seq_id = 42;
 
     // alloc_cache should fail because the tail worker returns OOM
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -1596,7 +1915,7 @@ async fn test_partial_cache_alloc_rollback_three_nodes() {
     let pipeline = DistributedPipeline::new(&assignments, 4096).unwrap();
     let seq_id = 77;
 
-    let result = pipeline.alloc_cache(&mut registry, seq_id, 4096).await;
+    let result = pipeline.alloc_cache(&mut registry, seq_id).await;
     assert!(result.is_err());
     assert!(!pipeline.is_allocated(seq_id));
 
@@ -1632,8 +1951,8 @@ async fn test_batched_forward_two_nodes_returns_per_sequence_logits() {
     let seq2 = 101;
 
     // Allocate caches
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     // Build batch metadata
     let sequences = vec![
@@ -1656,10 +1975,9 @@ async fn test_batched_forward_two_nodes_returns_per_sequence_logits() {
     ];
 
     let all_token_ids = vec![128000, 791, 1401, 42]; // 3 tokens seq1, 1 token seq2
-    let all_positions = vec![0, 1, 2, 5];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &all_token_ids, &all_positions, true)
+        .batched_forward(&mut registry, &sequences, &all_token_ids, true)
         .await
         .unwrap();
 
@@ -1688,7 +2006,7 @@ async fn test_batched_forward_single_sequence() {
     let (pipeline, mut registry) = setup_two_node_pipeline().await;
 
     let seq_id = 200;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,
@@ -1704,7 +2022,6 @@ async fn test_batched_forward_single_sequence() {
             &mut registry,
             &sequences,
             &[1, 2, 3, 4, 5],
-            &[0, 1, 2, 3, 4],
             true,
         )
         .await
@@ -1730,7 +2047,7 @@ async fn test_batched_forward_without_cache_is_error() {
     }];
 
     let result = pipeline
-        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .batched_forward(&mut registry, &sequences, &[1], false)
         .await;
 
     assert!(result.is_err());
@@ -1796,7 +2113,7 @@ async fn test_batched_forward_single_node_pipeline() {
     .unwrap();
 
     let seq_id = 1;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,
@@ -1808,7 +2125,7 @@ async fn test_batched_forward_single_node_pipeline() {
     }];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2], &[0, 1], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2], true)
         .await
         .unwrap();
 
@@ -1898,8 +2215,8 @@ async fn test_batched_forward_three_node_pipeline() {
 
     let seq1 = 10;
     let seq2 = 11;
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     let sequences = vec![
         SequenceMetadataWire {
@@ -1921,7 +2238,7 @@ async fn test_batched_forward_three_node_pipeline() {
     ];
 
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 3], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], true)
         .await
         .unwrap();
 
@@ -2068,8 +2385,8 @@ async fn test_batched_forward_fallback_to_forward_result() {
 
     let seq1 = 50;
     let seq2 = 51;
-    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
-    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2).await.unwrap();
 
     let sequences = vec![
         SequenceMetadataWire {
@@ -2093,7 +2410,7 @@ async fn test_batched_forward_fallback_to_forward_result() {
     // Workers respond with ForwardResult (not BatchedForwardResult) —
     // coordinator should handle this fallback gracefully.
     let per_seq_logits = pipeline
-        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 0], true)
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], true)
         .await
         .unwrap();
 
@@ -2201,7 +2518,7 @@ async fn test_batched_forward_worker_error_propagates() {
     .unwrap();
 
     let seq_id = 1;
-    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq_id).await.unwrap();
 
     let sequences = vec![SequenceMetadataWire {
         seq_id,
@@ -2213,7 +2530,7 @@ async fn test_batched_forward_worker_error_propagates() {
     }];
 
     let result = pipeline
-        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .batched_forward(&mut registry, &sequences, &[1], false)
         .await;
 
     assert!(result.is_err());
@@ -2224,4 +2541,724 @@ async fn test_batched_forward_worker_error_propagates() {
     );
 
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+// =========================================================================
+// Fault Tolerance Integration Tests
+// =========================================================================
+
+/// Spawn a mock worker that handles Reconfigure (for rebalance tests):
+/// receives Reconfigure, responds with WorkerReady.
+async fn spawn_reconfigurable_worker(
+    listener: TcpListener,
+    is_tail: bool,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    let _req: ForwardPayload =
+                        FramedConnection::deserialize_payload(&payload).unwrap();
+                    let result = if is_tail {
+                        let data: Vec<u8> = (0..vocab_size)
+                            .flat_map(|i| (i as f32).to_le_bytes())
+                            .collect();
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Logits { data },
+                        }
+                    } else {
+                        let data_len = hidden_size * 2;
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Activations {
+                                tensor_header: TensorWireHeader {
+                                    ndim: 2,
+                                    shape: vec![1, hidden_size as u32],
+                                    dtype: 0,
+                                    compression: 0,
+                                    data_len: data_len as u32,
+                                },
+                                tensor_data: vec![0u8; data_len],
+                            },
+                        }
+                    };
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Reconfigure => {
+                    // Handle reconfiguration: respond with WorkerReady
+                    conn.send_empty(MessageType::WorkerReady, 0)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Helper: set up a 3-node pipeline with reconfigurable mock workers.
+async fn setup_three_node_reconfigurable() -> (
+    DistributedPipeline,
+    PeerRegistry,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let l0 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a0 = l0.local_addr().unwrap();
+    let a1 = l1.local_addr().unwrap();
+    let a2 = l2.local_addr().unwrap();
+
+    let t0 = spawn_reconfigurable_worker(l0, false, hidden_size, vocab_size).await;
+    let t1 = spawn_reconfigurable_worker(l1, false, hidden_size, vocab_size).await;
+    let t2 = spawn_reconfigurable_worker(l2, true, hidden_size, vocab_size).await;
+
+    let c0 = FramedConnection::new(tokio::net::TcpStream::connect(a0).await.unwrap());
+    let c1 = FramedConnection::new(tokio::net::TcpStream::connect(a1).await.unwrap());
+    let c2 = FramedConnection::new(tokio::net::TcpStream::connect(a2).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    let caps = |name: &str| WorkerCapabilities {
+        node_id: name.into(),
+        gpu_model: "Mock".into(),
+        gpu_memory_available: 24_000_000_000,
+        compute_capability: (8, 0),
+        decode_ms_per_layer: 1.0,
+        prefill_ms_per_layer_128: 3.0,
+    };
+
+    registry.register(caps("w0"), c0).unwrap();
+    registry.register(caps("w1"), c1).unwrap();
+    registry.register(caps("w2"), c2).unwrap();
+
+    let a = |name: &str, start: usize, end: usize, role: NodeRole| LayerAssignment {
+        node_id: name.into(),
+        layer_range: start..end,
+        role,
+        expected_decode_ms: 10.0,
+        weight_memory_gb: 5.0,
+        cache_memory_gb: 1.0,
+    };
+
+    let assignments = vec![
+        a("w0", 0, 11, NodeRole::Head),
+        a("w1", 11, 22, NodeRole::Middle),
+        a("w2", 22, 32, NodeRole::Tail),
+    ];
+    for ass in &assignments {
+        registry.assign(&ass.node_id, ass.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, hidden_size).unwrap();
+    (pipeline, registry, vec![t0, t1, t2])
+}
+
+#[tokio::test]
+async fn test_reregister_payload_over_wire() {
+    // Test ReRegister message round-trip over TCP
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu0".into(),
+            gpu_model: "RTX 3090".into(),
+            gpu_memory_total: 24_000_000_000,
+            gpu_memory_available: 8_000_000_000,
+            compute_capability: (8, 6),
+            decode_ms_per_layer: 1.1,
+            prefill_ms_per_layer_128: 3.5,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![1, 5, 42],
+        };
+        conn.send(MessageType::ReRegister, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::ReRegister);
+    let rereg: ReRegisterPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(rereg.node_id, "worker-gpu0");
+    assert_eq!(rereg.current_layer_start, Some(0));
+    assert_eq!(rereg.current_layer_end, Some(16));
+    assert_eq!(rereg.active_cache_seq_ids, vec![1, 5, 42]);
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_leave_intent_over_wire() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = LeaveIntentPayload {
+            reason: "SIGTERM received".into(),
+        };
+        conn.send(MessageType::LeaveIntent, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::LeaveIntent);
+    let leave: LeaveIntentPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(leave.reason, "SIGTERM received");
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cluster_manifest_over_wire() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = ClusterManifestPayload {
+            version: 3,
+            term: 1,
+            nodes: vec![
+                NodeInfo {
+                    node_id: "coordinator".into(),
+                    address: "192.168.1.1:9400".into(),
+                    election_priority: 0,
+                    coordinator_capable: true,
+                    role: fracture_protocol::messages::NodeRole::Coordinator,
+                },
+                NodeInfo {
+                    node_id: "worker-0".into(),
+                    address: "192.168.1.2:9400".into(),
+                    election_priority: 1,
+                    coordinator_capable: true,
+                    role: fracture_protocol::messages::NodeRole::Worker,
+                },
+            ],
+        };
+        conn.send(MessageType::ClusterManifest, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::ClusterManifest);
+    let manifest: ClusterManifestPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(manifest.version, 3);
+    assert_eq!(manifest.term, 1);
+    assert_eq!(manifest.nodes.len(), 2);
+    assert_eq!(manifest.nodes[0].role, fracture_protocol::messages::NodeRole::Coordinator);
+    assert!(manifest.nodes[1].coordinator_capable);
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_election_messages_over_wire() {
+    // Test all 3 election message types over TCP
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        // ElectionStart
+        conn.send(
+            MessageType::ElectionStart,
+            0,
+            &ElectionStartPayload {
+                candidate_id: "node-a".into(),
+                priority: 0,
+                term: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        // ElectionChallenge
+        conn.send(
+            MessageType::ElectionChallenge,
+            0,
+            &ElectionChallengePayload {
+                challenger_id: "node-b".into(),
+                priority: 1,
+                term: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Victory
+        conn.send(
+            MessageType::Victory,
+            0,
+            &VictoryPayload {
+                leader_id: "node-a".into(),
+                term: 5,
+                coordinator_addr: "192.168.1.10:9400".into(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Receive ElectionStart
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ElectionStart);
+    let es: ElectionStartPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(es.candidate_id, "node-a");
+    assert_eq!(es.priority, 0);
+    assert_eq!(es.term, 5);
+
+    // Receive ElectionChallenge
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ElectionChallenge);
+    let ec: ElectionChallengePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(ec.challenger_id, "node-b");
+
+    // Receive Victory
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::Victory);
+    let v: VictoryPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(v.leader_id, "node-a");
+    assert_eq!(v.term, 5);
+    assert_eq!(v.coordinator_addr, "192.168.1.10:9400");
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_abort_all_sequences_frees_caches() {
+    let (pipeline, mut registry) = setup_two_node_pipeline().await;
+
+    // Allocate caches for 3 sequences
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 2).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 3).await.unwrap();
+
+    assert!(pipeline.is_allocated(1));
+    assert!(pipeline.is_allocated(2));
+    assert!(pipeline.is_allocated(3));
+
+    // Abort all
+    let aborted = pipeline.abort_all_sequences(&mut registry).await;
+    assert_eq!(aborted.len(), 3);
+    assert!(aborted.contains(&1));
+    assert!(aborted.contains(&2));
+    assert!(aborted.contains(&3));
+
+    // All freed
+    assert!(!pipeline.is_allocated(1));
+    assert!(!pipeline.is_allocated(2));
+    assert!(!pipeline.is_allocated(3));
+}
+
+#[tokio::test]
+async fn test_pipeline_order_excludes_dead_workers() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Initially both in pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 2);
+
+    // Kill head
+    registry.mark_dead("head");
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+}
+
+#[tokio::test]
+async fn test_reregister_reconnection_handshake() {
+    // Simulate the full reconnection flow:
+    // Worker connects → sends ReRegister → receives RegisterAck → sends WorkerReady
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let worker_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        // Send ReRegister
+        let rereg = ReRegisterPayload {
+            node_id: "worker-0".into(),
+            gpu_model: "Mock GPU".into(),
+            gpu_memory_total: 24_000_000_000,
+            gpu_memory_available: 20_000_000_000,
+            compute_capability: (8, 0),
+            decode_ms_per_layer: 1.0,
+            prefill_ms_per_layer_128: 3.0,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![],
+        };
+        conn.send(MessageType::ReRegister, 0, &rereg).await.unwrap();
+
+        // Receive RegisterAck (assignment unchanged)
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::RegisterAck);
+        let ack: RegisterAckPayload =
+            FramedConnection::deserialize_payload(&payload).unwrap();
+        assert_eq!(ack.layer_start, 0);
+        assert_eq!(ack.layer_end, 16);
+
+        // Send WorkerReady
+        conn.send_empty(MessageType::WorkerReady, 0).await.unwrap();
+    });
+
+    // Coordinator side
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Receive ReRegister
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ReRegister);
+    let rereg: ReRegisterPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(rereg.node_id, "worker-0");
+    assert_eq!(rereg.current_layer_start, Some(0));
+
+    // Send RegisterAck (same assignment)
+    let ack = RegisterAckPayload {
+        layer_start: 0,
+        layer_end: 16,
+        total_layers: 32,
+        max_seq_len: 4096,
+        model_config: fracture_core::ModelConfig {
+            hidden_size: 4096,
+            num_layers: 32,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
+            vocab_size: 128256,
+            rope_theta: 500000.0,
+            rms_norm_eps: 1e-5,
+            max_seq_len: 8192,
+        },
+    };
+    conn.send(MessageType::RegisterAck, 0, &ack).await.unwrap();
+
+    // Receive WorkerReady
+    let (header, _) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::WorkerReady);
+
+    worker_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_forced_rebalance_excludes_dead_worker() {
+    use fracture_coordinator::rebalance;
+    use fracture_coordinator::scheduler::SchedulingMode;
+    use std::sync::Arc;
+
+    let (pipeline, registry, _tasks) = setup_three_node_reconfigurable().await;
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+
+    // Mark middle worker (w1) as dead
+    {
+        let mut reg = registry.lock().await;
+        reg.mark_dead("w1");
+    }
+
+    let model_config = fracture_core::ModelConfig {
+        hidden_size: 4096,
+        num_layers: 32,
+        num_q_heads: 32,
+        num_kv_heads: 8,
+        head_dim: 128,
+        intermediate_size: 14336,
+        vocab_size: 128256,
+        rope_theta: 500000.0,
+        rms_norm_eps: 1e-5,
+        max_seq_len: 8192,
+    };
+
+    // Forced rebalance excluding dead worker
+    let result = rebalance::forced_rebalance(
+        &registry,
+        &pipeline,
+        &model_config,
+        &SchedulingMode::EqualSplit,
+        4096,
+        &["w1".to_string()],
+    )
+    .await
+    .unwrap();
+
+    // Pipeline should have 2 stages (w0, w2), covering all 32 layers
+    assert_eq!(result.pipeline.pipeline_order().len(), 2);
+    assert_eq!(result.assignments.len(), 2);
+
+    // Verify all layers are covered
+    let total_layers: usize = result
+        .assignments
+        .iter()
+        .map(|a| a.layer_range.len())
+        .sum();
+    assert_eq!(total_layers, 32);
+
+    // Verify w1 is not in assignments
+    assert!(result
+        .assignments
+        .iter()
+        .all(|a| a.node_id != "w1"));
+}
+
+#[tokio::test]
+async fn test_draining_worker_excluded_from_pipeline_order() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Both workers in pipeline
+    assert_eq!(registry.pipeline_order().len(), 2);
+
+    // Mark head as draining
+    registry.mark_draining("head");
+
+    // Draining worker excluded from pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+
+    // But still in all_capabilities (for rescheduling)
+    let caps = registry.all_capabilities();
+    assert_eq!(caps.len(), 2);
+}
+
+#[tokio::test]
+async fn test_pending_worker_in_capabilities_not_pipeline() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Mark head as pending (simulating a new join before rebalance)
+    registry.mark_pending("head");
+
+    // Pending worker NOT in pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+
+    // But IS in all_capabilities (scheduler can assign it layers)
+    let caps = registry.all_capabilities();
+    assert_eq!(caps.len(), 2);
+
+    // pending_workers returns it
+    let pending = registry.pending_workers();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0], "head");
+}
+
+// =========================================================================
+// Seed Node Discovery Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_who_is_coordinator_over_wire() {
+    // Test WhoIsCoordinator request/response round-trip
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Simulate a seed node that knows the coordinator
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::WhoIsCoordinator);
+        let req: WhoIsCoordinatorPayload =
+            FramedConnection::deserialize_payload(&payload).unwrap();
+        assert_eq!(req.node_id, "new-worker");
+
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: Some("192.168.1.100:9400".into()),
+            term: 3,
+            manifest: Some(ClusterManifestPayload {
+                version: 5,
+                term: 3,
+                nodes: vec![
+                    NodeInfo {
+                        node_id: "coordinator".into(),
+                        address: "192.168.1.100:9400".into(),
+                        election_priority: 0,
+                        coordinator_capable: true,
+                        role: fracture_protocol::messages::NodeRole::Coordinator,
+                    },
+                ],
+            }),
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    // New worker queries the seed
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    let req = WhoIsCoordinatorPayload {
+        node_id: "new-worker".into(),
+    };
+    conn.send(MessageType::WhoIsCoordinator, 0, &req)
+        .await
+        .unwrap();
+
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::WhoIsCoordinatorResponse);
+    let resp: WhoIsCoordinatorResponsePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(resp.coordinator_addr, Some("192.168.1.100:9400".into()));
+    assert_eq!(resp.term, 3);
+    assert!(resp.manifest.is_some());
+    let manifest = resp.manifest.unwrap();
+    assert_eq!(manifest.nodes.len(), 1);
+    assert_eq!(manifest.nodes[0].node_id, "coordinator");
+
+    seed_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_who_is_coordinator_unknown() {
+    // Seed node doesn't know the coordinator (mid-election)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await.unwrap();
+
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: None,
+            term: 0,
+            manifest: None,
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    conn.send(
+        MessageType::WhoIsCoordinator,
+        0,
+        &WhoIsCoordinatorPayload {
+            node_id: "joiner".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_, payload) = conn.recv().await.unwrap();
+    let resp: WhoIsCoordinatorResponsePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert!(resp.coordinator_addr.is_none());
+
+    seed_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_seed_discovery_skips_unreachable_tries_next() {
+    // First seed is unreachable, second seed responds
+    let unreachable_addr = "127.0.0.1:1"; // port 1 is almost certainly refused
+    let good_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good_listener.local_addr().unwrap();
+
+    let seed_task = tokio::spawn(async move {
+        let (stream, _) = good_listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let _ = conn.recv().await.unwrap();
+        let resp = WhoIsCoordinatorResponsePayload {
+            coordinator_addr: Some("10.0.0.1:9400".into()),
+            term: 1,
+            manifest: None,
+        };
+        conn.send(MessageType::WhoIsCoordinatorResponse, 0, &resp)
+            .await
+            .unwrap();
+    });
+
+    // Use discover_coordinator-like logic inline (can't call the worker's function directly)
+    let seeds = vec![unreachable_addr.to_string(), good_addr.to_string()];
+    let mut found = None;
+
+    for seed in &seeds {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(seed),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                let mut conn = FramedConnection::new(stream);
+                conn.send(
+                    MessageType::WhoIsCoordinator,
+                    0,
+                    &WhoIsCoordinatorPayload {
+                        node_id: "test".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let (_, payload) = conn.recv().await.unwrap();
+                let resp: WhoIsCoordinatorResponsePayload =
+                    FramedConnection::deserialize_payload(&payload).unwrap();
+                if let Some(addr) = resp.coordinator_addr {
+                    found = Some(addr);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert_eq!(found, Some("10.0.0.1:9400".into()));
+    seed_task.await.unwrap();
 }

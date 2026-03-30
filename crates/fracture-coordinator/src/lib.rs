@@ -3,6 +3,7 @@
 
 pub mod heartbeat;
 pub mod pipeline;
+pub mod rebalance;
 pub mod registry;
 pub mod scheduler;
 pub mod state;

@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+"Bash(cargo nextest:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo tree:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git merge:*)",
+      "Bash(git log:*)",
+      "Bash(git stash:*)",
+      "Bash(git push:*)",
+      "Bash(git -C:*)",
+      "Bash(vex validate:*)",
+      "Bash(vex check:*)",
+      "Bash(vex guide:*)",
+      "Bash(vex update:*)",
+      "Bash(nvcc --list-gpu-arch)",
+      "Bash(nvcc --help)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)"
+    ]
+  }
+}

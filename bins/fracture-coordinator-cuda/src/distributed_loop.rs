@@ -4,16 +4,24 @@
 //! Instead of calling `batched_forward()` on a local engine, it sends
 //! `BatchedForward` messages through the distributed pipeline. Cache is
 //! managed on workers via `alloc_cache`/`free_cache`.
+//!
+//! Heartbeats are sent inline between batch iterations. On worker death,
+//! all active sequences are aborted and the pipeline is flagged as degraded.
 
+use fracture_coordinator::heartbeat::{self, HeartbeatTracker};
 use fracture_coordinator::pipeline::DistributedPipeline;
 use fracture_coordinator::registry::PeerRegistry;
 use fracture_engine::{GenerationEvent, PendingRequest};
 use fracture_generate::{Sampler, SamplingParams, StopReason};
-use fracture_protocol::messages::SequenceMetadataWire;
+use fracture_protocol::connection::FramedConnection;
+use fracture_protocol::frame::MessageType;
+use fracture_protocol::messages::{HeartbeatAckPayload, HeartbeatPayload, SequenceMetadataWire};
+use fracture_protocol::FramedReader;
 use fracture_server::SchedulerHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch, Mutex};
 
 /// An active distributed sequence.
 struct DistributedSequence {
@@ -40,6 +48,16 @@ pub struct DistributedLoopConfig {
     pub max_prefill_tokens: usize,
     /// Minimum free blocks on the bottleneck worker before admitting new sequences.
     pub min_free_blocks_reserve: u32,
+    /// Heartbeat interval.
+    pub heartbeat_interval: Duration,
+    /// Max missed heartbeats before marking a worker dead.
+    pub heartbeat_max_missed: usize,
+    /// Model config (needed for rebalancing after worker death).
+    pub model_config: Option<fracture_core::ModelConfig>,
+    /// Scheduling mode (needed for rebalancing).
+    pub scheduling_mode: fracture_coordinator::scheduler::SchedulingMode,
+    /// Max sequence length (needed for rebalancing).
+    pub max_seq_len: usize,
 }
 
 impl Default for DistributedLoopConfig {
@@ -49,6 +67,11 @@ impl Default for DistributedLoopConfig {
             max_batch_tokens: 4096,
             max_prefill_tokens: 512,
             min_free_blocks_reserve: 4,
+            heartbeat_interval: heartbeat::DEFAULT_INTERVAL,
+            heartbeat_max_missed: heartbeat::DEFAULT_MAX_MISSED,
+            model_config: None,
+            scheduling_mode: fracture_coordinator::scheduler::SchedulingMode::Auto,
+            max_seq_len: 4096,
         }
     }
 }
@@ -56,29 +79,44 @@ impl Default for DistributedLoopConfig {
 /// Start the distributed scheduler loop as a background tokio task.
 ///
 /// Returns a SchedulerHandle compatible with `BatchedAppState`.
+///
+/// The `pipeline_rx` channel receives pipeline updates when the pipeline
+/// is reconfigured after worker death/reconnection.
 pub fn start_distributed_loop(
     pipeline: Arc<DistributedPipeline>,
     registry: Arc<Mutex<PeerRegistry>>,
     config: DistributedLoopConfig,
+    pipeline_rx: watch::Receiver<Arc<DistributedPipeline>>,
 ) -> SchedulerHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = SchedulerHandle::from_sender(tx);
 
-    tokio::spawn(distributed_loop_task(pipeline, registry, rx, config));
+    tokio::spawn(distributed_loop_task(pipeline, registry, rx, config, pipeline_rx));
 
     handle
 }
 
 async fn distributed_loop_task(
-    pipeline: Arc<DistributedPipeline>,
+    mut pipeline: Arc<DistributedPipeline>,
     registry: Arc<Mutex<PeerRegistry>>,
     mut request_rx: mpsc::UnboundedReceiver<PendingRequest>,
     config: DistributedLoopConfig,
+    mut pipeline_rx: watch::Receiver<Arc<DistributedPipeline>>,
 ) {
     let mut pending: Vec<PendingRequest> = Vec::new();
     let mut active: HashMap<u64, DistributedSequence> = HashMap::new();
+    let mut last_heartbeat = Instant::now();
+    let mut tracker = HeartbeatTracker::new();
+    let mut pipeline_degraded = false;
 
     loop {
+        // Check for pipeline reconfiguration.
+        if pipeline_rx.has_changed().unwrap_or(false) {
+            pipeline = pipeline_rx.borrow_and_update().clone();
+            pipeline_degraded = false;
+            tracing::info!("distributed loop received reconfigured pipeline");
+        }
+
         // Drain all pending requests from the channel.
         loop {
             match request_rx.try_recv() {
@@ -93,11 +131,232 @@ async fn distributed_loop_task(
             }
         }
 
-        // If no work, wait for the next request.
+        // Heartbeat: poll acks for the current nonce, then evaluate misses,
+        // then send a fresh heartbeat. This order ensures workers have the
+        // full interval to respond before being judged.
+        if last_heartbeat.elapsed() >= config.heartbeat_interval {
+            // 1. Poll acks for the nonce we sent last round.
+            //    Workers had the full interval to respond; collect now.
+            if tracker.pending_nonce().is_some() {
+                let reader_handles = {
+                    let reg = registry.lock().await;
+                    reg.reader_handles()
+                };
+                let acks = poll_worker_acks_concurrent(&reader_handles).await;
+
+                // Process acks through the tracker (validates nonce, resets missed count).
+                // Also detect any LeaveIntent messages.
+                let mut leaving_workers: Vec<String> = Vec::new();
+                {
+                    let mut reg = registry.lock().await;
+                    for (node_id, poll) in &acks {
+                        match poll {
+                            PollResult::Ack(ack) => {
+                                tracker.process_ack(&mut reg, node_id, ack);
+                            }
+                            PollResult::LeaveIntent => {
+                                tracing::info!("worker '{}' sent LeaveIntent — marking as draining", node_id);
+                                reg.mark_draining(node_id);
+                                leaving_workers.push(node_id.clone());
+                            }
+                            PollResult::Nothing => {}
+                        }
+                    }
+                }
+
+                // 2. Increment missed for workers that didn't ack this round.
+                let ready_node_ids = {
+                    let reg = registry.lock().await;
+                    reg.pipeline_order()
+                };
+                let dead_ids = tracker.increment_missed(
+                    &ready_node_ids,
+                    config.heartbeat_max_missed,
+                );
+                if !dead_ids.is_empty() {
+                    tracing::error!("dead workers detected: {dead_ids:?}");
+
+                    {
+                        let mut reg = registry.lock().await;
+                        heartbeat::mark_dead_workers(&mut reg, &dead_ids);
+                    }
+
+                    // Abort active sequences that used dead workers' layers.
+                    let aborted = {
+                        let mut reg = registry.lock().await;
+                        pipeline.abort_all_sequences(&mut reg).await
+                    };
+                    for seq_id in &aborted {
+                        if let Some(seq) = active.remove(seq_id) {
+                            let _ = seq.event_tx.send(GenerationEvent::Error(
+                                format!("worker died: {dead_ids:?}"),
+                            ));
+                        }
+                    }
+
+                    // Try to rebalance with remaining workers (FT-5).
+                    if let Some(ref model_cfg) = config.model_config {
+                        tracing::info!("attempting crash recovery rebalance without dead workers");
+                        match fracture_coordinator::rebalance::forced_rebalance(
+                            &registry,
+                            &pipeline,
+                            model_cfg,
+                            &config.scheduling_mode,
+                            config.max_seq_len,
+                            &dead_ids,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                pipeline = result.pipeline;
+                                tracing::info!(
+                                    "crash recovery rebalance succeeded: {} stages",
+                                    pipeline.pipeline_order().len()
+                                );
+                                // Pipeline recovered — not degraded.
+                                // Pending requests can proceed.
+                            }
+                            Err(e) => {
+                                tracing::error!("crash recovery rebalance failed: {e}");
+                                tracing::error!("pipeline degraded — waiting for manual intervention or worker reconnection");
+                                pipeline_degraded = true;
+                                for req in pending.drain(..) {
+                                    let _ = req.event_tx.send(GenerationEvent::Error(
+                                        format!("pipeline degraded: worker(s) {dead_ids:?} died"),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        // No model config — can't rebalance, fall back to old behavior.
+                        pipeline_degraded = true;
+                        for req in pending.drain(..) {
+                            let _ = req.event_tx.send(GenerationEvent::Error(
+                                format!("pipeline degraded: worker(s) {dead_ids:?} died"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 3. Send new heartbeat with fresh nonce for the next round.
+            let nonce = send_heartbeats(&registry).await;
+            tracker.set_pending_nonce(nonce);
+
+            last_heartbeat = Instant::now();
+        }
+
+        // Handle draining/pending workers when all active sequences complete.
+        if active.is_empty() && !pipeline_degraded {
+            let draining_workers: Vec<String> = {
+                let reg = registry.lock().await;
+                reg.iter()
+                    .filter(|(_, e)| e.status == fracture_coordinator::registry::WorkerStatus::Draining)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            let pending_workers: Vec<String> = {
+                let reg = registry.lock().await;
+                reg.pending_workers()
+            };
+            let needs_rebalance = !draining_workers.is_empty() || !pending_workers.is_empty();
+
+            if needs_rebalance {
+                if !draining_workers.is_empty() {
+                    tracing::info!("draining workers ready to leave: {draining_workers:?}");
+                }
+                if !pending_workers.is_empty() {
+                    tracing::info!("pending workers ready to join: {pending_workers:?}");
+                }
+
+                // Send Shutdown to draining workers and mark them dead.
+                {
+                    let mut reg = registry.lock().await;
+                    for node_id in &draining_workers {
+                        if let Some(entry) = reg.get_mut(node_id) {
+                            let _ = entry.writer.send_empty(MessageType::Shutdown, 0).await;
+                        }
+                        reg.mark_dead(node_id);
+                    }
+                }
+
+                // Rebalance: exclude draining (now dead) workers, include pending workers.
+                if let Some(ref model_cfg) = config.model_config {
+                    match fracture_coordinator::rebalance::forced_rebalance(
+                        &registry,
+                        &pipeline,
+                        model_cfg,
+                        &config.scheduling_mode,
+                        config.max_seq_len,
+                        &draining_workers,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            pipeline = result.pipeline;
+                            tracing::info!(
+                                "rebalanced (leave: {}, join: {}): {} stages",
+                                draining_workers.len(),
+                                pending_workers.len(),
+                                pipeline.pipeline_order().len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("rebalance failed: {e}");
+                            pipeline_degraded = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If pipeline is degraded, reject new requests until reconfigured.
+        if pipeline_degraded {
+            for req in pending.drain(..) {
+                let _ = req.event_tx.send(GenerationEvent::Error(
+                    "pipeline degraded: waiting for reconfiguration".to_string(),
+                ));
+            }
+            if active.is_empty() {
+                tokio::select! {
+                    _ = pipeline_rx.changed() => {
+                        pipeline = pipeline_rx.borrow_and_update().clone();
+                        pipeline_degraded = false;
+                        tracing::info!("distributed loop received reconfigured pipeline");
+                    }
+                    req = request_rx.recv() => {
+                        match req {
+                            Some(r) => pending.push(r),
+                            None => return,
+                        }
+                    }
+                }
+                continue;
+            }
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        // If no work, wait for the next request (with heartbeat timeout).
         if pending.is_empty() && active.is_empty() {
-            match request_rx.recv().await {
-                Some(req) => pending.push(req),
-                None => return,
+            let heartbeat_deadline = last_heartbeat + config.heartbeat_interval;
+            tokio::select! {
+                req = request_rx.recv() => {
+                    match req {
+                        Some(r) => pending.push(r),
+                        None => return,
+                    }
+                }
+                _ = tokio::time::sleep_until(heartbeat_deadline.into()) => {
+                    // Heartbeat timer fired while idle — loop back to send + poll.
+                    continue;
+                }
+                _ = pipeline_rx.changed() => {
+                    pipeline = pipeline_rx.borrow_and_update().clone();
+                    pipeline_degraded = false;
+                    tracing::info!("distributed loop received reconfigured pipeline");
+                    continue;
+                }
             }
         }
 
@@ -118,7 +377,7 @@ async fn distributed_loop_task(
             // Allocate cache on all workers.
             let alloc_result = {
                 let mut reg = registry.lock().await;
-                pipeline.alloc_cache(&mut reg, seq_id, 0).await
+                pipeline.alloc_cache(&mut reg, seq_id).await
             };
 
             match alloc_result {
@@ -161,7 +420,6 @@ async fn distributed_loop_task(
         let mut batch_seq_ids: Vec<u64> = Vec::new();
         let mut batch_is_prefill: Vec<bool> = Vec::new();
         let mut all_token_ids: Vec<u32> = Vec::new();
-        let mut all_positions: Vec<u32> = Vec::new();
         let mut seq_metas: Vec<SequenceMetadataWire> = Vec::new();
         let mut total_tokens = 0usize;
 
@@ -194,7 +452,6 @@ async fn distributed_loop_task(
                 last_block_tokens: 0,
             });
             all_token_ids.extend_from_slice(&chunk_tokens);
-            all_positions.extend_from_slice(&chunk_positions);
             batch_seq_ids.push(seq.seq_id);
             batch_is_prefill.push(true);
             total_tokens += chunk_size;
@@ -225,7 +482,6 @@ async fn distributed_loop_task(
                 last_block_tokens: 0,
             });
             all_token_ids.push(last_token);
-            all_positions.push(seq.current_pos as u32);
             batch_seq_ids.push(seq.seq_id);
             batch_is_prefill.push(false);
             total_tokens += 1;
@@ -241,21 +497,21 @@ async fn distributed_loop_task(
         let forward_result = {
             let mut reg = registry.lock().await;
             pipeline
-                .batched_forward(&mut reg, &seq_metas, &all_token_ids, &all_positions, is_prefill)
+                .batched_forward(&mut reg, &seq_metas, &all_token_ids, is_prefill)
                 .await
         };
 
         let per_seq_logits = match forward_result {
             Ok(logits) => logits,
             Err(e) => {
-                // Abort all sequences in this batch.
+                // Forward failed — could be a dead worker. Abort all sequences in batch.
                 let mut reg = registry.lock().await;
                 for seq_id in &batch_seq_ids {
                     if let Some(seq) = active.remove(seq_id) {
                         let _ = seq.event_tx.send(GenerationEvent::Error(
                             format!("forward pass failed: {e}"),
                         ));
-                        let _ = pipeline.free_cache(&mut reg, seq.seq_id).await;
+                        pipeline.free_cache_best_effort(&mut reg, seq.seq_id).await;
                     }
                 }
                 continue;
@@ -342,4 +598,77 @@ async fn distributed_loop_task(
             }
         }
     }
+}
+
+/// Send heartbeat pings to all ready workers. Returns the nonce used.
+async fn send_heartbeats(registry: &Mutex<PeerRegistry>) -> u64 {
+    let mut reg = registry.lock().await;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let nonce: u64 = rand::random();
+    let payload = HeartbeatPayload {
+        timestamp_ns: now_ns,
+        nonce,
+    };
+    let node_ids = reg.pipeline_order();
+    for node_id in &node_ids {
+        if let Some(entry) = reg.get_mut(node_id) {
+            let _ = entry.writer.send(MessageType::Heartbeat, 0, &payload).await;
+        }
+    }
+    nonce
+}
+
+/// Result of polling a single worker during heartbeat phase.
+enum PollResult {
+    Ack(HeartbeatAckPayload),
+    LeaveIntent,
+    Nothing,
+}
+
+/// Poll all worker readers concurrently for heartbeat acks and leave intents.
+///
+/// Each reader is polled independently with a short timeout.
+async fn poll_worker_acks_concurrent(
+    reader_handles: &[(String, Arc<tokio::sync::Mutex<FramedReader>>)],
+) -> Vec<(String, PollResult)> {
+    let mut set = tokio::task::JoinSet::new();
+
+    for (node_id, reader) in reader_handles {
+        let node_id = node_id.clone();
+        let reader = reader.clone();
+        set.spawn(async move {
+            let result = tokio::time::timeout(Duration::from_millis(100), async {
+                let mut r = reader.lock().await;
+                r.recv().await
+            })
+            .await;
+
+            let poll = match result {
+                Ok(Ok((header, payload)))
+                    if header.msg_type == MessageType::HeartbeatAck =>
+                {
+                    match FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload) {
+                        Ok(ack) => PollResult::Ack(ack),
+                        Err(_) => PollResult::Nothing,
+                    }
+                }
+                Ok(Ok((header, _)))
+                    if header.msg_type == MessageType::LeaveIntent =>
+                {
+                    PollResult::LeaveIntent
+                }
+                _ => PollResult::Nothing,
+            };
+            (node_id, poll)
+        });
+    }
+
+    let mut results = Vec::with_capacity(reader_handles.len());
+    while let Some(Ok(result)) = set.join_next().await {
+        results.push(result);
+    }
+    results
 }

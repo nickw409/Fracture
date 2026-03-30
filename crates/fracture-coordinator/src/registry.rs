@@ -3,8 +3,9 @@
 
 use crate::scheduler::{LayerAssignment, WorkerCapabilities};
 use fracture_core::{FractureError, Result};
-use fracture_protocol::FramedConnection;
+use fracture_protocol::{FramedConnection, FramedReader, FramedWriter};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Health status of a worker.
@@ -14,6 +15,10 @@ pub enum WorkerStatus {
     Connected,
     /// Assigned layers and ready to serve.
     Ready,
+    /// Worker has announced intent to leave; no new work should be scheduled to it.
+    Draining,
+    /// New worker waiting to be incorporated into the pipeline via rebalance.
+    Pending,
     /// Missed too many heartbeats.
     Dead,
 }
@@ -21,12 +26,15 @@ pub enum WorkerStatus {
 /// A registered worker and its associated state.
 pub struct WorkerEntry {
     pub capabilities: WorkerCapabilities,
-    pub connection: FramedConnection,
+    pub writer: FramedWriter,
+    pub reader: Arc<tokio::sync::Mutex<FramedReader>>,
     pub assignment: Option<LayerAssignment>,
     pub last_heartbeat: Instant,
     pub status: WorkerStatus,
     /// Free blocks in this worker's paged KV cache pool (from heartbeat ack).
     pub free_blocks: u32,
+    /// GPU memory used in bytes (from heartbeat ack).
+    pub gpu_memory_used: u64,
 }
 
 impl std::fmt::Debug for WorkerEntry {
@@ -59,6 +67,11 @@ impl PeerRegistry {
 
     /// Register a new worker. Returns error if a worker with the same
     /// node_id is already registered and not dead.
+    ///
+    /// The connection is split into independent writer and reader halves.
+    /// The writer stays in `WorkerEntry` for sending commands; the reader
+    /// is wrapped in `Arc<Mutex>` so it can be polled concurrently for
+    /// heartbeat acks without holding the registry lock.
     pub fn register(
         &mut self,
         capabilities: WorkerCapabilities,
@@ -74,15 +87,19 @@ impl PeerRegistry {
             )));
         }
 
+        let (writer, reader) = connection.into_split();
+
         self.workers.insert(
             node_id,
             WorkerEntry {
                 capabilities,
-                connection,
+                writer,
+                reader: Arc::new(tokio::sync::Mutex::new(reader)),
                 assignment: None,
                 last_heartbeat: Instant::now(),
                 status: WorkerStatus::Connected,
                 free_blocks: 0,
+                gpu_memory_used: 0,
             },
         );
         Ok(())
@@ -131,11 +148,38 @@ impl PeerRegistry {
         }
     }
 
+    /// Mark a worker as draining (intent to leave). No new work should be
+    /// scheduled to this worker, but existing sequences continue until complete.
+    pub fn mark_draining(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            if entry.status == WorkerStatus::Ready {
+                entry.status = WorkerStatus::Draining;
+            }
+        }
+    }
+
+    /// Mark a worker as pending (waiting to join the pipeline via rebalance).
+    pub fn mark_pending(&mut self, node_id: &str) {
+        if let Some(entry) = self.workers.get_mut(node_id) {
+            entry.status = WorkerStatus::Pending;
+        }
+    }
+
+    /// Return node IDs of workers in Pending status.
+    pub fn pending_workers(&self) -> Vec<String> {
+        self.workers
+            .iter()
+            .filter(|(_, e)| e.status == WorkerStatus::Pending)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Update a worker's last heartbeat time and block pool stats.
-    pub fn record_heartbeat(&mut self, node_id: &str, free_blocks: u32) {
+    pub fn record_heartbeat(&mut self, node_id: &str, free_blocks: u32, gpu_memory_used: u64) {
         if let Some(entry) = self.workers.get_mut(node_id) {
             entry.last_heartbeat = Instant::now();
             entry.free_blocks = free_blocks;
+            entry.gpu_memory_used = gpu_memory_used;
         }
     }
 
@@ -185,16 +229,21 @@ impl PeerRegistry {
             .count()
     }
 
-    /// Check all workers for missed heartbeats. Returns node IDs of
-    /// workers that have exceeded the timeout.
-    pub fn check_heartbeats(&self, timeout: std::time::Duration) -> Vec<String> {
-        let now = Instant::now();
+    /// Collect reader handles for all ready workers.
+    ///
+    /// Returns `(node_id, Arc<Mutex<FramedReader>>)` pairs. The caller can
+    /// release the registry lock and poll all readers concurrently.
+    pub fn reader_handles(&self) -> Vec<(String, Arc<tokio::sync::Mutex<FramedReader>>)> {
         self.workers
             .values()
-            .filter(|e| e.status == WorkerStatus::Ready)
-            .filter(|e| now.duration_since(e.last_heartbeat) > timeout)
-            .map(|e| e.capabilities.node_id.clone())
+            .filter(|e| e.status == WorkerStatus::Ready && e.assignment.is_some())
+            .map(|e| (e.capabilities.node_id.clone(), e.reader.clone()))
             .collect()
+    }
+
+    /// Iterate over immutable entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &WorkerEntry)> {
+        self.workers.iter()
     }
 
     /// Iterate over mutable entries (for sending messages to all workers).
@@ -290,29 +339,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_check() {
+    async fn test_reader_handles_returns_ready_workers() {
         let mut reg = PeerRegistry::new();
         reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        // No workers are Ready yet (only Connected), so no reader handles.
+        assert!(reg.reader_handles().is_empty());
+
         reg.assign(
             "w1",
             LayerAssignment {
                 node_id: "w1".into(),
-                layer_range: 0..32,
+                layer_range: 0..16,
                 role: NodeRole::Head,
-                expected_decode_ms: 32.0,
-                weight_memory_gb: 12.0,
-                cache_memory_gb: 2.0,
+                expected_decode_ms: 16.0,
+                weight_memory_gb: 6.0,
+                cache_memory_gb: 1.0,
             },
         )
         .unwrap();
 
-        // Just registered — should not be timed out with a 15s timeout
-        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(15));
-        assert!(timed_out.is_empty());
-
-        // With zero timeout, should immediately be detected
-        let timed_out = reg.check_heartbeats(std::time::Duration::ZERO);
-        assert_eq!(timed_out, vec!["w1"]);
+        let handles = reg.reader_handles();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].0, "w1");
     }
 
     #[tokio::test]
@@ -493,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_record_heartbeat_updates_timestamp() {
+    async fn test_record_heartbeat_updates_stats() {
         let mut reg = PeerRegistry::new();
         reg.register(test_caps("w1"), dummy_connection().await).unwrap();
         reg.assign(
@@ -504,16 +554,10 @@ mod tests {
             },
         ).unwrap();
 
-        // Should be timed out with zero timeout
-        assert!(!reg.check_heartbeats(std::time::Duration::ZERO).is_empty());
-
-        // Record heartbeat, then check with a generous timeout — should pass
-        reg.record_heartbeat("w1", 100);
-        let timed_out = reg.check_heartbeats(std::time::Duration::from_secs(60));
-        assert!(timed_out.is_empty());
-
-        // Verify free_blocks was stored
+        // Record heartbeat and verify stats are stored
+        reg.record_heartbeat("w1", 100, 4_000_000_000);
         assert_eq!(reg.get("w1").unwrap().free_blocks, 100);
+        assert_eq!(reg.get("w1").unwrap().gpu_memory_used, 4_000_000_000);
     }
 
     #[tokio::test]
@@ -535,7 +579,7 @@ mod tests {
             cache_memory_gb: 1.0,
         };
         reg.assign("w1", assign("w1", 0, 32)).unwrap();
-        reg.record_heartbeat("w1", 50);
+        reg.record_heartbeat("w1", 50, 0);
         assert_eq!(reg.min_free_blocks(), 50);
     }
 
@@ -556,8 +600,8 @@ mod tests {
         reg.assign("w1", assign("w1", 0, 16)).unwrap();
         reg.assign("w2", assign("w2", 16, 32)).unwrap();
 
-        reg.record_heartbeat("w1", 200);
-        reg.record_heartbeat("w2", 75);
+        reg.record_heartbeat("w1", 200, 0);
+        reg.record_heartbeat("w2", 75, 0);
 
         // Bottleneck is w2 with 75 free blocks
         assert_eq!(reg.min_free_blocks(), 75);
@@ -580,11 +624,137 @@ mod tests {
         reg.assign("w1", assign("w1", 0, 16)).unwrap();
         reg.assign("w2", assign("w2", 16, 32)).unwrap();
 
-        reg.record_heartbeat("w1", 200);
-        reg.record_heartbeat("w2", 10);
+        reg.record_heartbeat("w1", 200, 0);
+        reg.record_heartbeat("w2", 10, 0);
 
         // Mark the bottleneck as dead — should be excluded
         reg.mark_dead("w2");
         assert_eq!(reg.min_free_blocks(), 200);
+    }
+
+    fn make_assignment(id: &str, start: usize, end: usize) -> LayerAssignment {
+        LayerAssignment {
+            node_id: id.into(),
+            layer_range: start..end,
+            role: if start == 0 { NodeRole::Head } else { NodeRole::Tail },
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mark_draining_from_ready() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign("w1", make_assignment("w1", 0, 32)).unwrap();
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Ready);
+
+        reg.mark_draining("w1");
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Draining);
+    }
+
+    #[tokio::test]
+    async fn test_mark_draining_from_non_ready_is_noop() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        // Worker is Connected (not Ready)
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+
+        reg.mark_draining("w1");
+        // Should still be Connected — mark_draining only transitions Ready → Draining
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_mark_pending() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+
+        reg.mark_pending("w1");
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_pending_workers_returns_pending_only() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w3"), dummy_connection().await).unwrap();
+
+        // w1 stays Connected, w2 becomes Ready, w3 becomes Pending
+        reg.assign("w2", make_assignment("w2", 0, 16)).unwrap();
+        reg.mark_pending("w3");
+
+        let pending = reg.pending_workers();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], "w3");
+    }
+
+    #[tokio::test]
+    async fn test_pending_workers_empty_when_none() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign("w1", make_assignment("w1", 0, 32)).unwrap();
+
+        let pending = reg.pending_workers();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_all_capabilities_includes_pending() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 16)).unwrap();
+        reg.mark_pending("w2");
+
+        let caps = reg.all_capabilities();
+        let ids: Vec<&str> = caps.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(caps.len(), 2);
+        assert!(ids.contains(&"w1"), "Ready worker should be included");
+        assert!(ids.contains(&"w2"), "Pending worker should be included");
+    }
+
+    #[tokio::test]
+    async fn test_all_capabilities_includes_draining() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 16)).unwrap();
+        reg.assign("w2", make_assignment("w2", 16, 32)).unwrap();
+        reg.mark_draining("w2");
+
+        let caps = reg.all_capabilities();
+        let ids: Vec<&str> = caps.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(caps.len(), 2);
+        assert!(ids.contains(&"w1"), "Ready worker should be included");
+        assert!(ids.contains(&"w2"), "Draining worker should be included");
+    }
+
+    #[tokio::test]
+    async fn test_draining_excluded_from_pipeline_order() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w3"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 10)).unwrap();
+        reg.assign("w2", make_assignment("w2", 10, 20)).unwrap();
+        reg.assign("w3", make_assignment("w3", 20, 32)).unwrap();
+
+        // All three should be in pipeline order initially
+        assert_eq!(reg.pipeline_order().len(), 3);
+
+        // Mark w2 as draining — it should be excluded from pipeline_order
+        reg.mark_draining("w2");
+        let order = reg.pipeline_order();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], "w1");
+        assert_eq!(order[1], "w3");
+        assert!(!order.contains(&"w2".to_string()), "draining worker should not be in pipeline order");
     }
 }

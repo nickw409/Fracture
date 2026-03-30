@@ -17,7 +17,7 @@ pub mod messages;
 pub mod tensor;
 
 // Re-export key types for convenience
-pub use connection::FramedConnection;
+pub use connection::{FramedConnection, FramedReader, FramedWriter};
 pub use frame::{FrameHeader, MessageType};
 pub use messages::*;
 pub use tensor::TensorWireHeader;

@@ -1,9 +1,206 @@
 use crate::kv_cache::CacheHandle;
 use crate::node::{NodeConfig, NodeOutput};
 use crate::paged_kv_cache::PagedKvCacheManager;
+use crate::quantized_paged_kv_cache::QuantizedKvCacheManager;
 use fracture_core::{Backend, DType, DeviceTensor, FractureError, Result};
 use fracture_gguf::WeightStore;
 use std::ops::Range;
+
+/// Trait abstracting paged KV cache operations for batched forward passes.
+///
+/// Both `PagedKvCacheManager` (FP16) and `QuantizedKvCacheManager` (TurboQuant)
+/// implement this trait. The batched forward functions are generic over `C: PagedCache`,
+/// so the same forward-pass code works with either cache backend.
+///
+/// The key method is `dispatch_attention` — each implementation knows its own
+/// data layout (FP16 block tensors vs packed indices + norms + rotation matrices)
+/// and calls the appropriate Backend method internally.
+pub trait PagedCache {
+    fn seq_len(&self, handle: CacheHandle) -> Result<usize>;
+    fn block_table(&self, handle: CacheHandle) -> Result<&[usize]>;
+    fn num_free_blocks(&self) -> usize;
+
+    fn append_kv<B: Backend>(
+        &mut self,
+        handle: CacheHandle,
+        layer: usize,
+        keys: &DeviceTensor,
+        values: &DeviceTensor,
+        backend: &B,
+    ) -> Result<()>;
+
+    /// Dispatch attention for a single sequence at a given cache layer index.
+    ///
+    /// FP16 paged: gathers block tensors, calls `backend.attention_paged`.
+    /// TurboQuant: gathers packed/norm tensors + rotation matrices + centroids,
+    ///             calls `backend.attention_paged_tq`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attention<B: Backend>(
+        &self,
+        backend: &B,
+        q_slice: &DeviceTensor,
+        handle: CacheHandle,
+        cache_idx: usize,
+        num_kv_heads: usize,
+        kv_len: usize,
+        start_pos: usize,
+        out: &DeviceTensor,
+    ) -> Result<()>;
+
+    fn alloc(&mut self) -> Result<CacheHandle>;
+    fn free(&mut self, handle: CacheHandle) -> Result<()>;
+}
+
+impl PagedCache for PagedKvCacheManager {
+    fn seq_len(&self, handle: CacheHandle) -> Result<usize> {
+        self.seq_len(handle)
+    }
+
+    fn block_table(&self, handle: CacheHandle) -> Result<&[usize]> {
+        self.block_table(handle)
+    }
+
+    fn num_free_blocks(&self) -> usize {
+        self.num_free_blocks()
+    }
+
+    fn append_kv<B: Backend>(
+        &mut self,
+        handle: CacheHandle,
+        layer: usize,
+        keys: &DeviceTensor,
+        values: &DeviceTensor,
+        backend: &B,
+    ) -> Result<()> {
+        self.append_kv(handle, layer, keys, values, backend)
+    }
+
+    fn dispatch_attention<B: Backend>(
+        &self,
+        backend: &B,
+        q_slice: &DeviceTensor,
+        handle: CacheHandle,
+        cache_idx: usize,
+        num_kv_heads: usize,
+        kv_len: usize,
+        start_pos: usize,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        let block_table = self.block_table(handle)?;
+        let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+
+        let pool = self.pool();
+        let k_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.k_tensor(bid, cache_idx))
+            .collect();
+        let v_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.v_tensor(bid, cache_idx))
+            .collect();
+
+        backend.attention_paged(
+            q_slice,
+            &block_table_i32,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            kv_len,
+            start_pos,
+            out,
+        )
+    }
+
+    fn alloc(&mut self) -> Result<CacheHandle> {
+        self.alloc()
+    }
+
+    fn free(&mut self, handle: CacheHandle) -> Result<()> {
+        self.free(handle)
+    }
+}
+
+impl PagedCache for QuantizedKvCacheManager {
+    fn seq_len(&self, handle: CacheHandle) -> Result<usize> {
+        self.seq_len(handle)
+    }
+
+    fn block_table(&self, handle: CacheHandle) -> Result<&[usize]> {
+        self.block_table(handle)
+    }
+
+    fn num_free_blocks(&self) -> usize {
+        self.num_free_blocks()
+    }
+
+    fn append_kv<B: Backend>(
+        &mut self,
+        handle: CacheHandle,
+        layer: usize,
+        keys: &DeviceTensor,
+        values: &DeviceTensor,
+        backend: &B,
+    ) -> Result<()> {
+        self.append_kv(handle, layer, keys, values, backend)
+    }
+
+    fn dispatch_attention<B: Backend>(
+        &self,
+        backend: &B,
+        q_slice: &DeviceTensor,
+        handle: CacheHandle,
+        cache_idx: usize,
+        num_kv_heads: usize,
+        kv_len: usize,
+        start_pos: usize,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        let block_table = self.block_table(handle)?;
+        let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
+
+        let pool = self.pool();
+        let k_packed: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.k_packed(bid, cache_idx))
+            .collect();
+        let k_norms: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.k_norms(bid, cache_idx))
+            .collect();
+        let v_packed: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.v_packed(bid, cache_idx))
+            .collect();
+        let v_norms: Vec<&DeviceTensor> = (0..pool.capacity())
+            .map(|bid| pool.v_norms(bid, cache_idx))
+            .collect();
+
+        let key_bits = pool.key_bits_for_layer(cache_idx);
+        let value_bits = pool.value_bits_for_layer(cache_idx);
+
+        backend.attention_paged_tq(
+            q_slice,
+            &block_table_i32,
+            &k_packed,
+            &k_norms,
+            &v_packed,
+            &v_norms,
+            pool.k_rotation(cache_idx),
+            pool.v_rotation(cache_idx),
+            pool.centroids(key_bits),
+            pool.centroids(value_bits),
+            key_bits,
+            value_bits,
+            num_kv_heads,
+            kv_len,
+            start_pos,
+            out,
+        )
+    }
+
+    fn alloc(&mut self) -> Result<CacheHandle> {
+        self.alloc()
+    }
+
+    fn free(&mut self, handle: CacheHandle) -> Result<()> {
+        self.free(handle)
+    }
+}
 
 /// A single sequence's contribution to a batched forward pass.
 pub struct SequenceSlice {
@@ -30,11 +227,11 @@ pub struct BatchedOutput {
 /// RoPE, FFN) are concatenated into a single large tensor for GPU
 /// efficiency. Attention is dispatched per-sequence since each has
 /// its own block table.
-pub fn batched_forward<B: Backend>(
+pub fn batched_forward<B: Backend, C: PagedCache>(
     backend: &B,
     weights: &WeightStore,
     layer_range: &Range<usize>,
-    cache: &mut PagedKvCacheManager,
+    cache: &mut C,
     sequences: &[SequenceSlice],
 ) -> Result<BatchedOutput> {
     if sequences.is_empty() {
@@ -167,26 +364,9 @@ pub fn batched_forward<B: Backend>(
 
             let attn_slice = backend.alloc(&[n, num_q_heads, head_dim], DType::FP16)?;
 
-            let block_table = cache.block_table(seq.handle)?;
-            let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
-
-            let pool = cache.pool();
-            let k_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.k_tensor(bid, cache_idx))
-                .collect();
-            let v_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.v_tensor(bid, cache_idx))
-                .collect();
-
-            backend.attention_paged(
-                &q_slice,
-                &block_table_i32,
-                &k_blocks,
-                &v_blocks,
-                num_kv_heads,
-                new_seq_len,
-                start_pos,
-                &attn_slice,
+            cache.dispatch_attention(
+                backend, &q_slice, seq.handle, cache_idx,
+                num_kv_heads, new_seq_len, start_pos, &attn_slice,
             )?;
 
             // Copy attention output back into the batched buffer
@@ -281,11 +461,11 @@ pub fn batched_forward<B: Backend>(
 /// The `sequences` slice provides per-sequence cache handles and positions.
 /// For head nodes, token IDs come from `SequenceSlice::token_ids`.
 /// For middle/tail nodes, activations are provided via `input_hidden_states`.
-pub fn batched_forward_node<B: Backend>(
+pub fn batched_forward_node<B: Backend, C: PagedCache>(
     backend: &B,
     weights: &WeightStore,
     node_config: &NodeConfig,
-    cache: &mut PagedKvCacheManager,
+    cache: &mut C,
     sequences: &[SequenceSlice],
     input_hidden_states: Option<DeviceTensor>,
 ) -> Result<NodeOutput> {
@@ -445,26 +625,9 @@ pub fn batched_forward_node<B: Backend>(
 
             let attn_slice = backend.alloc(&[n, num_q_heads, head_dim], DType::FP16)?;
 
-            let block_table = cache.block_table(seq.handle)?;
-            let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
-
-            let pool = cache.pool();
-            let k_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.k_tensor(bid, cache_idx))
-                .collect();
-            let v_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.v_tensor(bid, cache_idx))
-                .collect();
-
-            backend.attention_paged(
-                &q_slice,
-                &block_table_i32,
-                &k_blocks,
-                &v_blocks,
-                num_kv_heads,
-                new_seq_len,
-                start_pos,
-                &attn_slice,
+            cache.dispatch_attention(
+                backend, &q_slice, seq.handle, cache_idx,
+                num_kv_heads, new_seq_len, start_pos, &attn_slice,
             )?;
 
             let attn_out_mh = DeviceTensor::new(

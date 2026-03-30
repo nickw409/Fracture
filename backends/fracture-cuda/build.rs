@@ -16,6 +16,9 @@ fn main() {
         "attention_paged.cu",
         "embedding.cu",
         "add.cu",
+        "turboquant_compress.cu",
+        "turboquant_decompress.cu",
+        "attention_paged_tq.cu",
     ];
 
     let mut objects = Vec::new();

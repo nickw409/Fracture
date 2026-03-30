@@ -144,17 +144,129 @@ pub struct HeartbeatAckPayload {
     pub free_blocks: u32,
 }
 
-// ── 0x07 CacheAlloc (Coordinator → Worker) ──────────────────────────────
-
-/// Instructs worker to allocate KV cache for a sequence.
-/// The seq_id is carried in the frame header.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheAllocPayload {
-    pub max_seq_len: u32,
-}
-
+// ── 0x07 CacheAlloc — no payload (seq_id in frame header) ──────────────
 // ── 0x08 CacheFree — no payload (seq_id in frame header) ────────────────
 // ── 0x09 Shutdown — no payload ──────────────────────────────────────────
+
+// ── 0x10 ElectionStart (Node → Peers) ───────────────────────────────────
+
+/// Broadcast by a candidate to start an election.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionStartPayload {
+    pub candidate_id: String,
+    pub priority: u32,
+    pub term: u64,
+}
+
+// ── 0x11 ElectionChallenge (Node → Candidate) ──────────────────────────
+
+/// Sent by a higher-priority node to challenge a candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionChallengePayload {
+    pub challenger_id: String,
+    pub priority: u32,
+    pub term: u64,
+}
+
+// ── 0x12 Victory (Leader → Peers) ──────────────────────────────────────
+
+/// Broadcast by the election winner to declare victory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VictoryPayload {
+    pub leader_id: String,
+    pub term: u64,
+    /// Address where the new coordinator accepts connections.
+    pub coordinator_addr: String,
+}
+
+// ── 0x13 ClusterManifest (Coordinator → Workers) ────────────────────────
+
+/// Cluster manifest broadcast to all workers for peer discovery.
+/// Workers store this locally for election and coordinator fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterManifestPayload {
+    /// Monotonic version number. Workers reject manifests with version <= current.
+    pub version: u64,
+    /// Current election term.
+    pub term: u64,
+    /// All nodes in the cluster.
+    pub nodes: Vec<NodeInfo>,
+}
+
+/// Information about a single node in the cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    /// Address for peer connections (election, reconnection).
+    pub address: String,
+    /// Election priority (lower = higher priority, 0 = highest).
+    pub election_priority: u32,
+    /// Whether this node can become coordinator.
+    pub coordinator_capable: bool,
+    /// Current role in the cluster.
+    pub role: NodeRole,
+}
+
+/// Role of a node in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    Coordinator,
+    Worker,
+    Standby,
+}
+
+// ── 0x14 ReRegister (Worker → Coordinator) ──────────────────────────────
+
+/// Worker re-registration payload sent after reconnecting to the coordinator.
+/// Carries the worker's current state so the coordinator can restore it
+/// without a full re-setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReRegisterPayload {
+    /// Same fields as RegisterPayload (capabilities).
+    pub node_id: String,
+    pub gpu_model: String,
+    pub gpu_memory_total: u64,
+    pub gpu_memory_available: u64,
+    pub compute_capability: (u32, u32),
+    pub decode_ms_per_layer: f32,
+    pub prefill_ms_per_layer_128: f32,
+    /// Current layer assignment (if Ready before disconnect).
+    pub current_layer_start: Option<u32>,
+    pub current_layer_end: Option<u32>,
+    /// Sequence IDs with active KV cache allocations.
+    pub active_cache_seq_ids: Vec<u64>,
+}
+
+// ── 0x15 LeaveIntent (Worker → Coordinator) ─────────────────────────────
+
+/// Worker announces intent to leave the cluster gracefully.
+/// The coordinator will drain work from this worker before removing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveIntentPayload {
+    pub reason: String,
+}
+
+// ── 0x16 WhoIsCoordinator (New Node → Seed Peer) ────────────────────────
+
+/// Seed discovery request: "who is the current coordinator?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoIsCoordinatorPayload {
+    /// Requester's node ID (for logging).
+    pub node_id: String,
+}
+
+// ── 0x17 WhoIsCoordinatorResponse (Seed Peer → New Node) ───────────────
+
+/// Seed discovery response with coordinator address and cluster manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoIsCoordinatorResponsePayload {
+    /// Current coordinator address, or None if unknown (mid-election).
+    pub coordinator_addr: Option<String>,
+    /// Current election term.
+    pub term: u64,
+    /// Full cluster manifest (so the joiner knows all peers immediately).
+    pub manifest: Option<ClusterManifestPayload>,
+}
 
 // ── 0x0A Error (Bidirectional) ──────────────────────────────────────────
 
@@ -482,10 +594,82 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_alloc_roundtrip() {
-        let payload = CacheAllocPayload { max_seq_len: 4096 };
-        let decoded: CacheAllocPayload = bincode_roundtrip(&payload);
-        assert_eq!(decoded.max_seq_len, 4096);
+    fn test_cluster_manifest_roundtrip() {
+        let payload = ClusterManifestPayload {
+            version: 3,
+            term: 1,
+            nodes: vec![
+                NodeInfo {
+                    node_id: "coordinator-0".into(),
+                    address: "192.168.1.10:9400".into(),
+                    election_priority: 0,
+                    coordinator_capable: true,
+                    role: NodeRole::Coordinator,
+                },
+                NodeInfo {
+                    node_id: "worker-gpu0".into(),
+                    address: "192.168.1.20:9400".into(),
+                    election_priority: 1,
+                    coordinator_capable: true,
+                    role: NodeRole::Worker,
+                },
+                NodeInfo {
+                    node_id: "worker-gpu1".into(),
+                    address: "192.168.1.30:9400".into(),
+                    election_priority: u32::MAX,
+                    coordinator_capable: false,
+                    role: NodeRole::Worker,
+                },
+            ],
+        };
+        let decoded: ClusterManifestPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.term, 1);
+        assert_eq!(decoded.nodes.len(), 3);
+        assert_eq!(decoded.nodes[0].role, NodeRole::Coordinator);
+        assert!(decoded.nodes[1].coordinator_capable);
+        assert!(!decoded.nodes[2].coordinator_capable);
+        assert_eq!(decoded.nodes[2].election_priority, u32::MAX);
+    }
+
+    #[test]
+    fn test_reregister_payload_roundtrip() {
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu0".into(),
+            gpu_model: "NVIDIA RTX 3090".into(),
+            gpu_memory_total: 24 * 1024 * 1024 * 1024,
+            gpu_memory_available: 8 * 1024 * 1024 * 1024,
+            compute_capability: (8, 6),
+            decode_ms_per_layer: 1.1,
+            prefill_ms_per_layer_128: 3.5,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![1, 5, 42],
+        };
+        let decoded: ReRegisterPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.node_id, "worker-gpu0");
+        assert_eq!(decoded.current_layer_start, Some(0));
+        assert_eq!(decoded.current_layer_end, Some(16));
+        assert_eq!(decoded.active_cache_seq_ids, vec![1, 5, 42]);
+    }
+
+    #[test]
+    fn test_reregister_payload_no_assignment_roundtrip() {
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu1".into(),
+            gpu_model: "NVIDIA RTX 5090".into(),
+            gpu_memory_total: 32 * 1024 * 1024 * 1024,
+            gpu_memory_available: 30 * 1024 * 1024 * 1024,
+            compute_capability: (12, 0),
+            decode_ms_per_layer: 0.8,
+            prefill_ms_per_layer_128: 2.1,
+            current_layer_start: None,
+            current_layer_end: None,
+            active_cache_seq_ids: vec![],
+        };
+        let decoded: ReRegisterPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.current_layer_start, None);
+        assert!(decoded.active_cache_seq_ids.is_empty());
     }
 
     #[test]

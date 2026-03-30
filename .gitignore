@@ -30,6 +30,9 @@ tests/validation/target/
 .vex/validation.json
 .vex/drift.json
 
+# Config (contains local paths/addresses)
+fracture.env
+
 # IDE
 .vscode/
 .idea/

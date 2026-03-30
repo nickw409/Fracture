@@ -3,7 +3,10 @@ use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
 use fracture_engine::{Engine, KvCacheManager};
 use fracture_gguf::WeightStore;
-use fracture_server::{create_router, AppState};
+use fracture_server::dashboard::dto::ModelInfo;
+use fracture_server::dashboard::metrics::MetricsCollector;
+use fracture_server::dashboard::request_log::RequestLog;
+use fracture_server::{create_router, AppState, ClusterProvider, DashboardState};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +37,12 @@ async fn main() -> Result<()> {
         .position(|a| a == "--tokenizer")
         .and_then(|i| args.get(i + 1).cloned());
 
+    let max_seq_len_override: Option<usize> = args
+        .iter()
+        .position(|a| a == "--max-seq-len")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok());
+
     tracing::info!("Fracture inference server (CUDA backend)");
     tracing::info!("model: {model_path}");
 
@@ -49,7 +58,19 @@ async fn main() -> Result<()> {
     // Load model weights
     tracing::info!("loading model weights...");
     let weights = WeightStore::load(std::path::Path::new(model_path), &backend, None)?;
-    let config = weights.config.clone();
+    let mut config = weights.config.clone();
+
+    // Clamp max_seq_len to avoid OOM on contiguous KV cache allocation.
+    // The GGUF may report 128K+ but the contiguous cache pre-allocates the full length.
+    if let Some(override_len) = max_seq_len_override {
+        config.max_seq_len = override_len;
+    } else if config.max_seq_len > 4096 {
+        tracing::warn!(
+            "clamping max_seq_len from {} to 4096 (use --max-seq-len to override)",
+            config.max_seq_len
+        );
+        config.max_seq_len = 4096;
+    }
     tracing::info!(
         "model loaded: {}L, d={}, vocab={}",
         config.num_layers,
@@ -89,12 +110,35 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Build dashboard state
+    let dashboard_state = Arc::new(DashboardState {
+        metrics: Arc::new(MetricsCollector::new()),
+        request_log: Arc::new(RequestLog::new()),
+        cluster: ClusterProvider::Standalone {
+            gpu_name: engine.backend().device_name().to_string(),
+            vram_total_mb: (engine.backend().total_memory() / (1024 * 1024)) as u64,
+            vram_used_mb: ((engine.backend().total_memory() - engine.backend().available_memory())
+                / (1024 * 1024)) as u64,
+            model: ModelInfo {
+                name: "llama-3-8b".to_string(),
+                parameters: "8B".to_string(),
+                layers: config.num_layers,
+                context_length: config.max_seq_len,
+                dtype: "FP16".to_string(),
+            },
+            total_layers: config.num_layers,
+        },
+        scheduler: None,
+    });
+
     // Build app state and router
     let state = Arc::new(AppState {
         engine,
         cache: Mutex::new(cache),
         tokenizer,
+        dashboard: dashboard_state,
     });
+
     let router = create_router(state);
 
     // Start server

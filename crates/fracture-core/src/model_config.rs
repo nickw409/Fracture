@@ -64,7 +64,7 @@ impl ModelConfig {
             ));
         }
 
-        if self.num_q_heads % self.num_kv_heads != 0 {
+        if !self.num_q_heads.is_multiple_of(self.num_kv_heads) {
             return Err(FractureError::ModelConfig(format!(
                 "num_q_heads ({}) must be divisible by num_kv_heads ({})",
                 self.num_q_heads, self.num_kv_heads

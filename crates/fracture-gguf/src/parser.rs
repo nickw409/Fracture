@@ -202,6 +202,7 @@ pub struct TensorInfo {
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub offset: u64,
+    #[allow(dead_code)] // retained for future quantization support
     pub(crate) gguf_dtype: u32,
 }
 

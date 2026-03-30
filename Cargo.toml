@@ -8,6 +8,7 @@ members = [
     "crates/fracture-gguf",
     "crates/fracture-protocol",
     "crates/fracture-coordinator",
+    "crates/fracture-election",
     "backends/fracture-cuda",
     "bins/fracture-server-cuda",
     "bins/fracture-worker-cuda",
@@ -31,6 +32,7 @@ fracture-gguf = { path = "crates/fracture-gguf" }
 fracture-cuda = { path = "backends/fracture-cuda" }
 fracture-protocol = { path = "crates/fracture-protocol" }
 fracture-coordinator = { path = "crates/fracture-coordinator" }
+fracture-election = { path = "crates/fracture-election" }
 fracture-validation = { path = "tests/validation" }
 
 # Async runtime
@@ -39,7 +41,7 @@ tokio = { version = "1", features = ["full"] }
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

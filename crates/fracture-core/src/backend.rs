@@ -70,6 +70,7 @@ pub trait Backend: Send + Sync {
     /// out: [N, num_q_heads, head_dim]
     ///
     /// Default returns an error — backends must opt in by overriding.
+    #[allow(clippy::too_many_arguments)]
     fn attention_paged(
         &self,
         _q: &DeviceTensor,
@@ -148,4 +149,75 @@ pub trait Backend: Send + Sync {
 
     /// Pop the most recent profiling marker. Default no-op.
     fn marker_pop(&self) {}
+
+    // ── TurboQuant KV cache compression ──────────────────────────
+
+    /// Compress KV vectors using TurboQuant: normalize → rotate → Lloyd-Max quantize → pack.
+    ///
+    /// - `input`: `[N, num_kv_heads, head_dim]` FP16 — K or V vectors to compress
+    /// - `rotation_matrix`: `[head_dim, head_dim]` FP32 — layer-specific Haar rotation
+    /// - `centroids`: `[2^bits]` FP32 — Lloyd-Max centroid table
+    /// - `bits`: quantization bit-width (2, 4, or 8)
+    /// - `packed_out`: `[N, num_kv_heads * packed_dim_per_head]` INT8 — bit-packed indices
+    /// - `norms_out`: `[N, num_kv_heads]` FP16 — per-head L2 norms
+    ///
+    /// Default returns an error — backends must opt in by overriding.
+    #[allow(clippy::too_many_arguments)]
+    fn turboquant_compress(
+        &self,
+        _input: &DeviceTensor,
+        _rotation_matrix: &DeviceTensor,
+        _centroids: &DeviceTensor,
+        _bits: u8,
+        _packed_out: &DeviceTensor,
+        _norms_out: &DeviceTensor,
+    ) -> Result<()> {
+        Err(crate::FractureError::Backend(
+            "TurboQuant compression not supported by this backend".into(),
+        ))
+    }
+
+    /// Paged attention with TurboQuant-compressed KV blocks.
+    ///
+    /// Fuses decompress + attention: pre-rotates query with Pi_k for K scores,
+    /// accumulates V in rotated space and unrotates once with Pi_v^T.
+    ///
+    /// - `q`: `[N, num_q_heads, head_dim]` FP16
+    /// - `block_table`: physical block IDs for quantized blocks
+    /// - `k_packed / v_packed`: per-block packed index tensors for this layer
+    /// - `k_norms / v_norms`: per-block norm tensors for this layer
+    /// - `k_rotation`: `[head_dim, head_dim]` FP32 — K rotation matrix (for query pre-rotation)
+    /// - `v_rotation`: `[head_dim, head_dim]` FP32 — V rotation matrix (for output unrotation)
+    /// - `k_centroids / v_centroids`: centroid lookup tables
+    /// - `key_bits / value_bits`: quantization bit-widths
+    /// - `num_kv_heads`: number of KV attention heads
+    /// - `kv_len`: total valid tokens across all blocks
+    /// - `start_pos`: tokens before this batch (for causal mask)
+    /// - `out`: `[N, num_q_heads, head_dim]` FP16
+    ///
+    /// Default returns an error — backends must opt in by overriding.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_paged_tq(
+        &self,
+        _q: &DeviceTensor,
+        _block_table: &[i32],
+        _k_packed: &[&DeviceTensor],
+        _k_norms: &[&DeviceTensor],
+        _v_packed: &[&DeviceTensor],
+        _v_norms: &[&DeviceTensor],
+        _k_rotation: &DeviceTensor,
+        _v_rotation: &DeviceTensor,
+        _k_centroids: &DeviceTensor,
+        _v_centroids: &DeviceTensor,
+        _key_bits: u8,
+        _value_bits: u8,
+        _num_kv_heads: usize,
+        _kv_len: usize,
+        _start_pos: usize,
+        _out: &DeviceTensor,
+    ) -> Result<()> {
+        Err(crate::FractureError::Backend(
+            "TurboQuant paged attention not supported by this backend".into(),
+        ))
+    }
 }

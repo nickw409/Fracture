@@ -48,6 +48,25 @@ pub enum MessageType {
     BatchedForward = 0x0C,
     BatchedForwardResult = 0x0D,
     WorkerReady = 0x0E,
+    /// Coordinator tells a worker to reconfigure with a new layer range.
+    /// Payload is RegisterAckPayload (same fields).
+    Reconfigure = 0x0F,
+    /// Election start broadcast (candidate → peers).
+    ElectionStart = 0x10,
+    /// Election challenge (higher-priority node → candidate).
+    ElectionChallenge = 0x11,
+    /// Victory declaration (new leader → all peers).
+    Victory = 0x12,
+    /// Cluster manifest broadcast (coordinator → workers).
+    ClusterManifest = 0x13,
+    /// Worker re-registration after reconnection (carries current state).
+    ReRegister = 0x14,
+    /// Worker announces intent to leave the cluster gracefully.
+    LeaveIntent = 0x15,
+    /// Seed discovery: "who is the coordinator?" (new node → any peer).
+    WhoIsCoordinator = 0x16,
+    /// Seed discovery response (peer → new node).
+    WhoIsCoordinatorResponse = 0x17,
 }
 
 impl MessageType {
@@ -67,6 +86,15 @@ impl MessageType {
             0x0C => Ok(Self::BatchedForward),
             0x0D => Ok(Self::BatchedForwardResult),
             0x0E => Ok(Self::WorkerReady),
+            0x0F => Ok(Self::Reconfigure),
+            0x10 => Ok(Self::ElectionStart),
+            0x11 => Ok(Self::ElectionChallenge),
+            0x12 => Ok(Self::Victory),
+            0x13 => Ok(Self::ClusterManifest),
+            0x14 => Ok(Self::ReRegister),
+            0x15 => Ok(Self::LeaveIntent),
+            0x16 => Ok(Self::WhoIsCoordinator),
+            0x17 => Ok(Self::WhoIsCoordinatorResponse),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -172,6 +200,15 @@ mod tests {
             MessageType::BatchedForward,
             MessageType::BatchedForwardResult,
             MessageType::WorkerReady,
+            MessageType::Reconfigure,
+            MessageType::ElectionStart,
+            MessageType::ElectionChallenge,
+            MessageType::Victory,
+            MessageType::ClusterManifest,
+            MessageType::ReRegister,
+            MessageType::LeaveIntent,
+            MessageType::WhoIsCoordinator,
+            MessageType::WhoIsCoordinatorResponse,
         ];
         for mt in types {
             let v = mt as u8;
@@ -183,7 +220,6 @@ mod tests {
     #[test]
     fn test_message_type_unknown() {
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x0F).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 
