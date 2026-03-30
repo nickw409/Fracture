@@ -45,6 +45,8 @@ struct CoordinatorConfig {
     /// Use the batched scheduler loop (Phase 4) instead of the
     /// one-at-a-time distributed_generate path.
     batched: bool,
+    /// KV cache quantization mode. Workers must be launched with the same flag.
+    kv_quant: Option<String>,
 }
 
 #[tokio::main]
@@ -100,12 +102,17 @@ async fn main() -> Result<()> {
             .and_then(|p| p.parse().ok())
             .unwrap_or(120), // default 2 minutes
         batched: args.iter().any(|a| a == "--batched"),
+        kv_quant: args.iter().position(|a| a == "--kv-quant")
+            .and_then(|i| args.get(i + 1).cloned()),
     };
 
     tracing::info!("Fracture coordinator");
     tracing::info!("listening for workers on {}", config.listen_address);
     tracing::info!("expecting {} workers", config.expected_workers);
     tracing::info!("model: {}", config.model_path);
+    if let Some(ref kv_quant) = config.kv_quant {
+        tracing::info!("KV cache quantization: {kv_quant} (workers must use matching --kv-quant flag)");
+    }
 
     // Parse GGUF metadata for model config
     let gguf = fracture_gguf::GgufParser::parse(std::path::Path::new(&config.model_path))?;

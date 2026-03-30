@@ -1,22 +1,26 @@
 use crate::kv_cache::{CacheHandle, KvCacheManager};
 use crate::node::{NodeConfig, NodeInput, NodeOutput};
 use crate::paged_kv_cache::PagedKvCacheManager;
+use crate::quantized_paged_kv_cache::QuantizedKvCacheManager;
 use fracture_core::{Backend, DType, DeviceTensor, ForwardProfile, FractureError, LayerProfile, Result};
 use fracture_gguf::WeightStore;
 use std::ops::Range;
 
 /// Runtime-selected KV cache implementation.
+#[allow(clippy::large_enum_variant)]
 pub enum KvCacheBackend {
     Contiguous(KvCacheManager),
     Paged(PagedKvCacheManager),
+    /// TurboQuant-compressed paged KV cache (opt-in via `--kv-quant turboquant`).
+    QuantizedPaged(QuantizedKvCacheManager),
 }
 
 impl KvCacheBackend {
     pub fn alloc_contiguous<B: Backend>(&mut self, backend: &B) -> Result<CacheHandle> {
         match self {
             Self::Contiguous(c) => c.alloc(backend),
-            Self::Paged(_) => Err(FractureError::KvCache(
-                "alloc_contiguous called on paged cache".into(),
+            _ => Err(FractureError::KvCache(
+                "alloc_contiguous called on non-contiguous cache".into(),
             )),
         }
     }
@@ -24,6 +28,7 @@ impl KvCacheBackend {
     pub fn alloc_paged(&mut self) -> Result<CacheHandle> {
         match self {
             Self::Paged(p) => p.alloc(),
+            Self::QuantizedPaged(q) => q.alloc(),
             Self::Contiguous(_) => Err(FractureError::KvCache(
                 "alloc_paged called on contiguous cache".into(),
             )),
@@ -34,6 +39,7 @@ impl KvCacheBackend {
         match self {
             Self::Contiguous(c) => c.alloc(backend),
             Self::Paged(p) => p.alloc(),
+            Self::QuantizedPaged(q) => q.alloc(),
         }
     }
 
@@ -41,6 +47,7 @@ impl KvCacheBackend {
         match self {
             Self::Contiguous(c) => c.seq_len(handle),
             Self::Paged(p) => p.seq_len(handle),
+            Self::QuantizedPaged(q) => q.seq_len(handle),
         }
     }
 
@@ -51,11 +58,19 @@ impl KvCacheBackend {
                 p.free(handle)?;
                 Ok(())
             }
+            Self::QuantizedPaged(q) => {
+                q.free(handle)?;
+                Ok(())
+            }
         }
     }
 
     pub fn is_paged(&self) -> bool {
-        matches!(self, Self::Paged(_))
+        matches!(self, Self::Paged(_) | Self::QuantizedPaged(_))
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::QuantizedPaged(_))
     }
 }
 
