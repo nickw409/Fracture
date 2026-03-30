@@ -631,4 +631,130 @@ mod tests {
         reg.mark_dead("w2");
         assert_eq!(reg.min_free_blocks(), 200);
     }
+
+    fn make_assignment(id: &str, start: usize, end: usize) -> LayerAssignment {
+        LayerAssignment {
+            node_id: id.into(),
+            layer_range: start..end,
+            role: if start == 0 { NodeRole::Head } else { NodeRole::Tail },
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mark_draining_from_ready() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign("w1", make_assignment("w1", 0, 32)).unwrap();
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Ready);
+
+        reg.mark_draining("w1");
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Draining);
+    }
+
+    #[tokio::test]
+    async fn test_mark_draining_from_non_ready_is_noop() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        // Worker is Connected (not Ready)
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+
+        reg.mark_draining("w1");
+        // Should still be Connected — mark_draining only transitions Ready → Draining
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_mark_pending() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Connected);
+
+        reg.mark_pending("w1");
+        assert_eq!(reg.get("w1").unwrap().status, WorkerStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_pending_workers_returns_pending_only() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w3"), dummy_connection().await).unwrap();
+
+        // w1 stays Connected, w2 becomes Ready, w3 becomes Pending
+        reg.assign("w2", make_assignment("w2", 0, 16)).unwrap();
+        reg.mark_pending("w3");
+
+        let pending = reg.pending_workers();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], "w3");
+    }
+
+    #[tokio::test]
+    async fn test_pending_workers_empty_when_none() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.assign("w1", make_assignment("w1", 0, 32)).unwrap();
+
+        let pending = reg.pending_workers();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_all_capabilities_includes_pending() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 16)).unwrap();
+        reg.mark_pending("w2");
+
+        let caps = reg.all_capabilities();
+        let ids: Vec<&str> = caps.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(caps.len(), 2);
+        assert!(ids.contains(&"w1"), "Ready worker should be included");
+        assert!(ids.contains(&"w2"), "Pending worker should be included");
+    }
+
+    #[tokio::test]
+    async fn test_all_capabilities_includes_draining() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 16)).unwrap();
+        reg.assign("w2", make_assignment("w2", 16, 32)).unwrap();
+        reg.mark_draining("w2");
+
+        let caps = reg.all_capabilities();
+        let ids: Vec<&str> = caps.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(caps.len(), 2);
+        assert!(ids.contains(&"w1"), "Ready worker should be included");
+        assert!(ids.contains(&"w2"), "Draining worker should be included");
+    }
+
+    #[tokio::test]
+    async fn test_draining_excluded_from_pipeline_order() {
+        let mut reg = PeerRegistry::new();
+        reg.register(test_caps("w1"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w2"), dummy_connection().await).unwrap();
+        reg.register(test_caps("w3"), dummy_connection().await).unwrap();
+
+        reg.assign("w1", make_assignment("w1", 0, 10)).unwrap();
+        reg.assign("w2", make_assignment("w2", 10, 20)).unwrap();
+        reg.assign("w3", make_assignment("w3", 20, 32)).unwrap();
+
+        // All three should be in pipeline order initially
+        assert_eq!(reg.pipeline_order().len(), 3);
+
+        // Mark w2 as draining — it should be excluded from pipeline_order
+        reg.mark_draining("w2");
+        let order = reg.pipeline_order();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], "w1");
+        assert_eq!(order[1], "w3");
+        assert!(!order.contains(&"w2".to_string()), "draining worker should not be in pipeline order");
+    }
 }

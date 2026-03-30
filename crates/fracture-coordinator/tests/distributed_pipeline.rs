@@ -2542,3 +2542,555 @@ async fn test_batched_forward_worker_error_propagates() {
 
     pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 }
+
+// =========================================================================
+// Fault Tolerance Integration Tests
+// =========================================================================
+
+/// Spawn a mock worker that handles Reconfigure (for rebalance tests):
+/// receives Reconfigure, responds with WorkerReady.
+async fn spawn_reconfigurable_worker(
+    listener: TcpListener,
+    is_tail: bool,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
+                MessageType::Forward => {
+                    let _req: ForwardPayload =
+                        FramedConnection::deserialize_payload(&payload).unwrap();
+                    let result = if is_tail {
+                        let data: Vec<u8> = (0..vocab_size)
+                            .flat_map(|i| (i as f32).to_le_bytes())
+                            .collect();
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Logits { data },
+                        }
+                    } else {
+                        let data_len = hidden_size * 2;
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Activations {
+                                tensor_header: TensorWireHeader {
+                                    ndim: 2,
+                                    shape: vec![1, hidden_size as u32],
+                                    dtype: 0,
+                                    compression: 0,
+                                    data_len: data_len as u32,
+                                },
+                                tensor_data: vec![0u8; data_len],
+                            },
+                        }
+                    };
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Reconfigure => {
+                    // Handle reconfiguration: respond with WorkerReady
+                    conn.send_empty(MessageType::WorkerReady, 0)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Helper: set up a 3-node pipeline with reconfigurable mock workers.
+async fn setup_three_node_reconfigurable() -> (
+    DistributedPipeline,
+    PeerRegistry,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let l0 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a0 = l0.local_addr().unwrap();
+    let a1 = l1.local_addr().unwrap();
+    let a2 = l2.local_addr().unwrap();
+
+    let t0 = spawn_reconfigurable_worker(l0, false, hidden_size, vocab_size).await;
+    let t1 = spawn_reconfigurable_worker(l1, false, hidden_size, vocab_size).await;
+    let t2 = spawn_reconfigurable_worker(l2, true, hidden_size, vocab_size).await;
+
+    let c0 = FramedConnection::new(tokio::net::TcpStream::connect(a0).await.unwrap());
+    let c1 = FramedConnection::new(tokio::net::TcpStream::connect(a1).await.unwrap());
+    let c2 = FramedConnection::new(tokio::net::TcpStream::connect(a2).await.unwrap());
+
+    let mut registry = PeerRegistry::new();
+    let caps = |name: &str| WorkerCapabilities {
+        node_id: name.into(),
+        gpu_model: "Mock".into(),
+        gpu_memory_available: 24_000_000_000,
+        compute_capability: (8, 0),
+        decode_ms_per_layer: 1.0,
+        prefill_ms_per_layer_128: 3.0,
+    };
+
+    registry.register(caps("w0"), c0).unwrap();
+    registry.register(caps("w1"), c1).unwrap();
+    registry.register(caps("w2"), c2).unwrap();
+
+    let a = |name: &str, start: usize, end: usize, role: NodeRole| LayerAssignment {
+        node_id: name.into(),
+        layer_range: start..end,
+        role,
+        expected_decode_ms: 10.0,
+        weight_memory_gb: 5.0,
+        cache_memory_gb: 1.0,
+    };
+
+    let assignments = vec![
+        a("w0", 0, 11, NodeRole::Head),
+        a("w1", 11, 22, NodeRole::Middle),
+        a("w2", 22, 32, NodeRole::Tail),
+    ];
+    for ass in &assignments {
+        registry.assign(&ass.node_id, ass.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, hidden_size).unwrap();
+    (pipeline, registry, vec![t0, t1, t2])
+}
+
+#[tokio::test]
+async fn test_reregister_payload_over_wire() {
+    // Test ReRegister message round-trip over TCP
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = ReRegisterPayload {
+            node_id: "worker-gpu0".into(),
+            gpu_model: "RTX 3090".into(),
+            gpu_memory_total: 24_000_000_000,
+            gpu_memory_available: 8_000_000_000,
+            compute_capability: (8, 6),
+            decode_ms_per_layer: 1.1,
+            prefill_ms_per_layer_128: 3.5,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![1, 5, 42],
+        };
+        conn.send(MessageType::ReRegister, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::ReRegister);
+    let rereg: ReRegisterPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(rereg.node_id, "worker-gpu0");
+    assert_eq!(rereg.current_layer_start, Some(0));
+    assert_eq!(rereg.current_layer_end, Some(16));
+    assert_eq!(rereg.active_cache_seq_ids, vec![1, 5, 42]);
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_leave_intent_over_wire() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = LeaveIntentPayload {
+            reason: "SIGTERM received".into(),
+        };
+        conn.send(MessageType::LeaveIntent, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::LeaveIntent);
+    let leave: LeaveIntentPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(leave.reason, "SIGTERM received");
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cluster_manifest_over_wire() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+        let payload = ClusterManifestPayload {
+            version: 3,
+            term: 1,
+            nodes: vec![
+                NodeInfo {
+                    node_id: "coordinator".into(),
+                    address: "192.168.1.1:9400".into(),
+                    election_priority: 0,
+                    coordinator_capable: true,
+                    role: fracture_protocol::messages::NodeRole::Coordinator,
+                },
+                NodeInfo {
+                    node_id: "worker-0".into(),
+                    address: "192.168.1.2:9400".into(),
+                    election_priority: 1,
+                    coordinator_capable: true,
+                    role: fracture_protocol::messages::NodeRole::Worker,
+                },
+            ],
+        };
+        conn.send(MessageType::ClusterManifest, 0, &payload)
+            .await
+            .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+    let (header, payload) = conn.recv().await.unwrap();
+
+    assert_eq!(header.msg_type, MessageType::ClusterManifest);
+    let manifest: ClusterManifestPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(manifest.version, 3);
+    assert_eq!(manifest.term, 1);
+    assert_eq!(manifest.nodes.len(), 2);
+    assert_eq!(manifest.nodes[0].role, fracture_protocol::messages::NodeRole::Coordinator);
+    assert!(manifest.nodes[1].coordinator_capable);
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_election_messages_over_wire() {
+    // Test all 3 election message types over TCP
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        // ElectionStart
+        conn.send(
+            MessageType::ElectionStart,
+            0,
+            &ElectionStartPayload {
+                candidate_id: "node-a".into(),
+                priority: 0,
+                term: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        // ElectionChallenge
+        conn.send(
+            MessageType::ElectionChallenge,
+            0,
+            &ElectionChallengePayload {
+                challenger_id: "node-b".into(),
+                priority: 1,
+                term: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Victory
+        conn.send(
+            MessageType::Victory,
+            0,
+            &VictoryPayload {
+                leader_id: "node-a".into(),
+                term: 5,
+                coordinator_addr: "192.168.1.10:9400".into(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Receive ElectionStart
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ElectionStart);
+    let es: ElectionStartPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(es.candidate_id, "node-a");
+    assert_eq!(es.priority, 0);
+    assert_eq!(es.term, 5);
+
+    // Receive ElectionChallenge
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ElectionChallenge);
+    let ec: ElectionChallengePayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(ec.challenger_id, "node-b");
+
+    // Receive Victory
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::Victory);
+    let v: VictoryPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(v.leader_id, "node-a");
+    assert_eq!(v.term, 5);
+    assert_eq!(v.coordinator_addr, "192.168.1.10:9400");
+
+    send_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_abort_all_sequences_frees_caches() {
+    let (pipeline, mut registry) = setup_two_node_pipeline().await;
+
+    // Allocate caches for 3 sequences
+    pipeline.alloc_cache(&mut registry, 1, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 2, 4096).await.unwrap();
+    pipeline.alloc_cache(&mut registry, 3, 4096).await.unwrap();
+
+    assert!(pipeline.is_allocated(1));
+    assert!(pipeline.is_allocated(2));
+    assert!(pipeline.is_allocated(3));
+
+    // Abort all
+    let aborted = pipeline.abort_all_sequences(&mut registry).await;
+    assert_eq!(aborted.len(), 3);
+    assert!(aborted.contains(&1));
+    assert!(aborted.contains(&2));
+    assert!(aborted.contains(&3));
+
+    // All freed
+    assert!(!pipeline.is_allocated(1));
+    assert!(!pipeline.is_allocated(2));
+    assert!(!pipeline.is_allocated(3));
+}
+
+#[tokio::test]
+async fn test_pipeline_order_excludes_dead_workers() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Initially both in pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 2);
+
+    // Kill head
+    registry.mark_dead("head");
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+}
+
+#[tokio::test]
+async fn test_reregister_reconnection_handshake() {
+    // Simulate the full reconnection flow:
+    // Worker connects → sends ReRegister → receives RegisterAck → sends WorkerReady
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let worker_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        // Send ReRegister
+        let rereg = ReRegisterPayload {
+            node_id: "worker-0".into(),
+            gpu_model: "Mock GPU".into(),
+            gpu_memory_total: 24_000_000_000,
+            gpu_memory_available: 20_000_000_000,
+            compute_capability: (8, 0),
+            decode_ms_per_layer: 1.0,
+            prefill_ms_per_layer_128: 3.0,
+            current_layer_start: Some(0),
+            current_layer_end: Some(16),
+            active_cache_seq_ids: vec![],
+        };
+        conn.send(MessageType::ReRegister, 0, &rereg).await.unwrap();
+
+        // Receive RegisterAck (assignment unchanged)
+        let (header, payload) = conn.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::RegisterAck);
+        let ack: RegisterAckPayload =
+            FramedConnection::deserialize_payload(&payload).unwrap();
+        assert_eq!(ack.layer_start, 0);
+        assert_eq!(ack.layer_end, 16);
+
+        // Send WorkerReady
+        conn.send_empty(MessageType::WorkerReady, 0).await.unwrap();
+    });
+
+    // Coordinator side
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut conn = FramedConnection::new(stream);
+
+    // Receive ReRegister
+    let (header, payload) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::ReRegister);
+    let rereg: ReRegisterPayload =
+        FramedConnection::deserialize_payload(&payload).unwrap();
+    assert_eq!(rereg.node_id, "worker-0");
+    assert_eq!(rereg.current_layer_start, Some(0));
+
+    // Send RegisterAck (same assignment)
+    let ack = RegisterAckPayload {
+        layer_start: 0,
+        layer_end: 16,
+        total_layers: 32,
+        max_seq_len: 4096,
+        model_config: fracture_core::ModelConfig {
+            hidden_size: 4096,
+            num_layers: 32,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
+            vocab_size: 128256,
+            rope_theta: 500000.0,
+            rms_norm_eps: 1e-5,
+            max_seq_len: 8192,
+        },
+    };
+    conn.send(MessageType::RegisterAck, 0, &ack).await.unwrap();
+
+    // Receive WorkerReady
+    let (header, _) = conn.recv().await.unwrap();
+    assert_eq!(header.msg_type, MessageType::WorkerReady);
+
+    worker_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_forced_rebalance_excludes_dead_worker() {
+    use fracture_coordinator::rebalance;
+    use fracture_coordinator::scheduler::SchedulingMode;
+    use std::sync::Arc;
+
+    let (pipeline, registry, _tasks) = setup_three_node_reconfigurable().await;
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+
+    // Mark middle worker (w1) as dead
+    {
+        let mut reg = registry.lock().await;
+        reg.mark_dead("w1");
+    }
+
+    let model_config = fracture_core::ModelConfig {
+        hidden_size: 4096,
+        num_layers: 32,
+        num_q_heads: 32,
+        num_kv_heads: 8,
+        head_dim: 128,
+        intermediate_size: 14336,
+        vocab_size: 128256,
+        rope_theta: 500000.0,
+        rms_norm_eps: 1e-5,
+        max_seq_len: 8192,
+    };
+
+    // Forced rebalance excluding dead worker
+    let result = rebalance::forced_rebalance(
+        &registry,
+        &pipeline,
+        &model_config,
+        &SchedulingMode::EqualSplit,
+        4096,
+        &["w1".to_string()],
+    )
+    .await
+    .unwrap();
+
+    // Pipeline should have 2 stages (w0, w2), covering all 32 layers
+    assert_eq!(result.pipeline.pipeline_order().len(), 2);
+    assert_eq!(result.assignments.len(), 2);
+
+    // Verify all layers are covered
+    let total_layers: usize = result
+        .assignments
+        .iter()
+        .map(|a| a.layer_range.len())
+        .sum();
+    assert_eq!(total_layers, 32);
+
+    // Verify w1 is not in assignments
+    assert!(result
+        .assignments
+        .iter()
+        .all(|a| a.node_id != "w1"));
+}
+
+#[tokio::test]
+async fn test_draining_worker_excluded_from_pipeline_order() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Both workers in pipeline
+    assert_eq!(registry.pipeline_order().len(), 2);
+
+    // Mark head as draining
+    registry.mark_draining("head");
+
+    // Draining worker excluded from pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+
+    // But still in all_capabilities (for rescheduling)
+    let caps = registry.all_capabilities();
+    assert_eq!(caps.len(), 2);
+}
+
+#[tokio::test]
+async fn test_pending_worker_in_capabilities_not_pipeline() {
+    let (_, mut registry) = setup_two_node_pipeline().await;
+
+    // Mark head as pending (simulating a new join before rebalance)
+    registry.mark_pending("head");
+
+    // Pending worker NOT in pipeline order
+    let order = registry.pipeline_order();
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0], "tail");
+
+    // But IS in all_capabilities (scheduler can assign it layers)
+    let caps = registry.all_capabilities();
+    assert_eq!(caps.len(), 2);
+
+    // pending_workers returns it
+    let pending = registry.pending_workers();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0], "head");
+}

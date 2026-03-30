@@ -523,6 +523,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fracture-election"
+version = "0.1.0"
+dependencies = [
+ "fracture-core",
+ "fracture-protocol",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fracture-engine"
 version = "0.1.0"
 dependencies = [
@@ -656,9 +667,11 @@ dependencies = [
  "fracture-coordinator",
  "fracture-core",
  "fracture-cuda",
+ "fracture-election",
  "fracture-engine",
  "fracture-gguf",
  "fracture-protocol",
+ "rand",
  "tokio",
  "tracing",
  "tracing-subscriber",

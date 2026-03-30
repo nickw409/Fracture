@@ -286,6 +286,17 @@ mod tests {
         assert_eq!(a.state(), ElectionState::Follower);
     }
 
+    fn agent_at_term(id: &str, priority: u32, term: u64) -> ElectionAgent {
+        ElectionAgent::new(
+            ElectionConfig {
+                node_id: id.to_string(),
+                priority,
+                election_window: Duration::from_secs(5),
+            },
+            term,
+        )
+    }
+
     #[test]
     fn test_same_priority_tiebreak_by_node_id() {
         let mut a = agent("node-a", 1);
@@ -351,5 +362,167 @@ mod tests {
         let win = a.on_election_timeout();
         assert_eq!(win, ElectionAction::DeclareVictory);
         assert_eq!(a.state(), ElectionState::Leader);
+    }
+
+    #[test]
+    fn test_simultaneous_elections_same_term() {
+        let mut a = agent("node-a", 0); // higher priority
+        let mut b = agent("node-b", 1); // lower priority
+
+        // Both start elections at the same time — both become Candidate.
+        let term_a = a.start_election();
+        let term_b = b.start_election();
+        assert_eq!(a.state(), ElectionState::Candidate);
+        assert_eq!(b.state(), ElectionState::Candidate);
+
+        // Each sees the other's ElectionStart.
+        // A (priority 0) sees B's ElectionStart (priority 1) — A challenges B.
+        let a_action = a.on_election_start("node-b", 1, term_b);
+        assert_eq!(
+            a_action,
+            ElectionAction::Challenge {
+                candidate_id: "node-b".into()
+            }
+        );
+
+        // B (priority 1) sees A's ElectionStart (priority 0) — B stands down.
+        let b_action = b.on_election_start("node-a", 0, term_a);
+        assert_eq!(b_action, ElectionAction::None);
+        assert_eq!(b.state(), ElectionState::Follower);
+
+        // A times out with no challenges — wins.
+        let win = a.on_election_timeout();
+        assert_eq!(win, ElectionAction::DeclareVictory);
+
+        // Exactly one Leader, one Follower.
+        assert_eq!(a.state(), ElectionState::Leader);
+        assert_eq!(b.state(), ElectionState::Follower);
+    }
+
+    #[test]
+    fn test_stale_election_start_rejected() {
+        let mut a = agent_at_term("node-a", 1, 5);
+        assert_eq!(a.term.current(), 5);
+
+        // Receive ElectionStart at term 3 (stale).
+        let action = a.on_election_start("node-b", 0, 3);
+        assert_eq!(action, ElectionAction::None);
+    }
+
+    #[test]
+    fn test_victory_updates_term() {
+        let mut a = agent_at_term("node-a", 1, 1);
+        assert_eq!(a.term.current(), 1);
+
+        let action = a.on_victory("node-b", 3, "192.168.1.10:9400");
+        assert_eq!(
+            action,
+            ElectionAction::AcceptLeader {
+                leader_id: "node-b".into(),
+                coordinator_addr: "192.168.1.10:9400".into()
+            }
+        );
+        assert_eq!(a.term.current(), 3);
+        assert_eq!(a.state(), ElectionState::Follower);
+    }
+
+    #[test]
+    fn test_election_after_victory_requires_higher_term() {
+        let mut a = agent_at_term("node-a", 0, 4);
+
+        // Accept Victory at term 5 — becomes Follower.
+        let action = a.on_victory("node-b", 5, "addr");
+        assert_eq!(
+            action,
+            ElectionAction::AcceptLeader {
+                leader_id: "node-b".into(),
+                coordinator_addr: "addr".into()
+            }
+        );
+        assert_eq!(a.state(), ElectionState::Follower);
+        assert_eq!(a.term.current(), 5);
+
+        // Start a new election — term should increment to 6.
+        let election_term = a.start_election();
+        assert_eq!(election_term, 6);
+        assert_eq!(a.state(), ElectionState::Candidate);
+    }
+
+    #[test]
+    fn test_five_node_election_convergence() {
+        // 5 nodes with priorities 0-4 (lower = higher priority).
+        let mut nodes: Vec<ElectionAgent> = (0..5)
+            .map(|i| agent(&format!("node-{i}"), i as u32))
+            .collect();
+
+        // All start elections.
+        let terms: Vec<u64> = nodes.iter_mut().map(|n| n.start_election()).collect();
+        for n in &nodes {
+            assert_eq!(n.state(), ElectionState::Candidate);
+        }
+
+        // All see each other's ElectionStarts.
+        // Track whether each node received a challenge from its perspective.
+        let mut challenged = vec![false; 5];
+        for sender in 0..5 {
+            for receiver in 0..5 {
+                if sender == receiver {
+                    continue;
+                }
+                let action = nodes[receiver].on_election_start(
+                    &format!("node-{sender}"),
+                    sender as u32,
+                    terms[sender],
+                );
+                match action {
+                    ElectionAction::Challenge { .. } => {
+                        // The receiver challenged the sender — meaning sender
+                        // will be challenged.
+                        challenged[sender] = true;
+                    }
+                    ElectionAction::None => {}
+                    _ => panic!("unexpected action: {action:?}"),
+                }
+            }
+        }
+
+        // Only node-0 (priority 0) should have no challenges.
+        assert!(!challenged[0], "node-0 should not be challenged");
+        for i in 1..5 {
+            assert!(challenged[i], "node-{i} should be challenged");
+        }
+
+        // node-0 is still Candidate; all others stood down to Follower.
+        assert_eq!(nodes[0].state(), ElectionState::Candidate);
+        for i in 1..5 {
+            assert_eq!(
+                nodes[i].state(),
+                ElectionState::Follower,
+                "node-{i} should be Follower"
+            );
+        }
+
+        // node-0 times out — wins.
+        let win = nodes[0].on_election_timeout();
+        assert_eq!(win, ElectionAction::DeclareVictory);
+        assert_eq!(nodes[0].state(), ElectionState::Leader);
+
+        // All others accept Victory.
+        let victory_term = nodes[0].term.current();
+        for i in 1..5 {
+            let action = nodes[i].on_victory(
+                "node-0",
+                victory_term,
+                "192.168.1.1:9400",
+            );
+            assert_eq!(
+                action,
+                ElectionAction::AcceptLeader {
+                    leader_id: "node-0".into(),
+                    coordinator_addr: "192.168.1.1:9400".into()
+                }
+            );
+            assert_eq!(nodes[i].state(), ElectionState::Follower);
+        }
     }
 }
