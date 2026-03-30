@@ -58,9 +58,9 @@ fn make_request(scheduler: &mut BatchScheduler, prompt_len: usize) -> mpsc::Unbo
 #[test]
 fn test_scheduler_empty() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     assert_eq!(decision.total_tokens, 0);
     assert!(decision.prefills.is_empty());
     assert!(decision.decodes.is_empty());
@@ -70,13 +70,13 @@ fn test_scheduler_empty() {
 #[test]
 fn test_scheduler_admits_new_request() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     let _rx = make_request(&mut sched, 5);
     assert!(sched.has_work());
 
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     assert_eq!(decision.prefills.len(), 1);
     assert_eq!(decision.prefills[0].token_ids.len(), 5);
     assert_eq!(decision.total_tokens, 5);
@@ -87,25 +87,25 @@ fn test_scheduler_admits_new_request() {
 #[test]
 fn test_scheduler_prefill_chunking() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     // max_prefill_tokens = 10, prompt = 25 tokens → 3 chunks (10, 10, 5)
     let mut sched = BatchScheduler::new(64, 4096, 10, 0.1);
 
     let _rx = make_request(&mut sched, 25);
 
     // Iteration 1: first chunk of 10
-    let d1 = sched.schedule(&cache);
+    let d1 = sched.schedule(&mut cache);
     assert_eq!(d1.prefills.len(), 1);
     assert_eq!(d1.prefills[0].token_ids.len(), 10);
     assert_eq!(d1.total_tokens, 10);
 
     // Iteration 2: second chunk of 10
-    let d2 = sched.schedule(&cache);
+    let d2 = sched.schedule(&mut cache);
     assert_eq!(d2.prefills.len(), 1);
     assert_eq!(d2.prefills[0].token_ids.len(), 10);
 
     // Iteration 3: final chunk of 5
-    let d3 = sched.schedule(&cache);
+    let d3 = sched.schedule(&mut cache);
     assert_eq!(d3.prefills.len(), 1);
     assert_eq!(d3.prefills[0].token_ids.len(), 5);
 
@@ -120,12 +120,12 @@ fn test_scheduler_prefill_chunking() {
 #[test]
 fn test_scheduler_decode_priority() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     // Add and "prefill" a sequence, then give it a generated token.
     let _rx1 = make_request(&mut sched, 3);
-    let _d = sched.schedule(&cache); // prefills seq 0
+    let _d = sched.schedule(&mut cache); // prefills seq 0
 
     // Manually mark it as having a generated token (simulating sampling).
     let seq = sched.active.get_mut(&0).unwrap();
@@ -135,7 +135,7 @@ fn test_scheduler_decode_priority() {
     let _rx2 = make_request(&mut sched, 5);
 
     // Schedule: decode for seq 0 should come first, then prefill for seq 1.
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     assert_eq!(decision.decodes.len(), 1);
     assert_eq!(decision.decodes[0].seq_id, 0);
     assert_eq!(decision.prefills.len(), 1);
@@ -147,7 +147,7 @@ fn test_scheduler_decode_priority() {
 #[test]
 fn test_scheduler_max_batch_tokens_limit() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     // max_batch_tokens = 8
     let mut sched = BatchScheduler::new(64, 8, 512, 0.1);
 
@@ -156,7 +156,7 @@ fn test_scheduler_max_batch_tokens_limit() {
     let _rx1 = make_request(&mut sched, 5);
     let _rx2 = make_request(&mut sched, 5);
 
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     assert_eq!(decision.prefills.len(), 2);
     assert_eq!(decision.prefills[0].token_ids.len(), 5); // full first request
     assert_eq!(decision.prefills[1].token_ids.len(), 3); // chunked second request
@@ -171,7 +171,7 @@ fn test_scheduler_max_batch_tokens_limit() {
 #[test]
 fn test_scheduler_cleanup_on_max_tokens() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -241,7 +241,7 @@ fn test_scheduler_cleanup_sends_length_event() {
 #[test]
 fn test_scheduler_cleanup_on_stop_token() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -300,7 +300,7 @@ fn test_scheduler_cleanup_on_disconnect() {
 fn test_admission_rejected_by_block_pool() {
     let backend = MockBackend::new();
     // 3 blocks × BLOCK_SIZE(16) = 48 tokens max capacity.
-    let cache = PagedKvCacheManager::new(3, 2, 2, 16, &backend).unwrap();
+    let mut cache = PagedKvCacheManager::new(3, 2, 2, 16, &backend).unwrap();
     // block_pool_reserve = 0.5 → reserved = ceil(3 * 0.5) = 2 blocks.
     // Available after reserve = 3 - 2 = 1 block = 16 tokens.
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.5);
@@ -308,7 +308,7 @@ fn test_admission_rejected_by_block_pool() {
     // Prompt of 20 tokens → needs ceil(20/16) = 2 blocks > 1 available.
     let _rx = make_request(&mut sched, 20);
 
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     assert!(decision.prefills.is_empty(), "should not admit when blocks insufficient after reserve");
     assert_eq!(decision.total_tokens, 0);
     // Request stays in the prefill queue.
@@ -319,7 +319,7 @@ fn test_admission_rejected_by_block_pool() {
 fn test_block_pool_reserve_prevents_starvation() {
     let backend = MockBackend::new();
     // 6 blocks total; reserve = 0.5 → reserved = 3 blocks.
-    let cache = PagedKvCacheManager::new(6, 2, 2, 16, &backend).unwrap();
+    let mut cache = PagedKvCacheManager::new(6, 2, 2, 16, &backend).unwrap();
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.5);
 
     // Insert an active decode sequence (already prefilled, has a generated token).
@@ -346,7 +346,7 @@ fn test_block_pool_reserve_prevents_starvation() {
     // Enqueue a bigger one: 64 tokens → needs 4 blocks > 3 available.
     let _rx2 = make_request(&mut sched, 64);
 
-    let decision = sched.schedule(&cache);
+    let decision = sched.schedule(&mut cache);
     // Active decode should still be scheduled.
     assert_eq!(decision.decodes.len(), 1, "active decode should still run");
     assert_eq!(decision.decodes[0].seq_id, seq_id);
@@ -358,7 +358,7 @@ fn test_block_pool_reserve_prevents_starvation() {
 #[test]
 fn test_max_batch_size_limit() {
     let backend = MockBackend::new();
-    let cache = make_cache(&backend);
+    let mut cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(2, 4096, 512, 0.1);
 
     // Admit 3 sequences via prefill, then move them to active decode state.
@@ -367,7 +367,7 @@ fn test_max_batch_size_limit() {
         rxs.push(make_request(&mut sched, 3));
     }
     // First schedule admits up to max_batch_size=2 prefills.
-    let d1 = sched.schedule(&cache);
+    let d1 = sched.schedule(&mut cache);
     assert_eq!(d1.prefills.len(), 2);
     assert_eq!(sched.num_pending(), 1);
 
@@ -377,7 +377,7 @@ fn test_max_batch_size_limit() {
     }
 
     // Schedule again: 2 active decodes fill max_batch_size, third still pending.
-    let d2 = sched.schedule(&cache);
+    let d2 = sched.schedule(&mut cache);
     assert!(d2.decodes.len() <= 2, "decodes should be capped at max_batch_size");
     assert_eq!(
         d2.decodes.len() + d2.prefills.len(),

@@ -130,7 +130,7 @@ impl BatchScheduler {
     /// 1. Include all active decodes (cheap, latency-sensitive).
     /// 2. Continue chunked prefills for partially-prefilled sequences.
     /// 3. Admit new requests if capacity and memory allow.
-    pub fn schedule(&mut self, cache: &PagedKvCacheManager) -> SchedulerDecision {
+    pub fn schedule(&mut self, cache: &mut PagedKvCacheManager) -> SchedulerDecision {
         let mut decision = SchedulerDecision {
             prefills: Vec::new(),
             decodes: Vec::new(),
@@ -246,6 +246,18 @@ impl BatchScheduler {
             let Some(req) = self.prefill_queue.pop_front() else { break };
             let seq_id = req.seq_id;
 
+            // Allocate cache immediately — no placeholder handles.
+            let handle = match cache.alloc() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("cache alloc failed for seq {seq_id}: {e}");
+                    let _ = req.event_tx.send(crate::GenerationEvent::Error(
+                        format!("cache allocation failed: {e}"),
+                    ));
+                    continue;
+                }
+            };
+
             let chunk_size = prompt_len
                 .min(remaining_batch_cap)
                 .min(remaining_prefill_cap);
@@ -260,10 +272,6 @@ impl BatchScheduler {
             };
 
             let positions: Vec<u32> = (0..chunk.len()).map(|p| p as u32).collect();
-
-            // We need a CacheHandle — the caller must alloc before adding to active.
-            // Use CacheHandle(seq_id) as a placeholder; the loop will alloc.
-            let handle = CacheHandle(seq_id);
 
             decision.prefills.push(PrefillJob {
                 seq_id,
