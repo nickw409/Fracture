@@ -11,7 +11,7 @@ Pipeline-parallel execution over TCP. OpenAI-compatible API. Zero engine changes
 [![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-Supported-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-[Architecture](#architecture) · [Features](#features) · [TurboQuant](#turboquant-kv-cache-compression) · [Quick Start](#quick-start) · [Distributed Inference](#distributed-inference) · [Testing](#testing) · [Roadmap](#roadmap)
+[Architecture](#architecture) · [Features](#features) · [TurboQuant](#turboquant-kv-cache-compression) · [Quick Start](#quick-start) · [Distributed Inference](#distributed-inference) · [Network Resilience](#network-resilience) · [Testing](#testing) · [Roadmap](#roadmap)
 
 </div>
 
@@ -19,7 +19,7 @@ Pipeline-parallel execution over TCP. OpenAI-compatible API. Zero engine changes
 
 Fracture is a from-scratch LLM inference engine (~41k lines of Rust, ~1300 lines of CUDA) designed around one principle: **the engine never knows what GPU it's running on**. All compute flows through a `Backend` trait, making the core engine, generation loop, HTTP server, and wire protocol completely backend-agnostic. Today that backend is CUDA; tomorrow it's Metal, and a single inference cluster can mix both.
 
-The system runs Llama 3.1 8B with full numerical validation against PyTorch — greedy generation is token-for-token identical. It has been validated across heterogeneous hardware (RTX 5090 + RTX 3090) in multi-machine distributed inference. KV cache compression via [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) (ICLR 2026) reduces memory consumption by 5x with 0.999 cosine similarity to FP16 output.
+The system runs Llama 3.1 8B with full numerical validation against PyTorch — greedy generation is token-for-token identical. It has been validated across heterogeneous hardware (RTX 5090 + RTX 3090) in multi-machine distributed inference. KV cache compression via [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) (ICLR 2026) reduces memory consumption by 5x with 0.999 cosine similarity to FP16 output. The cluster is self-healing: workers reconnect after coordinator death, any worker can win a leader election, and nodes can join or leave without restarting the cluster.
 
 ## Architecture
 
@@ -86,8 +86,9 @@ The workspace enforces strict dependency boundaries — engine, server, and prot
 | `fracture-generate` | Sampling (temperature, top-k, top-p, seeded RNG), generation loop, cooperative cancellation |
 | `fracture-server` | OpenAI-compatible HTTP API (axum), SSE streaming, batched + serialized modes |
 | `fracture-gguf` | GGUF v3 file parser and weight loader (FP16/FP32/BF16) |
-| `fracture-protocol` | Binary wire protocol over TCP (CRC32C integrity, 12 message types, 256 MB cap) |
-| `fracture-coordinator` | Scheduler, peer registry, heartbeat, distributed pipeline (single + batched forward) |
+| `fracture-protocol` | Binary wire protocol over TCP (CRC32C integrity, 20 message types, 256 MB cap) |
+| `fracture-coordinator` | Scheduler, peer registry, heartbeat, distributed pipeline (single + batched forward), rebalance orchestration |
+| `fracture-election` | Priority-based leader election: `ElectionAgent`, `TermTracker`, bully-algorithm state machine |
 | `fracture-cuda` | CUDA `Backend` implementation: 10 hand-written kernels (including TurboQuant compress/decompress/attention) + cuBLAS matmul |
 
 ## Features
@@ -123,6 +124,14 @@ Hand-written kernels optimized for inference:
 - Heartbeat protocol with nonce-validated acks and dead-worker detection
 - Cache lifecycle management: alloc with partial-failure rollback, reuse after free
 - Distributed batched forward with per-worker paged cache and block pool admission control
+
+### Network Resilience
+- **Worker reconnection** — workers reconnect automatically after coordinator death; `ReRegister` protocol skips weight reload on reconnect
+- **Leader election** — priority-based bully algorithm; any worker can become coordinator without human intervention; term numbers prevent split-brain
+- **Seed node discovery** — new nodes query a known seed address (`WhoIsCoordinator` message) to find the current coordinator regardless of which node was originally elected
+- **Dynamic join/leave** — workers join mid-run with deferred pipeline integration (`Pending` status); workers leave gracefully via drain (active requests complete before departure)
+- **Crash recovery** — coordinator detects dead workers via heartbeat timeout, aborts in-flight sequences, and rebuilds the pipeline with surviving workers
+- **`fracture.env` config file** — all CLI flags can be set via a config file; loaded at startup, CLI flags take precedence
 
 ### Numerical Validation
 - Per-layer comparison against PyTorch reference tensors (rtol=1e-3, atol=1e-3)
@@ -180,10 +189,10 @@ cargo run --release -p fracture-coordinator-cuda -- \
     --tokenizer /path/to/tokenizer.json \
     --listen 0.0.0.0:9410 \
     --http-port 8080 \
-    --num-workers 2
+    --min-workers 2
 ```
 
-Start a worker on machine B:
+Start workers on machines B and C:
 
 ```bash
 cargo run --release -p fracture-worker-cuda -- \
@@ -191,11 +200,73 @@ cargo run --release -p fracture-worker-cuda -- \
     --model /path/to/llama-3-8b.gguf
 ```
 
-The coordinator waits for all workers to register, runs calibration, assigns layers based on measured GPU performance, and starts serving. The HTTP API is identical — clients don't know inference is distributed.
+The coordinator waits until `--min-workers` are registered, runs calibration, assigns layers based on measured GPU performance, and starts serving. The HTTP API is identical — clients don't know inference is distributed. Additional workers can join after startup and will be integrated dynamically.
+
+### Config File
+
+All flags can be set in a `fracture.env` file in the working directory (CLI flags take precedence):
+
+```ini
+FRACTURE_MODEL=/path/to/llama-3-8b.gguf
+FRACTURE_LISTEN=0.0.0.0:9410
+FRACTURE_HTTP_PORT=8080
+FRACTURE_MIN_WORKERS=2
+FRACTURE_SEEDS=192.168.1.10:9410,192.168.1.11:9410
+```
+
+See `fracture.env.example` for all documented keys.
 
 ### How Scheduling Works
 
 Each worker runs calibration forward passes at registration. The scheduler uses these timings to assign layers proportional to each GPU's speed, then clamps assignments to fit in available memory. Slow workers can be pruned entirely. The result: a heterogeneous cluster (e.g., RTX 5090 + RTX 3090) where each GPU gets the workload it can handle.
+
+## Network Resilience
+
+### Leader Election
+
+Any worker can become the coordinator. When the current coordinator dies, workers detect the timeout via heartbeat, then hold an election:
+
+1. Each worker has an `--election-priority` (higher wins). Default derives from IP/port.
+2. Workers exchange `ElectionStart` challenges; the highest-priority live node wins.
+3. The winner broadcasts `Victory` and starts accepting connections as coordinator.
+4. Term numbers are monotonically increasing — a coordinator with an older term is rejected.
+
+```bash
+# Worker that should become coordinator if the primary fails
+cargo run --release -p fracture-worker-cuda -- \
+    --coordinator <primary>:9410 \
+    --model /path/to/model.gguf \
+    --election-priority 100 \
+    --peer-port 9411
+```
+
+### Seed Node Discovery
+
+New nodes need to find the current coordinator. Pass one or more well-known seed addresses; nodes will query them with `WhoIsCoordinator` to resolve the actual coordinator address even after failover:
+
+```bash
+cargo run --release -p fracture-worker-cuda -- \
+    --model /path/to/model.gguf \
+    --seed 192.168.1.10:9410 \
+    --seed 192.168.1.11:9411
+```
+
+### Graceful Leave and Dynamic Join
+
+```bash
+# Drain a worker before taking it offline (waits for active requests to finish)
+curl -X POST http://<coordinator>:8080/admin/drain \
+  -H "Content-Type: application/json" \
+  -d '{"worker_id": "192.168.1.12:9412"}'
+
+# View current cluster state
+curl http://<coordinator>:8080/admin/cluster
+
+# Trigger a manual pipeline rebalance
+curl -X POST http://<coordinator>:8080/admin/rebalance
+```
+
+Workers that join after the pipeline is running are held in `Pending` state and integrated on the next rebalance without interrupting in-flight requests.
 
 ## TurboQuant KV Cache Compression
 
@@ -299,8 +370,9 @@ Tests are organized into thread groups via nextest config to manage GPU memory:
 | Sampling | Temperature, top-k, top-p, greedy, NaN/Inf handling, seeded RNG |
 | Generation | Prefill/decode, stop conditions, metrics, cancellation, stop reason |
 | Server | Request validation, chat template, response format, batched routes |
-| Protocol | Frame encoding, message roundtrip, CRC integrity, 12 message types |
-| Coordinator | Scheduler, registry, state, heartbeat, distributed pipeline, rollback |
+| Protocol | Frame encoding, message roundtrip, CRC integrity, 20 message types (including election + reconnect) |
+| Coordinator | Scheduler, registry, state, heartbeat, distributed pipeline, rollback, rebalance, drain |
+| Election | ElectionAgent term progression, TermTracker split-brain prevention, seed discovery |
 | Batch scheduler | Decode priority, prefill chunking, admission control, block pool reserve |
 | TurboQuant | Compress/decompress round-trip (2/4/8-bit), norm preservation, zero vector safety, e2e A/B vs FP16 |
 | Model validation | PyTorch reference comparison, golden generation, kernel correctness |
@@ -330,6 +402,8 @@ python scripts/dump_reference.py --golden \
 
 **Decode-priority scheduling.** Active decodes are always scheduled before new prefills. A decode step is one token per sequence (fast, latency-sensitive). A prefill can be hundreds of tokens (slow, throughput-oriented). Starving decodes would spike time-to-first-token for every in-flight request.
 
+**Priority bully election, not Raft.** Distributed consensus (Raft, Paxos) is designed for replicated state machines that must agree on a log. Fracture's coordinator holds no persistent state that requires consensus — workers hold their own weights, and the pipeline assignment can be recomputed from scratch on failover. A priority-based bully algorithm is sufficient: the highest-priority reachable node wins, term numbers prevent split-brain from a rejoining stale coordinator. This keeps the election crate small and the failure path deterministic.
+
 **TurboQuant: MSE-only, no QJL.** The TurboQuant paper proposes QJL residual correction for unbiased inner products. Community validation across 6+ independent implementations showed that softmax exponentially amplifies QJL's variance, producing worse results than MSE-only quantization. Fracture implements the V3 MSE-only approach. The `PagedCache` trait keeps the forward pass generic — TurboQuant required zero changes to `batched_forward`, only a new trait implementation.
 
 ## WSL2 Notes
@@ -350,7 +424,8 @@ If CUDA tests segfault, verify `nvidia-smi` works and `.cargo/config.toml` is pr
 | 3 | Distribution (wire protocol, scheduling, heartbeat, multi-machine) | **Complete** |
 | 4 | Production (paged KV cache, continuous batching, distributed batching) | **Complete** |
 | 4.5 | [TurboQuant](docs/turboquant.md) KV cache compression (5x memory reduction, ICLR 2026) | **Complete** |
-| 5 | Cross-platform (Metal backend for Apple Silicon — heterogeneous clusters) | Planned |
+| 5 | Network resilience (leader election, worker reconnection, seed discovery, dynamic join/leave) | **Complete** |
+| 6 | Cross-platform (Metal backend for Apple Silicon — heterogeneous clusters) | Planned |
 
 ## License
 
