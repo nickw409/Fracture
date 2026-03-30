@@ -14,6 +14,7 @@
       "Bash(git log:*)",
       "Bash(git stash:*)",
       "Bash(git push:*)",
+      "Bash(git -C:*)",
       "Bash(vex validate:*)",
       "Bash(vex check:*)",
       "Bash(vex guide:*)",
