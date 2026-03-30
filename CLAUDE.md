@@ -72,6 +72,31 @@ cargo clippy         # Lint
 
 **Always use `cargo nextest run`, never `cargo test`.** Nextest enforces test groups in `.config/nextest.toml` that serialize GPU-memory-sensitive and e2e tests. `cargo test` ignores these groups and will cause OOM or port conflicts.
 
+### Worktrees
+
+Use git worktrees for isolated feature branches. Convention: `../Fracture-<feature>` as a sibling directory with a matching branch name.
+
+```bash
+git branch my-feature
+git worktree add ../Fracture-my-feature my-feature
+```
+
+**Use `git -C <worktree-path>` for all git operations in worktrees** — do not `cd` into the worktree for git commands. `git -C` matches the permission pattern `Bash(git -C:*)` directly, while `cd && git` does not.
+
+```bash
+git -C ../Fracture-my-feature add -A
+git -C ../Fracture-my-feature commit -m "message"
+```
+
+For non-git commands (cargo, etc.), use `cd <path> && cargo ...`. Edits to worktree files work normally since user-level permissions cover `/home/nick/projects/Fracture*/**`.
+
+When done, merge back and clean up:
+```bash
+git merge my-feature --no-ff -m "merge: description"
+git worktree remove ../Fracture-my-feature
+git branch -d my-feature
+```
+
 CUDA backend requires NVIDIA GPU + CUDA toolkit. The workspace compiles without CUDA for non-GPU crates.
 
 **No manual `export LD_LIBRARY_PATH` is needed.** The `.cargo/config.toml` sets it automatically for all cargo commands (including nextest). This is required on WSL2 where the CUDA driver lives in `/usr/lib/wsl/lib/`.
