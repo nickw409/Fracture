@@ -7,9 +7,11 @@
 use anyhow::Result;
 use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
+use fracture_core::TurboQuantConfig;
 use fracture_engine::{
     batched_forward_node, CacheHandle, ComputeNode, ComputeNodeImpl, Engine, KvCacheManager,
-    NodeConfig, NodeInput, NodeOutput, PagedKvCacheManager, SequenceSlice, BLOCK_SIZE,
+    NodeConfig, NodeInput, NodeOutput, PagedKvCacheManager, QuantizedKvCacheManager,
+    SequenceSlice, BLOCK_SIZE,
     paged_kv_cache::compute_num_blocks,
 };
 use fracture_gguf::{GgufParser, WeightStore};
@@ -60,6 +62,32 @@ async fn main() -> Result<()> {
         .position(|a| a == "--node-id")
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| format!("worker-gpu{gpu_device}"));
+
+    // TurboQuant KV cache compression (opt-in)
+    let kv_quant = args
+        .iter()
+        .position(|a| a == "--kv-quant")
+        .and_then(|i| args.get(i + 1).cloned());
+    let tq_config = if kv_quant.as_deref() == Some("turboquant") {
+        let key_bits: u8 = args.iter().position(|a| a == "--tq-key-bits")
+            .and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(4);
+        let value_bits: u8 = args.iter().position(|a| a == "--tq-value-bits")
+            .and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(2);
+        let protected_bits: u8 = args.iter().position(|a| a == "--tq-protected-bits")
+            .and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(8);
+        let protected_layers: usize = args.iter().position(|a| a == "--tq-protected-layers")
+            .and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let seed: u64 = args.iter().position(|a| a == "--tq-seed")
+            .and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(42);
+        let config = TurboQuantConfig {
+            key_bits, value_bits, protected_bits, protected_layers,
+            residual_tokens: 0, seed,
+        };
+        config.validate().expect("invalid TurboQuant config");
+        Some(config)
+    } else {
+        None
+    };
 
     tracing::info!("Fracture worker (CUDA backend)");
     tracing::info!("node_id: {node_id}");
@@ -167,6 +195,38 @@ async fn main() -> Result<()> {
     // FFN intermediates) and cuBLAS workspace. 512 MB was insufficient for
     // prompts longer than ~10 tokens.
     let scratch_reserve = 2 * 1024 * 1024 * 1024;
+
+    // TurboQuant: allocate quantized cache if configured, otherwise FP16 paged cache
+    let mut _quantized_cache: Option<QuantizedKvCacheManager> = None;
+    if let Some(ref tq_cfg) = tq_config {
+        let num_blocks = tq_cfg.compute_num_blocks(
+            gpu_avail,
+            scratch_reserve,
+            layer_range.len(),
+            ack.model_config.num_kv_heads,
+            ack.model_config.head_dim,
+        );
+        let bytes_per_block = tq_cfg.bytes_per_block_total(
+            layer_range.len(), ack.model_config.num_kv_heads, ack.model_config.head_dim,
+        );
+        tracing::info!(
+            "TurboQuant KV cache: K{}V{} ({} blocks, {:.1} MB, ~{} tokens)",
+            tq_cfg.key_bits, tq_cfg.value_bits,
+            num_blocks,
+            (num_blocks * bytes_per_block) as f64 / 1e6,
+            num_blocks * BLOCK_SIZE,
+        );
+        _quantized_cache = Some(QuantizedKvCacheManager::new(
+            num_blocks,
+            layer_range.len(),
+            ack.model_config.num_kv_heads,
+            ack.model_config.head_dim,
+            512, // max_compress_tokens (prefill chunk size)
+            tq_cfg.clone(),
+            node.engine().backend(),
+        )?);
+    }
+
     let num_blocks = compute_num_blocks(
         gpu_avail,
         scratch_reserve,
@@ -186,12 +246,14 @@ async fn main() -> Result<()> {
         * ack.model_config.head_dim
         * 2 * 2
         * layer_range.len();
-    tracing::info!(
-        "paged KV cache: {} blocks ({:.1} MB), ~{} tokens capacity",
-        num_blocks,
-        (num_blocks * bytes_per_block) as f64 / 1e6,
-        num_blocks * BLOCK_SIZE,
-    );
+    if tq_config.is_none() {
+        tracing::info!(
+            "paged KV cache: {} blocks ({:.1} MB), ~{} tokens capacity",
+            num_blocks,
+            (num_blocks * bytes_per_block) as f64 / 1e6,
+            num_blocks * BLOCK_SIZE,
+        );
+    }
 
     // Sequence tracking: seq_id -> CacheHandle
     let mut handles: HashMap<u64, CacheHandle> = HashMap::new();
