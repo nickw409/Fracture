@@ -104,7 +104,21 @@ async fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| format!("worker-gpu{gpu_device}"));
 
+    let election_priority: u32 = args
+        .iter()
+        .position(|a| a == "--election-priority")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(u32::MAX); // default: lowest priority (won't win elections)
+
+    let coordinator_capable = !args.iter().any(|a| a == "--no-coordinator");
+
     tracing::info!("Fracture worker (CUDA backend)");
+    if coordinator_capable {
+        tracing::info!("election priority: {election_priority}");
+    } else {
+        tracing::info!("coordinator-capable: false (--no-coordinator)");
+    }
     tracing::info!("node_id: {node_id}");
     tracing::info!("coordinator: {coordinator_addr}");
     tracing::info!("model: {model_path}");
@@ -270,6 +284,20 @@ async fn main() -> Result<()> {
 
     // Cluster manifest — updated by coordinator broadcasts, used for election/reconnection.
     let mut cluster_manifest: Option<ClusterManifestPayload> = None;
+
+    // Election agent — initialized if coordinator-capable.
+    let mut election_agent = if coordinator_capable {
+        Some(fracture_election::state_machine::ElectionAgent::new(
+            fracture_election::state_machine::ElectionConfig {
+                node_id: node_id.clone(),
+                priority: election_priority,
+                election_window: Duration::from_secs(5),
+            },
+            0, // initial term — updated from cluster manifest
+        ))
+    } else {
+        None
+    };
 
     // SIGTERM handler: set flag so serve loop can send LeaveIntent gracefully.
     let leave_requested = Arc::new(AtomicBool::new(false));
@@ -579,8 +607,28 @@ async fn main() -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
         let backoff_factor = 2u32;
+        let disconnect_time = std::time::Instant::now();
+        let election_timeout = Duration::from_secs(15); // 3 missed heartbeats
+        let mut election_started = false;
 
         loop {
+            // Check if we should start an election (FT-11).
+            if !election_started
+                && coordinator_capable
+                && disconnect_time.elapsed() >= election_timeout
+                && cluster_manifest.is_some()
+            {
+                if let Some(ref mut agent) = election_agent {
+                    let term = agent.start_election();
+                    election_started = true;
+                    tracing::info!(
+                        "election timeout reached — starting election (term={term})"
+                    );
+                    // FT-12 will implement actual peer communication here.
+                    // For now, log the intent and continue reconnection attempts.
+                    // If this node wins (no challengers), FT-12 will handle promotion.
+                }
+            }
             // Apply +/-25% jitter to prevent thundering herd
             let jitter_range = backoff.as_millis() as f64 * 0.25;
             let jitter_ms = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
