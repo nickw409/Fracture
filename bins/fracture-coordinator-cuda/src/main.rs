@@ -23,6 +23,10 @@ use fracture_protocol::{
     messages::*,
 };
 use fracture_server::api::*;
+use fracture_server::dashboard::dto::ModelInfo as DashboardModelInfo;
+use fracture_server::dashboard::metrics::MetricsCollector;
+use fracture_server::dashboard::request_log::RequestLog;
+use fracture_server::dashboard::routes::{dashboard_routes, ClusterProvider, DashboardState};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -292,12 +296,35 @@ async fn main() -> Result<()> {
         max_seq_len: config.max_seq_len,
     });
 
+    // Build dashboard state
+    let dashboard_state = Arc::new(DashboardState {
+        metrics: Arc::new(MetricsCollector::new()),
+        request_log: Arc::new(RequestLog::new()),
+        cluster: ClusterProvider::Standalone {
+            gpu_name: "distributed".to_string(),
+            vram_total_mb: 0,
+            vram_used_mb: 0,
+            model: DashboardModelInfo {
+                name: "llama-3-8b".to_string(),
+                parameters: "8B".to_string(),
+                layers: model_config.num_layers,
+                context_length: config.max_seq_len,
+                dtype: "FP16".to_string(),
+            },
+            total_layers: model_config.num_layers,
+        },
+        scheduler: None,
+    });
+
     // Build HTTP router
+    use tower_http::cors::CorsLayer;
     let router = Router::new()
         .route("/v1/completions", post(completions_handler))
         .route("/v1/models", get(models_handler))
         .route("/health", get(health_handler))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .merge(dashboard_routes(dashboard_state))
+        .layer(CorsLayer::permissive());
 
     // Start HTTP server
     let http_addr = format!("0.0.0.0:{}", config.http_port);

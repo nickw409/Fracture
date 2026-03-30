@@ -5,7 +5,9 @@ description: |
   Phase 2: node abstraction — engine operates on arbitrary layer ranges, accepts/returns activation
   tensors, enabling pipeline-parallel inference across multiple nodes on one machine.
   Phase 3: distributed inference — wire protocol, scheduling, heartbeat, multi-machine pipeline.
-  Phase 4 (in progress): production inference — paged KV cache, continuous batching, fault tolerance.
+  Phase 4: production inference — paged KV cache, continuous batching, distributed batching.
+  Dashboard: React/TypeScript observability UI with cluster topology, live metrics, inference
+  playground, and scheduler visualization. Served as static files or via Vite dev proxy.
   CUDA backend initially; engine is backend-agnostic via the Backend trait to support Metal in Phase 5+.
   Testing validates correctness at every layer from individual GPU kernels through end-to-end generation.
 
@@ -2517,3 +2519,285 @@ sections:
           Multiple concurrent HTTP requests produce correct, independent
           results. Each sequence's output matches what it would produce
           if run alone.
+
+      - name: scheduler-loop-snapshot
+        status: implemented
+        description: |
+          The scheduler loop accepts Snapshot commands via a oneshot channel
+          alongside Submit commands. Snapshots read BatchScheduler and
+          PagedKvCacheManager state without blocking the hot path, returning
+          a SchedulerSnapshot DTO to the dashboard endpoint.
+
+  # ============================================================
+  # DASHBOARD BACKEND (DTOs and Infrastructure)
+  # ============================================================
+  - name: Dashboard DTOs
+    path: crates/fracture-server/src/dashboard
+    status: implemented
+    description: |
+      Serializable response types for all dashboard API endpoints.
+      Separate from internal engine types — constructed by handlers
+      from mode-specific data sources (standalone vs distributed).
+    shared: [error-handling]
+    behaviors:
+      - name: cluster-response-dto
+        status: implemented
+        description: |
+          ClusterResponse includes mode (standalone/distributed),
+          worker list with GPU info, VRAM usage, layer assignments,
+          heartbeat status, and model metadata.
+
+      - name: scheduler-response-dto
+        status: implemented
+        description: |
+          SchedulerResponse includes active/max sequences, decode/prefill
+          queue counts, KV cache block pool stats (total, allocated, free,
+          utilization), and per-sequence state.
+
+      - name: metrics-event-dto
+        status: implemented
+        description: |
+          MetricsEvent for SSE stream includes throughput (tok/s), active
+          requests, TTFT, inter-token latency, cache utilization, and
+          per-worker heartbeat ages.
+
+      - name: request-record-dto
+        status: implemented
+        description: |
+          RequestRecord captures completed request metadata: type,
+          status, token counts, timing (TTFT, total duration, tok/s),
+          finish reason, temperature, and creation timestamp.
+
+  - name: Dashboard Metrics Collector
+    path: crates/fracture-server/src/dashboard
+    status: implemented
+    description: |
+      Thread-safe metrics aggregator shared between HTTP handlers
+      (which record completions) and the SSE endpoint (which reads
+      snapshots). Uses Arc<Mutex<Inner>> for safe concurrent access.
+    shared: [error-handling]
+    behaviors:
+      - name: throughput-sliding-window
+        status: implemented
+        description: |
+          Tracks completed tokens in a 10-second sliding window.
+          Throughput = total tokens in window / window duration.
+          Old entries pruned on each snapshot() call.
+
+      - name: latency-ema
+        status: implemented
+        description: |
+          Exponential moving average (alpha=0.3) for time-to-first-token
+          and inter-token latency. Updated on each request completion.
+          Zero values used as initial state.
+
+      - name: active-request-tracking
+        status: implemented
+        description: |
+          Incremented on request_started(), decremented on
+          record_completion(). Saturating subtraction prevents underflow.
+
+  - name: Dashboard Request Log
+    path: crates/fracture-server/src/dashboard
+    status: implemented
+    description: |
+      Bounded FIFO log of completed requests. Newest first.
+      Arc-shared for concurrent push (handlers) and read (endpoint).
+    shared: [error-handling]
+    behaviors:
+      - name: bounded-capacity
+        status: implemented
+        description: |
+          VecDeque capped at 1000 entries behind a Mutex.
+          push() adds to front, evicts from back when full.
+
+      - name: paginated-read
+        status: implemented
+        description: |
+          page(page, per_page) returns a slice of records with
+          total count. Page is 1-indexed, per_page clamped to 1-100.
+
+  # ============================================================
+  # DASHBOARD API ENDPOINTS
+  # ============================================================
+  - name: Dashboard API Endpoints
+    path: crates/fracture-server/src/dashboard
+    status: implemented
+    description: |
+      REST and SSE endpoints for the dashboard UI. Registered as a
+      sub-router merged into both create_router and create_batched_router.
+      CORS permissive layer applied for dev-mode cross-origin requests.
+    shared: [error-handling]
+    behaviors:
+      - name: cluster-endpoint
+        status: implemented
+        description: |
+          GET /v1/cluster returns ClusterResponse. In standalone mode,
+          constructs a single worker from backend GPU info. Uses
+          ClusterProvider enum for mode-specific data sources.
+
+      - name: scheduler-endpoint
+        status: implemented
+        description: |
+          GET /v1/scheduler returns SchedulerResponse. Uses
+          SchedulerHandle::snapshot() oneshot mechanism for batched
+          modes. Returns empty response for non-batched standalone.
+
+      - name: metrics-stream-endpoint
+        status: implemented
+        description: |
+          GET /v1/metrics/stream is an SSE endpoint that pushes a
+          MetricsEvent every second via tokio::time::interval. Calls
+          MetricsCollector::snapshot(). Stream never ends — zero
+          values emitted when idle.
+
+      - name: requests-endpoint
+        status: implemented
+        description: |
+          GET /v1/requests returns paginated RequestsResponse.
+          Supports ?page=N&per_page=M query parameters via axum
+          Query extractor.
+
+      - name: cors-middleware
+        status: implemented
+        description: |
+          CorsLayer::permissive() applied to all routers (create_router,
+          create_batched_router, coordinator router) for dashboard
+          dev-mode cross-origin access.
+
+      - name: dashboard-route-merging
+        status: implemented
+        description: |
+          dashboard_routes() returns a Router with all dashboard
+          endpoints. Merged into existing API routers via Router::merge
+          in both standalone and coordinator binaries.
+
+  # ============================================================
+  # DASHBOARD FRONTEND
+  # ============================================================
+  - name: Dashboard Frontend Foundation
+    path: fracture-dashboard/src
+    status: implemented
+    description: |
+      React 18 + TypeScript (strict) + Vite + Tailwind CSS frontend.
+      Dark theme infrastructure dashboard. Vite dev server proxies
+      /v1 and /health to the Rust backend on port 8080.
+    behaviors:
+      - name: typed-api-client
+        status: implemented
+        description: |
+          Typed fetch wrapper (api/client.ts) for REST endpoints and
+          POST-based SSE streaming (api/sse.ts) for chat completions.
+          All TypeScript interfaces mirror Rust DTOs.
+
+      - name: mock-data-mode
+        status: implemented
+        description: |
+          VITE_MOCK=true enables mock data generators for all endpoints.
+          Dashboard is fully functional without a running backend or GPU.
+          Mock data produces realistic-looking values with variation.
+
+      - name: layout-shell-routing
+        status: implemented
+        description: |
+          Shell component with icon sidebar (Cluster, Playground,
+          Scheduler) and status bar. React Router v6 with three routes.
+          StatusBar polls /health for connection indicator.
+
+      - name: polling-hooks
+        status: implemented
+        description: |
+          useCluster (5s), useScheduler (2s), useRequests (5s) hooks
+          with loading/error/data state. useMetricsStream uses native
+          EventSource for SSE with 60-event rolling buffer.
+
+  - name: Dashboard Cluster Page
+    path: fracture-dashboard/src
+    status: implemented
+    description: |
+      Landing page showing cluster topology, live performance metrics,
+      and model information.
+    behaviors:
+      - name: pipeline-visualization
+        status: implemented
+        description: |
+          PipelineView renders workers as cards arranged horizontally
+          with chevron connectors. Handles 1..N workers dynamically.
+          WorkerCard shows GPU name, layer range, VRAM bar, heartbeat
+          status dot, and calibration speed.
+
+      - name: live-metrics-sparklines
+        status: implemented
+        description: |
+          MetricsSummary displays 4 stat cards (throughput, active
+          requests, TTFT, cache utilization) with Recharts sparkline
+          graphs over the last 60 seconds of data.
+
+      - name: model-info-display
+        status: implemented
+        description: |
+          ModelInfo card shows model name, parameters, layers, context
+          length, and dtype from the cluster endpoint.
+
+  - name: Dashboard Inference Playground
+    path: fracture-dashboard/src
+    status: implemented
+    description: |
+      Multi-turn chat interface with real-time token streaming,
+      parameter controls, and generation statistics.
+    behaviors:
+      - name: streaming-chat
+        status: implemented
+        description: |
+          useInference hook manages message state, POST-based SSE
+          streaming via fetch ReadableStream, AbortController for
+          cancellation, and timing stats (TTFT, tok/s).
+
+      - name: chat-ui
+        status: implemented
+        description: |
+          ChatView with user/assistant message bubbles, textarea
+          input (Enter to send, Shift+Enter newline), streaming
+          cursor animation, and abort button during generation.
+
+      - name: parameter-controls
+        status: implemented
+        description: |
+          ParamControls with sliders for temperature (0-2, step 0.1)
+          and top_p (0-1, step 0.05), number inputs for top_k,
+          max_tokens, and seed.
+
+      - name: generation-stats-display
+        status: implemented
+        description: |
+          GenerationStats shows TTFT, tokens/second, completion
+          token count, and finish reason in mono font.
+
+  - name: Dashboard Scheduler Page
+    path: fracture-dashboard/src
+    status: implemented
+    description: |
+      Scheduler state visualization with queue stats, KV cache
+      pool bar, and active sequence table.
+    behaviors:
+      - name: queue-overview
+        status: implemented
+        description: |
+          QueueOverview shows 3 stat cards: active sequences (N/max),
+          decode queue count, prefill queue count with colored accents.
+
+      - name: cache-pool-visualization
+        status: implemented
+        description: |
+          CachePool renders horizontal progress bar with color
+          transitions (emerald <60%, amber 60-85%, red >85%).
+          Shows allocated/total blocks with percentage and
+          tokens-per-block info.
+
+      - name: sequence-table
+        status: implemented
+        description: |
+          SequenceTable with client-side sorting by ID, state,
+          tokens generated, max tokens. Colored state badges
+          (blue=prefilling, green=decoding, gray=completed).
+          Auto-refreshes via useScheduler 2s polling.

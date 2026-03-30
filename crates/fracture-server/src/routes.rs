@@ -10,11 +10,14 @@ use fracture_generate::{apply_chat_template, GenerationConfig, GenerationLoop, S
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokenizers::Tokenizer;
+use tower_http::cors::CorsLayer;
 
 use crate::api::*;
+use crate::dashboard::dto::RequestRecord;
+use crate::dashboard::routes::{dashboard_routes, ClusterProvider, DashboardState};
 
 /// Hardcoded model name for Phase 1 (single-model serving).
 /// When AppState carries the loaded model name, this should be replaced.
@@ -25,17 +28,23 @@ pub struct AppState<B: Backend> {
     pub engine: Arc<Engine<B>>,
     pub cache: Mutex<KvCacheManager>,
     pub tokenizer: Tokenizer,
+    pub dashboard: Arc<DashboardState>,
 }
 
 /// Create the HTTP router with OpenAI-compatible endpoints.
 pub fn create_router<B: Backend + 'static>(state: Arc<AppState<B>>) -> Router {
-    Router::new()
+    let dashboard_state = Arc::clone(&state.dashboard);
+
+    let api = Router::new()
         .route("/v1/completions", post(completions_handler::<B>))
         .route("/v1/chat/completions", post(chat_completions_handler::<B>))
         .route("/v1/models", get(models_handler))
         .route("/v1/profile", get(profile_handler))
         .route("/health", get(health_handler))
-        .with_state(state)
+        .with_state(state);
+
+    api.merge(dashboard_routes(dashboard_state))
+        .layer(CorsLayer::permissive())
 }
 
 async fn models_handler() -> impl IntoResponse {
@@ -100,6 +109,8 @@ async fn completions_handler<B: Backend + 'static>(
     }
 
     // Non-streaming
+    state.dashboard.metrics.request_started();
+    let t_start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let generated = {
         let mut cache = state.cache.lock().unwrap();
@@ -114,12 +125,31 @@ async fn completions_handler<B: Backend + 'static>(
                 tokens.push(t);
             }
             let text = decode_tokens(&state.tokenizer, &tokens);
-            let finish_reason = match result.stop_reason {
+            let finish_reason: &'static str = match result.stop_reason {
                 StopReason::Stop => "stop",
                 StopReason::Length => "length",
             };
+            let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            let tps = if total_duration_ms > 0.0 { tokens.len() as f64 / (total_duration_ms / 1000.0) } else { 0.0 };
+            let req_id = gen_id();
+            let record = RequestRecord {
+                id: req_id.clone(),
+                request_type: "completion",
+                status: "completed",
+                prompt_tokens: prompt_len,
+                completion_tokens: tokens.len(),
+                total_tokens: prompt_len + tokens.len(),
+                time_to_first_token_ms: 0.0,
+                total_duration_ms,
+                tokens_per_second: tps,
+                finish_reason,
+                temperature: req.temperature,
+                created_at: String::new(),
+            };
+            state.dashboard.metrics.record_completion(&record);
+            state.dashboard.request_log.push(record);
             let response = CompletionResponse {
-                id: gen_id(),
+                id: req_id,
                 object: "text_completion".to_string(),
                 created: unix_timestamp(),
                 choices: vec![Choice {
@@ -136,11 +166,30 @@ async fn completions_handler<B: Backend + 'static>(
             };
             (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body(&format!("generation failed: {e}"))),
-        )
-            .into_response(),
+        Err(e) => {
+            let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            let record = RequestRecord {
+                id: gen_id(),
+                request_type: "completion",
+                status: "error",
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                total_tokens: prompt_len,
+                time_to_first_token_ms: 0.0,
+                total_duration_ms,
+                tokens_per_second: 0.0,
+                finish_reason: "error",
+                temperature: req.temperature,
+                created_at: String::new(),
+            };
+            state.dashboard.metrics.record_completion(&record);
+            state.dashboard.request_log.push(record);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body(&format!("generation failed: {e}"))),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -191,6 +240,8 @@ async fn chat_completions_handler<B: Backend + 'static>(
     }
 
     // Non-streaming
+    state.dashboard.metrics.request_started();
+    let t_start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let generated = {
         let mut cache = state.cache.lock().unwrap();
@@ -205,12 +256,31 @@ async fn chat_completions_handler<B: Backend + 'static>(
                 tokens.push(t);
             }
             let text = decode_tokens(&state.tokenizer, &tokens);
-            let finish_reason = match result.stop_reason {
+            let finish_reason: &'static str = match result.stop_reason {
                 StopReason::Stop => "stop",
                 StopReason::Length => "length",
             };
+            let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            let tps = if total_duration_ms > 0.0 { tokens.len() as f64 / (total_duration_ms / 1000.0) } else { 0.0 };
+            let req_id = gen_id();
+            let record = RequestRecord {
+                id: req_id.clone(),
+                request_type: "chat",
+                status: "completed",
+                prompt_tokens: prompt_len,
+                completion_tokens: tokens.len(),
+                total_tokens: prompt_len + tokens.len(),
+                time_to_first_token_ms: 0.0,
+                total_duration_ms,
+                tokens_per_second: tps,
+                finish_reason,
+                temperature: req.temperature,
+                created_at: String::new(),
+            };
+            state.dashboard.metrics.record_completion(&record);
+            state.dashboard.request_log.push(record);
             let response = CompletionResponse {
-                id: gen_id(),
+                id: req_id,
                 object: "chat.completion".to_string(),
                 created: unix_timestamp(),
                 choices: vec![Choice {
@@ -230,11 +300,30 @@ async fn chat_completions_handler<B: Backend + 'static>(
             };
             (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body(&format!("generation failed: {e}"))),
-        )
-            .into_response(),
+        Err(e) => {
+            let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            let record = RequestRecord {
+                id: gen_id(),
+                request_type: "chat",
+                status: "error",
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                total_tokens: prompt_len,
+                time_to_first_token_ms: 0.0,
+                total_duration_ms,
+                tokens_per_second: 0.0,
+                finish_reason: "error",
+                temperature: req.temperature,
+                created_at: String::new(),
+            };
+            state.dashboard.metrics.record_completion(&record);
+            state.dashboard.request_log.push(record);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_body(&format!("generation failed: {e}"))),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -244,6 +333,8 @@ fn handle_streaming<B: Backend + 'static>(
     config: GenerationConfig,
     is_completion: bool,
 ) -> Sse<impl futures_core::Stream<Item = std::result::Result<Event, Infallible>> + use<B>> {
+    state.dashboard.metrics.request_started();
+
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (result_tx, mut result_rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -253,10 +344,8 @@ fn handle_streaming<B: Backend + 'static>(
     let prompt_len = prompt_tokens.len();
     let config_gen = config.clone();
     let tokenizer_for_stream = state.tokenizer.clone();
+    let dashboard = Arc::clone(&state.dashboard);
 
-    // Run generation in a blocking task since the engine is synchronous.
-    // The cancel flag is checked each decode iteration; the SSE stream sets it
-    // on client disconnect (when the stream is dropped).
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.cache.lock().unwrap();
         let result = GenerationLoop::generate_with_cancel(
@@ -270,11 +359,9 @@ fn handle_streaming<B: Backend + 'static>(
         let _ = result_tx.send(result);
     });
 
-    // When the stream is dropped (client disconnect), signal cancellation.
     let cancel_on_drop = Arc::clone(&cancel);
 
     let stream = async_stream::stream! {
-        // Guard: sets cancel flag when stream is dropped (client disconnect).
         struct CancelGuard(Arc<AtomicBool>);
         impl Drop for CancelGuard {
             fn drop(&mut self) {
@@ -287,9 +374,14 @@ fn handle_streaming<B: Backend + 'static>(
         let created = unix_timestamp();
         let model = LOADED_MODEL_NAME;
         let object = if is_completion { "text_completion" } else { "chat.completion.chunk" };
+        let t_start = Instant::now();
+        let mut t_first_token: Option<Instant> = None;
         let mut token_count = 0usize;
 
         while let Some(token_id) = rx.recv().await {
+            if t_first_token.is_none() {
+                t_first_token = Some(Instant::now());
+            }
             token_count += 1;
             let text = decode_tokens(&tokenizer_for_stream, &[token_id]);
             let delta = if is_completion {
@@ -326,7 +418,6 @@ fn handle_streaming<B: Backend + 'static>(
             None => ("error", Some("generation task dropped".to_string())),
         };
 
-        // Emit error event if generation failed
         if let Some(err_msg) = error_msg {
             let error_event = serde_json::json!({
                 "error": {
@@ -337,7 +428,6 @@ fn handle_streaming<B: Backend + 'static>(
             });
             yield Ok(Event::default().data(error_event.to_string()));
         } else {
-            // Final chunk with finish_reason
             let final_chunk = if is_completion {
                 serde_json::json!({
                     "id": id,
@@ -367,6 +457,27 @@ fn handle_streaming<B: Backend + 'static>(
             };
             yield Ok(Event::default().data(final_chunk.to_string()));
         }
+
+        // Record completion metrics.
+        let total_duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let ttft_ms = t_first_token.map(|t| (t - t_start).as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let tps = if total_duration_ms > 0.0 { token_count as f64 / (total_duration_ms / 1000.0) } else { 0.0 };
+        let record = RequestRecord {
+            id: id.clone(),
+            request_type: if is_completion { "completion" } else { "chat" },
+            status: if finish_reason == "error" { "error" } else { "completed" },
+            prompt_tokens: prompt_len,
+            completion_tokens: token_count,
+            total_tokens: prompt_len + token_count,
+            time_to_first_token_ms: ttft_ms,
+            total_duration_ms,
+            tokens_per_second: tps,
+            finish_reason,
+            temperature: 0.0,
+            created_at: String::new(),
+        };
+        dashboard.metrics.record_completion(&record);
+        dashboard.request_log.push(record);
 
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -948,6 +1059,30 @@ mod tests {
         tok
     }
 
+    fn make_test_dashboard_state() -> std::sync::Arc<DashboardState> {
+        use crate::dashboard::dto::ModelInfo;
+        use crate::dashboard::metrics::MetricsCollector;
+        use crate::dashboard::request_log::RequestLog;
+        std::sync::Arc::new(DashboardState {
+            metrics: std::sync::Arc::new(MetricsCollector::new()),
+            request_log: std::sync::Arc::new(RequestLog::new()),
+            cluster: ClusterProvider::Standalone {
+                gpu_name: "mock".to_string(),
+                vram_total_mb: 1024,
+                vram_used_mb: 0,
+                model: ModelInfo {
+                    name: "test".to_string(),
+                    parameters: "0".to_string(),
+                    layers: 2,
+                    context_length: 128,
+                    dtype: "FP32".to_string(),
+                },
+                total_layers: 2,
+            },
+            scheduler: None,
+        })
+    }
+
     fn make_test_app_state() -> std::sync::Arc<AppState<ServerMockBackend>> {
         let cfg = test_model_config();
         let backend = ServerMockBackend::new(cfg.vocab_size);
@@ -957,7 +1092,7 @@ mod tests {
             cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
         ));
         let tokenizer = make_test_tokenizer();
-        std::sync::Arc::new(AppState { engine, cache, tokenizer })
+        std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
     }
 
     #[tokio::test]
