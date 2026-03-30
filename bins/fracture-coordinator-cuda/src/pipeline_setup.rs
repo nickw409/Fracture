@@ -296,62 +296,88 @@ pub async fn reconnection_listener(
             }
         };
 
-        if header.msg_type != MessageType::Register {
-            tracing::warn!(
-                "expected Register from reconnecting {addr}, got {:?}",
-                header.msg_type
-            );
-            continue;
-        }
-
-        let reg_payload: RegisterPayload = match FramedConnection::deserialize_payload(&payload) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("failed to deserialize Register from {addr}: {e}");
+        // Accept both Register (fresh worker process) and ReRegister (surviving worker).
+        let (node_id, caps, is_reregister, current_assignment) = match header.msg_type {
+            MessageType::Register => {
+                let reg_msg: RegisterPayload = match FramedConnection::deserialize_payload(&payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("failed to deserialize Register from {addr}: {e}");
+                        continue;
+                    }
+                };
+                tracing::info!(
+                    "reconnecting worker '{}' (fresh process): {} ({:.1} GB)",
+                    reg_msg.node_id,
+                    reg_msg.gpu_model,
+                    reg_msg.gpu_memory_available as f64 / 1e9,
+                );
+                let caps = WorkerCapabilities {
+                    node_id: reg_msg.node_id.clone(),
+                    gpu_model: reg_msg.gpu_model,
+                    gpu_memory_available: reg_msg.gpu_memory_available as usize,
+                    compute_capability: reg_msg.compute_capability,
+                    decode_ms_per_layer: reg_msg.decode_ms_per_layer,
+                    prefill_ms_per_layer_128: reg_msg.prefill_ms_per_layer_128,
+                };
+                (reg_msg.node_id, caps, false, None)
+            }
+            MessageType::ReRegister => {
+                let rereg: ReRegisterPayload = match FramedConnection::deserialize_payload(&payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("failed to deserialize ReRegister from {addr}: {e}");
+                        continue;
+                    }
+                };
+                let current = rereg.current_layer_start.zip(rereg.current_layer_end)
+                    .map(|(s, e)| s as usize..e as usize);
+                tracing::info!(
+                    "reconnecting worker '{}' (surviving process): layers {:?}, {} active caches",
+                    rereg.node_id,
+                    current,
+                    rereg.active_cache_seq_ids.len(),
+                );
+                let caps = WorkerCapabilities {
+                    node_id: rereg.node_id.clone(),
+                    gpu_model: rereg.gpu_model,
+                    gpu_memory_available: rereg.gpu_memory_available as usize,
+                    compute_capability: rereg.compute_capability,
+                    decode_ms_per_layer: rereg.decode_ms_per_layer,
+                    prefill_ms_per_layer_128: rereg.prefill_ms_per_layer_128,
+                };
+                (rereg.node_id, caps, true, current)
+            }
+            other => {
+                tracing::warn!(
+                    "expected Register or ReRegister from {addr}, got {:?}",
+                    other
+                );
                 continue;
             }
-        };
-
-        tracing::info!(
-            "reconnecting worker '{}': {} ({:.1} GB)",
-            reg_payload.node_id,
-            reg_payload.gpu_model,
-            reg_payload.gpu_memory_available as f64 / 1e9,
-        );
-
-        let caps = WorkerCapabilities {
-            node_id: reg_payload.node_id.clone(),
-            gpu_model: reg_payload.gpu_model,
-            gpu_memory_available: reg_payload.gpu_memory_available as usize,
-            compute_capability: reg_payload.compute_capability,
-            decode_ms_per_layer: reg_payload.decode_ms_per_layer,
-            prefill_ms_per_layer_128: reg_payload.prefill_ms_per_layer_128,
         };
 
         {
             let mut reg = registry.lock().await;
             // Mark the old entry as dead so re-registration succeeds.
-            // The worker may reconnect before the heartbeat detects the death.
-            reg.mark_dead(&reg_payload.node_id);
+            reg.mark_dead(&node_id);
             if let Err(e) = reg.register(caps, conn) {
-                tracing::error!("failed to re-register '{}': {e}", reg_payload.node_id);
+                tracing::error!("failed to re-register '{}': {e}", node_id);
                 continue;
             }
         }
 
-        // Re-run scheduler, send RegisterAck to the fresh worker (it expects
-        // RegisterAck, not Reconfigure, since it just sent Register).
-        // Any already-running workers get Reconfigure.
+        // Re-run scheduler to get current assignments.
         let result = {
             let reg = registry.lock().await;
-            let caps = reg.all_capabilities();
-            if caps.is_empty() {
+            let all_caps = reg.all_capabilities();
+            if all_caps.is_empty() {
                 tracing::error!("no workers available after re-registration");
                 continue;
             }
             let input = scheduler::SchedulerInput {
                 model_config: model_config.clone(),
-                workers: caps,
+                workers: all_caps,
                 coordinator_compute: None,
                 mode: scheduling_mode.clone(),
                 max_seq_len,
@@ -371,7 +397,8 @@ pub async fn reconnection_listener(
             tracing::info!("  {} → layers {:?} ({:?})", a.node_id, a.layer_range, a.role);
         }
 
-        // Send RegisterAck to the reconnecting worker (fresh process expects RegisterAck).
+        // Send response to each worker. Logic depends on whether the reconnecting
+        // worker used Register (fresh process) or ReRegister (surviving process).
         let mut all_ok = true;
         {
             let mut reg = registry.lock().await;
@@ -385,10 +412,24 @@ pub async fn reconnection_listener(
                 };
                 reg.assign(&assignment.node_id, assignment.clone()).ok();
                 if let Some(entry) = reg.get_mut(&assignment.node_id) {
-                    // Fresh workers get RegisterAck, already-running workers get Reconfigure.
-                    let msg_type = if assignment.node_id == reg_payload.node_id {
-                        MessageType::RegisterAck
+                    let msg_type = if assignment.node_id == node_id {
+                        if is_reregister {
+                            // Surviving worker: check if assignment is unchanged.
+                            let assignment_unchanged = current_assignment.as_ref()
+                                .is_some_and(|cur| *cur == assignment.layer_range);
+                            if assignment_unchanged {
+                                // Same layers — worker can skip weight reload.
+                                MessageType::RegisterAck
+                            } else {
+                                // Different layers — worker must reconfigure.
+                                MessageType::Reconfigure
+                            }
+                        } else {
+                            // Fresh process always gets RegisterAck.
+                            MessageType::RegisterAck
+                        }
                     } else {
+                        // Other workers always get Reconfigure.
                         MessageType::Reconfigure
                     };
                     if let Err(e) = entry.writer.send(msg_type, 0, &ack).await {
@@ -410,13 +451,13 @@ pub async fn reconnection_listener(
             for assignment in &result.assignments {
                 if let Some(entry) = reg.get(&assignment.node_id) {
                     match entry.reader.lock().await.recv().await {
-                        Ok((header, _)) if header.msg_type == MessageType::WorkerReady => {
+                        Ok((hdr, _)) if hdr.msg_type == MessageType::WorkerReady => {
                             tracing::info!("worker '{}' ready after reconnect", assignment.node_id);
                         }
-                        Ok((header, _)) => {
+                        Ok((hdr, _)) => {
                             tracing::error!(
                                 "expected WorkerReady from '{}', got {:?}",
-                                assignment.node_id, header.msg_type
+                                assignment.node_id, hdr.msg_type
                             );
                         }
                         Err(e) => {
