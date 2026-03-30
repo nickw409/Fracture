@@ -207,9 +207,11 @@ pub async fn build_cluster_snapshot(
                 "middle"
             };
             let status = match entry.status {
+                fracture_coordinator::registry::WorkerStatus::Connected => "calibrating",
                 fracture_coordinator::registry::WorkerStatus::Ready => "active",
+                fracture_coordinator::registry::WorkerStatus::Draining => "draining",
+                fracture_coordinator::registry::WorkerStatus::Pending => "pending",
                 fracture_coordinator::registry::WorkerStatus::Dead => "dead",
-                _ => "calibrating",
             };
             let vram_total_mb =
                 (entry.capabilities.gpu_memory_available / (1024 * 1024)) as u64;
