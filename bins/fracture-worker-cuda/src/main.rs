@@ -8,8 +8,9 @@ use anyhow::Result;
 use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
 use fracture_engine::{
-    CacheHandle, ComputeNode, ComputeNodeImpl, Engine, KvCacheManager, NodeConfig, NodeInput,
-    NodeOutput,
+    batched_forward_node, CacheHandle, ComputeNode, ComputeNodeImpl, Engine, KvCacheManager,
+    NodeConfig, NodeInput, NodeOutput, PagedKvCacheManager, SequenceSlice, BLOCK_SIZE,
+    paged_kv_cache::compute_num_blocks,
 };
 use fracture_gguf::{GgufParser, WeightStore};
 use fracture_protocol::{
@@ -152,7 +153,7 @@ async fn main() -> Result<()> {
     let engine = Engine::new(backend, weights, layer_range.clone());
     let node = ComputeNodeImpl::new(engine, node_config);
 
-    // Create KV cache manager for our layer range
+    // Create KV cache manager for our layer range (contiguous — used by Forward)
     let mut cache = KvCacheManager::new(
         layer_range.len(),
         ack.model_config.num_kv_heads,
@@ -160,9 +161,46 @@ async fn main() -> Result<()> {
         ack.max_seq_len as usize,
     );
 
+    // Create paged KV cache (used by BatchedForward)
+    let gpu_avail = node.engine().backend().available_memory();
+    // Reserve 2 GB for forward pass scratch tensors (activations, projections,
+    // FFN intermediates) and cuBLAS workspace. 512 MB was insufficient for
+    // prompts longer than ~10 tokens.
+    let scratch_reserve = 2 * 1024 * 1024 * 1024;
+    let num_blocks = compute_num_blocks(
+        gpu_avail,
+        scratch_reserve,
+        layer_range.len(),
+        ack.model_config.num_kv_heads,
+        ack.model_config.head_dim,
+    );
+    let mut paged_cache = PagedKvCacheManager::new(
+        num_blocks,
+        layer_range.len(),
+        ack.model_config.num_kv_heads,
+        ack.model_config.head_dim,
+        node.engine().backend(),
+    )?;
+    let bytes_per_block = BLOCK_SIZE
+        * ack.model_config.num_kv_heads
+        * ack.model_config.head_dim
+        * 2 * 2
+        * layer_range.len();
+    tracing::info!(
+        "paged KV cache: {} blocks ({:.1} MB), ~{} tokens capacity",
+        num_blocks,
+        (num_blocks * bytes_per_block) as f64 / 1e6,
+        num_blocks * BLOCK_SIZE,
+    );
+
     // Sequence tracking: seq_id -> CacheHandle
     let mut handles: HashMap<u64, CacheHandle> = HashMap::new();
+    // Paged cache handles: seq_id -> CacheHandle (separate namespace)
+    let mut paged_handles: HashMap<u64, CacheHandle> = HashMap::new();
 
+    // Signal the coordinator that weight loading is complete and the
+    // worker is ready to process forward/cache requests.
+    conn.send_empty(MessageType::WorkerReady, 0).await?;
     tracing::info!("ready — entering serve loop");
 
     // Serve loop
@@ -215,6 +253,19 @@ async fn main() -> Result<()> {
                     match cache.alloc(node.engine().backend()) {
                         Ok(h) => {
                             handles.insert(seq_id, h);
+                            // Also allocate in paged cache for BatchedForward support
+                            match paged_cache.alloc() {
+                                Ok(ph) => {
+                                    paged_handles.insert(seq_id, ph);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "paged cache alloc for seq {seq_id} failed \
+                                         (batched forward unavailable): {e}"
+                                    );
+                                }
+                            }
+                            conn.send_empty(MessageType::CacheAllocAck, seq_id).await?;
                             tracing::debug!("allocated cache for seq {seq_id}");
                         }
                         Err(e) => {
@@ -235,6 +286,9 @@ async fn main() -> Result<()> {
                 let seq_id = header.seq_id;
                 if let Some(h) = handles.remove(&seq_id) {
                     cache.free(h, node.engine().backend())?;
+                    if let Some(ph) = paged_handles.remove(&seq_id) {
+                        paged_cache.free(ph)?;
+                    }
                     tracing::debug!("freed cache for seq {seq_id}");
                 } else {
                     let err = ErrorPayload {
@@ -256,7 +310,7 @@ async fn main() -> Result<()> {
                     gpu_memory_used: node.engine().backend().total_memory() as u64
                         - node.engine().backend().available_memory() as u64,
                     active_sequences: handles.len() as u32,
-                    free_blocks: 0,
+                    free_blocks: paged_cache.num_free_blocks() as u32,
                 };
                 conn.send(MessageType::HeartbeatAck, 0, &ack).await?;
             }
@@ -266,19 +320,39 @@ async fn main() -> Result<()> {
                 for (_, h) in handles.drain() {
                     let _ = cache.free(h, node.engine().backend());
                 }
+                for (_, ph) in paged_handles.drain() {
+                    let _ = paged_cache.free(ph);
+                }
+                let _ = paged_cache.destroy(node.engine().backend());
                 break;
             }
 
             MessageType::BatchedForward => {
-                // Phase 4: batched forward with paged KV cache.
-                // TODO: implement worker-side batched forward with paged block pool.
-                // Requires: PagedKvCacheManager setup at startup, batched_forward() call,
-                // return BatchedForwardResultPayload.
-                let err = ErrorPayload {
-                    error_code: ErrorCode::Internal,
-                    message: "BatchedForward not yet supported by this worker".into(),
-                };
-                conn.send(MessageType::Error, header.seq_id, &err).await?;
+                let result = handle_batched_forward(
+                    &header,
+                    &payload,
+                    &node,
+                    &mut paged_cache,
+                    &paged_handles,
+                );
+                match result {
+                    Ok(result_payload) => {
+                        conn.send(
+                            MessageType::BatchedForwardResult,
+                            header.seq_id,
+                            &result_payload,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        tracing::error!("batched forward error: {e}");
+                        let err = ErrorPayload {
+                            error_code: ErrorCode::Internal,
+                            message: e.to_string(),
+                        };
+                        conn.send(MessageType::Error, header.seq_id, &err).await?;
+                    }
+                }
             }
 
             other => {
@@ -359,6 +433,105 @@ fn handle_forward(
                     tensor_header: th,
                     tensor_data: host_buf,
                 },
+            })
+        }
+    }
+}
+
+/// Handle a BatchedForward message: deserialize input, run batched forward through
+/// this node's layers with paged KV cache, serialize output.
+fn handle_batched_forward(
+    _header: &fracture_protocol::FrameHeader,
+    payload: &[u8],
+    node: &ComputeNodeImpl<CudaBackend>,
+    paged_cache: &mut PagedKvCacheManager,
+    paged_handles: &HashMap<u64, CacheHandle>,
+) -> fracture_core::Result<BatchedForwardResultPayload> {
+    let req: BatchedForwardPayload = FramedConnection::deserialize_payload(payload)?;
+
+    // Build SequenceSlice for each sequence in the batch.
+    let mut sequences = Vec::with_capacity(req.sequences.len());
+    for meta in &req.sequences {
+        let handle = paged_handles.get(&meta.seq_id).ok_or_else(|| {
+            fracture_core::FractureError::Pipeline(format!(
+                "BatchedForward: seq {} has no paged cache (missing CacheAlloc)",
+                meta.seq_id
+            ))
+        })?;
+        sequences.push(SequenceSlice {
+            handle: *handle,
+            token_ids: Vec::new(), // Filled below for head nodes
+            positions: meta.positions.clone(),
+        });
+    }
+
+    // Resolve input: head gets token IDs, middle/tail get activations.
+    let input_hidden_states = match req.input {
+        ForwardInputWire::TokenIds { ids } => {
+            // Head node: distribute token IDs to sequences.
+            let mut offset = 0;
+            for (i, meta) in req.sequences.iter().enumerate() {
+                let n = meta.num_tokens;
+                sequences[i].token_ids = ids[offset..offset + n].to_vec();
+                offset += n;
+            }
+            None
+        }
+        ForwardInputWire::Activations {
+            tensor_header,
+            tensor_data,
+        } => {
+            // Middle/tail node: upload activations to GPU.
+            let dtype = wire_to_dtype(tensor_header.dtype)?;
+            let shape: Vec<usize> = tensor_header.shape.iter().map(|&d| d as usize).collect();
+            let tensor = node.engine().backend().alloc(&shape, dtype)?;
+            node.engine()
+                .backend()
+                .copy_to_device(&tensor, &tensor_data)?;
+            Some(tensor)
+        }
+    };
+
+    // Run batched forward through this node's layers.
+    let output = batched_forward_node(
+        node.engine().backend(),
+        node.engine().weights(),
+        node.config(),
+        paged_cache,
+        &sequences,
+        input_hidden_states,
+    )?;
+
+    // Serialize output.
+    match output {
+        NodeOutput::Logits(flat_logits) => {
+            let data: Vec<u8> = flat_logits
+                .iter()
+                .flat_map(|f: &f32| f.to_le_bytes())
+                .collect();
+            let vocab_size = node.engine().weights().config.vocab_size;
+            let logit_offsets: Vec<usize> = (0..req.sequences.len())
+                .map(|i| i * vocab_size * 4)
+                .collect();
+            Ok(BatchedForwardResultPayload {
+                output: ForwardOutputWire::Logits { data },
+                num_sequences: req.sequences.len(),
+                logit_offsets,
+            })
+        }
+        NodeOutput::Activations(tensor) => {
+            let mut host_buf = vec![0u8; tensor.size_bytes()];
+            node.engine().backend().copy_to_host(&tensor, &mut host_buf)?;
+            node.engine().backend().synchronize()?;
+            let th = make_header(&tensor.shape, tensor.dtype, host_buf.len());
+            node.engine().backend().free(&tensor)?;
+            Ok(BatchedForwardResultPayload {
+                output: ForwardOutputWire::Activations {
+                    tensor_header: th,
+                    tensor_data: host_buf,
+                },
+                num_sequences: req.sequences.len(),
+                logit_offsets: Vec::new(),
             })
         }
     }

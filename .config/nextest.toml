@@ -9,7 +9,7 @@ filter = 'package(fracture-model-validation)'
 test-group = 'gpu-memory-sensitive'
 
 [[profile.default.overrides]]
-filter = 'test(test_gpu_cache_freed_after_generation) | test(/test_matmul_(prefill_correctness|llama3_ffn_shapes|large_prefill)/)'
+filter = 'test(test_gpu_cache_freed_after_generation) | test(/test_matmul_(prefill_correctness|llama3_ffn_shapes|large_prefill|llama3_vocab_projection|llama3_prefill_ffn)/)'
 test-group = 'gpu-memory-sensitive'
 
 [test-groups.e2e-distributed]
@@ -18,5 +18,5 @@ test-group = 'gpu-memory-sensitive'
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/test_e2e_/)'
+filter = 'package(fracture-coordinator-cuda)'
 test-group = 'e2e-distributed'

@@ -605,6 +605,91 @@ fn test_kernel_silu_mul_decode() {
 }
 
 // ---------------------------------------------------------------------------
+// Attention kernel (prefill, layer 0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_kernel_attention_layer0() {
+    let Some((backend, weights, config)) = setup_backend_and_weights() else {
+        skip!("model or reference data not available");
+    };
+
+    let q_rope_ref = load_ref(&prefill_ref("layer_00/q_rope.bin"));
+    let k_rope_ref = load_ref(&prefill_ref("layer_00/k_rope.bin"));
+    let v_ref = load_ref(&prefill_ref("layer_00/v.bin"));
+    let expected = load_ref(&prefill_ref("layer_00/attn_output.bin"));
+
+    // q_rope: [seq_len, num_q_heads, head_dim]
+    // k_rope: [seq_len, num_kv_heads, head_dim]
+    // v:      [seq_len, num_kv_heads, head_dim]
+    let seq_len = q_rope_ref.shape[0];
+    let num_q_heads = config.num_q_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let hidden = config.hidden_size;
+
+    // Upload Q (post-RoPE) as [seq_len, num_q_heads, head_dim]
+    let dev_q = upload_ref(&backend, &q_rope_ref, &[seq_len, num_q_heads, head_dim]);
+
+    // Allocate KV cache tensors sized for the full prefill sequence.
+    // copy_to_device loads data starting at offset 0, so the cache is fully
+    // populated and start_pos=0 during the attention call.
+    let dev_k_cache = backend
+        .alloc(&[seq_len, num_kv_heads, head_dim], DType::FP16)
+        .unwrap();
+    let dev_v_cache = backend
+        .alloc(&[seq_len, num_kv_heads, head_dim], DType::FP16)
+        .unwrap();
+
+    let k_bytes = ref_to_fp16_bytes(&k_rope_ref);
+    let v_bytes = ref_to_fp16_bytes(&v_ref);
+    backend.copy_to_device(&dev_k_cache, &k_bytes).unwrap();
+    backend.copy_to_device(&dev_v_cache, &v_bytes).unwrap();
+
+    // Allocate raw attention output [seq_len, num_q_heads, head_dim]
+    let dev_attn_raw = backend
+        .alloc(&[seq_len, num_q_heads, head_dim], DType::FP16)
+        .unwrap();
+
+    backend
+        .attention(
+            &dev_q,
+            &dev_k_cache,
+            &dev_v_cache,
+            num_kv_heads,
+            0, // start_pos = 0 (pure prefill, no prior context)
+            &dev_attn_raw,
+        )
+        .unwrap();
+
+    // Reshape [seq_len, num_q_heads, head_dim] -> [seq_len, hidden] for o_proj
+    let dev_attn_flat = dev_attn_raw.reshape(vec![seq_len, hidden]).unwrap();
+
+    // Apply output projection: [seq_len, hidden] x o_proj -> [seq_len, hidden]
+    let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
+    backend
+        .matmul(&dev_attn_flat, &weights.layers[0].o_proj, &dev_output)
+        .unwrap();
+
+    // attn_output.bin is the full self-attention block output (after o_proj),
+    // which is what we compare against.
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        LOOSE_RTOL,
+        LOOSE_ATOL,
+        "attention_layer0",
+    );
+
+    backend.free(&dev_q).unwrap();
+    backend.free(&dev_k_cache).unwrap();
+    backend.free(&dev_v_cache).unwrap();
+    backend.free(&dev_attn_raw).unwrap();
+    backend.free(&dev_output).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Final RMSNorm (output norm, applied to full hidden state)
 // ---------------------------------------------------------------------------
 

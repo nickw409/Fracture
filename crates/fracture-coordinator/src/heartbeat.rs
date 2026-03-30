@@ -95,9 +95,9 @@ impl HeartbeatTracker {
             return false;
         }
 
-        // Valid ack: reset missed counter and update heartbeat timestamp
+        // Valid ack: reset missed counter and update heartbeat timestamp + stats
         self.missed_counts.insert(node_id.to_string(), 0);
-        registry.record_heartbeat(node_id);
+        registry.record_heartbeat(node_id, ack.free_blocks);
         true
     }
 

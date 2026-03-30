@@ -317,16 +317,17 @@ impl DistributedPipeline {
         is_prefill: bool,
     ) -> Result<Vec<Vec<f32>>> {
         // Verify all sequences have allocated caches.
-        let seqs = self.allocated_seqs.lock().unwrap();
-        for s in sequences {
-            if !seqs.contains(&s.seq_id) {
-                return Err(FractureError::Pipeline(format!(
-                    "batched_forward: seq {} cache not allocated",
-                    s.seq_id
-                )));
+        {
+            let seqs = self.allocated_seqs.lock().unwrap();
+            for s in sequences {
+                if !seqs.contains(&s.seq_id) {
+                    return Err(FractureError::Pipeline(format!(
+                        "batched_forward: seq {} cache not allocated",
+                        s.seq_id
+                    )));
+                }
             }
         }
-        drop(seqs);
 
         let n = self.pipeline_order.len();
 

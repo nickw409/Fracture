@@ -23,6 +23,9 @@ use tokio::net::TcpListener;
 /// - Responds to Forward by returning either:
 ///   - Activations (if `is_tail` is false): echo back a dummy [1, hidden_size] FP16 tensor
 ///   - Logits (if `is_tail` is true): return deterministic f32 logits
+/// - Responds to BatchedForward with batched results:
+///   - Activations (non-tail): dummy [total_tokens, hidden_size] FP16 tensor
+///   - Logits (tail): deterministic per-sequence f32 logits
 /// - Responds to Shutdown by exiting
 async fn spawn_mock_worker(
     listener: TcpListener,
@@ -80,6 +83,54 @@ async fn spawn_mock_worker(
                     };
 
                     conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::BatchedForward => {
+                    let req: BatchedForwardPayload =
+                        FramedConnection::deserialize_payload(&payload).unwrap();
+                    let num_seqs = req.sequences.len();
+                    let total_tokens: usize =
+                        req.sequences.iter().map(|s| s.num_tokens).sum();
+
+                    let result = if is_tail {
+                        // Return deterministic per-sequence logits:
+                        // seq i, logit j → (i * vocab_size + j) as f32
+                        let data: Vec<u8> = (0..num_seqs)
+                            .flat_map(|si| {
+                                (0..vocab_size)
+                                    .flat_map(move |j| {
+                                        ((si * vocab_size + j) as f32).to_le_bytes()
+                                    })
+                            })
+                            .collect();
+                        let logit_offsets: Vec<usize> =
+                            (0..num_seqs).map(|i| i * vocab_size * 4).collect();
+                        BatchedForwardResultPayload {
+                            output: ForwardOutputWire::Logits { data },
+                            num_sequences: num_seqs,
+                            logit_offsets,
+                        }
+                    } else {
+                        // Return dummy activations: [total_tokens, hidden_size] FP16 zeros
+                        let data_len = total_tokens * hidden_size * 2;
+                        BatchedForwardResultPayload {
+                            output: ForwardOutputWire::Activations {
+                                tensor_header: TensorWireHeader {
+                                    ndim: 2,
+                                    shape: vec![total_tokens as u32, hidden_size as u32],
+                                    dtype: 0, // FP16
+                                    compression: 0,
+                                    data_len: data_len as u32,
+                                },
+                                tensor_data: vec![0u8; data_len],
+                            },
+                            num_sequences: num_seqs,
+                            logit_offsets: Vec::new(),
+                        }
+                    };
+
+                    conn.send(MessageType::BatchedForwardResult, header.seq_id, &result)
                         .await
                         .unwrap();
                 }
@@ -1569,4 +1620,608 @@ async fn test_partial_cache_alloc_rollback_three_nodes() {
     assert_eq!(mid_events.len(), 2, "mid: expected alloc+free, got: {mid_events:?}");
     assert_eq!(mid_events[0].0, MessageType::CacheAlloc);
     assert_eq!(mid_events[1].0, MessageType::CacheFree);
+}
+
+// ── Batched Forward Tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_batched_forward_two_nodes_returns_per_sequence_logits() {
+    let (pipeline, mut registry) = setup_two_node_pipeline().await;
+
+    let seq1 = 100;
+    let seq2 = 101;
+
+    // Allocate caches
+    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+
+    // Build batch metadata
+    let sequences = vec![
+        SequenceMetadataWire {
+            seq_id: seq1,
+            num_tokens: 3,
+            positions: vec![0, 1, 2],
+            block_table: vec![0],
+            cache_seq_len: 3,
+            last_block_tokens: 3,
+        },
+        SequenceMetadataWire {
+            seq_id: seq2,
+            num_tokens: 1,
+            positions: vec![5],
+            block_table: vec![1, 2],
+            cache_seq_len: 6,
+            last_block_tokens: 6,
+        },
+    ];
+
+    let all_token_ids = vec![128000, 791, 1401, 42]; // 3 tokens seq1, 1 token seq2
+    let all_positions = vec![0, 1, 2, 5];
+
+    let per_seq_logits = pipeline
+        .batched_forward(&mut registry, &sequences, &all_token_ids, &all_positions, true)
+        .await
+        .unwrap();
+
+    assert_eq!(per_seq_logits.len(), 2, "should get logits for 2 sequences");
+
+    let vocab_size = 128256;
+    assert_eq!(per_seq_logits[0].len(), vocab_size, "seq 0 should have vocab_size logits");
+    assert_eq!(per_seq_logits[1].len(), vocab_size, "seq 1 should have vocab_size logits");
+
+    // Verify deterministic logit values from mock worker:
+    // seq 0, logit j → j as f32
+    assert_eq!(per_seq_logits[0][0], 0.0);
+    assert_eq!(per_seq_logits[0][1], 1.0);
+
+    // seq 1, logit j → (vocab_size + j) as f32
+    assert_eq!(per_seq_logits[1][0], vocab_size as f32);
+    assert_eq!(per_seq_logits[1][1], (vocab_size + 1) as f32);
+
+    // Cleanup
+    pipeline.free_cache(&mut registry, seq1).await.unwrap();
+    pipeline.free_cache(&mut registry, seq2).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_batched_forward_single_sequence() {
+    let (pipeline, mut registry) = setup_two_node_pipeline().await;
+
+    let seq_id = 200;
+    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+
+    let sequences = vec![SequenceMetadataWire {
+        seq_id,
+        num_tokens: 5,
+        positions: vec![0, 1, 2, 3, 4],
+        block_table: vec![0],
+        cache_seq_len: 5,
+        last_block_tokens: 5,
+    }];
+
+    let per_seq_logits = pipeline
+        .batched_forward(
+            &mut registry,
+            &sequences,
+            &[1, 2, 3, 4, 5],
+            &[0, 1, 2, 3, 4],
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(per_seq_logits.len(), 1);
+    assert_eq!(per_seq_logits[0].len(), 128256);
+
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_batched_forward_without_cache_is_error() {
+    let (pipeline, mut registry) = setup_two_node_pipeline().await;
+
+    let sequences = vec![SequenceMetadataWire {
+        seq_id: 999, // never allocated
+        num_tokens: 1,
+        positions: vec![0],
+        block_table: vec![],
+        cache_seq_len: 0,
+        last_block_tokens: 0,
+    }];
+
+    let result = pipeline
+        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("cache not allocated"),
+        "should mention missing cache"
+    );
+}
+
+#[tokio::test]
+async fn test_batched_forward_single_node_pipeline() {
+    // Setup single-node (head+tail) pipeline
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let _task = spawn_mock_worker(listener, true, hidden_size, vocab_size).await;
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+    registry
+        .register(
+            WorkerCapabilities {
+                node_id: "solo".into(),
+                gpu_model: "Mock".into(),
+                gpu_memory_available: 24_000_000_000,
+                compute_capability: (8, 0),
+                decode_ms_per_layer: 1.0,
+                prefill_ms_per_layer_128: 3.0,
+            },
+            conn,
+        )
+        .unwrap();
+    registry
+        .assign(
+            "solo",
+            LayerAssignment {
+                node_id: "solo".into(),
+                layer_range: 0..32,
+                role: NodeRole::Head,
+                expected_decode_ms: 32.0,
+                weight_memory_gb: 12.0,
+                cache_memory_gb: 2.0,
+            },
+        )
+        .unwrap();
+
+    let pipeline = DistributedPipeline::new(
+        &[LayerAssignment {
+            node_id: "solo".into(),
+            layer_range: 0..32,
+            role: NodeRole::Head,
+            expected_decode_ms: 32.0,
+            weight_memory_gb: 12.0,
+            cache_memory_gb: 2.0,
+        }],
+        hidden_size,
+    )
+    .unwrap();
+
+    let seq_id = 1;
+    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+
+    let sequences = vec![SequenceMetadataWire {
+        seq_id,
+        num_tokens: 2,
+        positions: vec![0, 1],
+        block_table: vec![0],
+        cache_seq_len: 2,
+        last_block_tokens: 2,
+    }];
+
+    let per_seq_logits = pipeline
+        .batched_forward(&mut registry, &sequences, &[1, 2], &[0, 1], true)
+        .await
+        .unwrap();
+
+    assert_eq!(per_seq_logits.len(), 1);
+    assert_eq!(per_seq_logits[0].len(), vocab_size);
+
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_batched_forward_three_node_pipeline() {
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mid_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let mid_addr = mid_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let _h = spawn_mock_worker(head_listener, false, hidden_size, vocab_size).await;
+    let _m = spawn_mock_worker(mid_listener, false, hidden_size, vocab_size).await;
+    let _t = spawn_mock_worker(tail_listener, true, hidden_size, vocab_size).await;
+
+    let head_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(head_addr).await.unwrap(),
+    );
+    let mid_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(mid_addr).await.unwrap(),
+    );
+    let tail_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(tail_addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+
+    for (id, conn) in [("head", head_conn), ("mid", mid_conn), ("tail", tail_conn)] {
+        registry
+            .register(
+                WorkerCapabilities {
+                    node_id: id.into(),
+                    gpu_model: "Mock".into(),
+                    gpu_memory_available: 24_000_000_000,
+                    compute_capability: (8, 0),
+                    decode_ms_per_layer: 1.0,
+                    prefill_ms_per_layer_128: 3.0,
+                },
+                conn,
+            )
+            .unwrap();
+    }
+
+    let assignments = vec![
+        LayerAssignment {
+            node_id: "head".into(),
+            layer_range: 0..10,
+            role: NodeRole::Head,
+            expected_decode_ms: 10.0,
+            weight_memory_gb: 4.0,
+            cache_memory_gb: 0.5,
+        },
+        LayerAssignment {
+            node_id: "mid".into(),
+            layer_range: 10..20,
+            role: NodeRole::Middle,
+            expected_decode_ms: 10.0,
+            weight_memory_gb: 4.0,
+            cache_memory_gb: 0.5,
+        },
+        LayerAssignment {
+            node_id: "tail".into(),
+            layer_range: 20..32,
+            role: NodeRole::Tail,
+            expected_decode_ms: 12.0,
+            weight_memory_gb: 5.0,
+            cache_memory_gb: 0.6,
+        },
+    ];
+
+    for a in &assignments {
+        registry.assign(&a.node_id, a.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, hidden_size).unwrap();
+
+    let seq1 = 10;
+    let seq2 = 11;
+    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+
+    let sequences = vec![
+        SequenceMetadataWire {
+            seq_id: seq1,
+            num_tokens: 2,
+            positions: vec![0, 1],
+            block_table: vec![0],
+            cache_seq_len: 2,
+            last_block_tokens: 2,
+        },
+        SequenceMetadataWire {
+            seq_id: seq2,
+            num_tokens: 1,
+            positions: vec![3],
+            block_table: vec![1],
+            cache_seq_len: 4,
+            last_block_tokens: 4,
+        },
+    ];
+
+    let per_seq_logits = pipeline
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 3], true)
+        .await
+        .unwrap();
+
+    assert_eq!(per_seq_logits.len(), 2);
+    assert_eq!(per_seq_logits[0].len(), vocab_size);
+    assert_eq!(per_seq_logits[1].len(), vocab_size);
+
+    pipeline.free_cache(&mut registry, seq1).await.unwrap();
+    pipeline.free_cache(&mut registry, seq2).await.unwrap();
+}
+
+/// Spawn a mock worker that responds to BatchedForward with a non-batched
+/// ForwardResult (testing the fallback path in the coordinator).
+async fn spawn_fallback_mock_worker(
+    listener: TcpListener,
+    is_tail: bool,
+    hidden_size: usize,
+    vocab_size: usize,
+    num_sequences: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
+                MessageType::BatchedForward => {
+                    // Respond with non-batched ForwardResult (fallback path)
+                    let result = if is_tail {
+                        let data: Vec<u8> = (0..num_sequences)
+                            .flat_map(|si| {
+                                (0..vocab_size)
+                                    .flat_map(move |j| {
+                                        ((si * vocab_size + j) as f32).to_le_bytes()
+                                    })
+                            })
+                            .collect();
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Logits { data },
+                        }
+                    } else {
+                        let _req: BatchedForwardPayload =
+                            FramedConnection::deserialize_payload(&payload).unwrap();
+                        let total_tokens: usize =
+                            _req.sequences.iter().map(|s| s.num_tokens).sum();
+                        let data_len = total_tokens * hidden_size * 2;
+                        ForwardResultPayload {
+                            output: ForwardOutputWire::Activations {
+                                tensor_header: TensorWireHeader {
+                                    ndim: 2,
+                                    shape: vec![total_tokens as u32, hidden_size as u32],
+                                    dtype: 0,
+                                    compression: 0,
+                                    data_len: data_len as u32,
+                                },
+                                tensor_data: vec![0u8; data_len],
+                            },
+                        }
+                    };
+                    // Send ForwardResult instead of BatchedForwardResult
+                    conn.send(MessageType::ForwardResult, header.seq_id, &result)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_batched_forward_fallback_to_forward_result() {
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+    let num_seqs = 2;
+
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let _h = spawn_fallback_mock_worker(head_listener, false, hidden_size, vocab_size, num_seqs).await;
+    let _t = spawn_fallback_mock_worker(tail_listener, true, hidden_size, vocab_size, num_seqs).await;
+
+    let head_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(head_addr).await.unwrap(),
+    );
+    let tail_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(tail_addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+
+    for (id, conn) in [("head", head_conn), ("tail", tail_conn)] {
+        registry
+            .register(
+                WorkerCapabilities {
+                    node_id: id.into(),
+                    gpu_model: "Mock".into(),
+                    gpu_memory_available: 24_000_000_000,
+                    compute_capability: (8, 0),
+                    decode_ms_per_layer: 1.0,
+                    prefill_ms_per_layer_128: 3.0,
+                },
+                conn,
+            )
+            .unwrap();
+    }
+
+    let head_assignment = LayerAssignment {
+        node_id: "head".into(),
+        layer_range: 0..16,
+        role: NodeRole::Head,
+        expected_decode_ms: 16.0,
+        weight_memory_gb: 6.0,
+        cache_memory_gb: 1.0,
+    };
+    let tail_assignment = LayerAssignment {
+        node_id: "tail".into(),
+        layer_range: 16..32,
+        role: NodeRole::Tail,
+        expected_decode_ms: 16.0,
+        weight_memory_gb: 6.0,
+        cache_memory_gb: 1.0,
+    };
+
+    registry.assign("head", head_assignment.clone()).unwrap();
+    registry.assign("tail", tail_assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[head_assignment, tail_assignment], hidden_size).unwrap();
+
+    let seq1 = 50;
+    let seq2 = 51;
+    pipeline.alloc_cache(&mut registry, seq1, 0).await.unwrap();
+    pipeline.alloc_cache(&mut registry, seq2, 0).await.unwrap();
+
+    let sequences = vec![
+        SequenceMetadataWire {
+            seq_id: seq1,
+            num_tokens: 2,
+            positions: vec![0, 1],
+            block_table: vec![0],
+            cache_seq_len: 2,
+            last_block_tokens: 2,
+        },
+        SequenceMetadataWire {
+            seq_id: seq2,
+            num_tokens: 1,
+            positions: vec![0],
+            block_table: vec![1],
+            cache_seq_len: 1,
+            last_block_tokens: 1,
+        },
+    ];
+
+    // Workers respond with ForwardResult (not BatchedForwardResult) —
+    // coordinator should handle this fallback gracefully.
+    let per_seq_logits = pipeline
+        .batched_forward(&mut registry, &sequences, &[1, 2, 3], &[0, 1, 0], true)
+        .await
+        .unwrap();
+
+    assert_eq!(per_seq_logits.len(), 2);
+    assert_eq!(per_seq_logits[0].len(), vocab_size);
+    assert_eq!(per_seq_logits[1].len(), vocab_size);
+
+    pipeline.free_cache(&mut registry, seq1).await.unwrap();
+    pipeline.free_cache(&mut registry, seq2).await.unwrap();
+}
+
+/// Spawn a mock worker that returns an error for BatchedForward.
+async fn spawn_error_batched_worker(
+    listener: TcpListener,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = FramedConnection::new(stream);
+
+        loop {
+            let (header, _payload) = match conn.recv().await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+
+            match header.msg_type {
+                MessageType::CacheAlloc => {
+                    conn.send_empty(MessageType::CacheAllocAck, header.seq_id)
+                        .await
+                        .unwrap();
+                }
+                MessageType::CacheFree => {}
+                MessageType::BatchedForward => {
+                    let err = ErrorPayload {
+                        error_code: ErrorCode::Internal,
+                        message: "batched forward failed: GPU error".into(),
+                    };
+                    conn.send(MessageType::Error, header.seq_id, &err)
+                        .await
+                        .unwrap();
+                }
+                MessageType::Shutdown => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_batched_forward_worker_error_propagates() {
+    let hidden_size = 4096;
+
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+
+    // Single-node pipeline that errors on BatchedForward
+    let _h = spawn_error_batched_worker(head_listener).await;
+
+    let head_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(head_addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    use fracture_coordinator::scheduler::WorkerCapabilities;
+
+    registry
+        .register(
+            WorkerCapabilities {
+                node_id: "head".into(),
+                gpu_model: "Mock".into(),
+                gpu_memory_available: 24_000_000_000,
+                compute_capability: (8, 0),
+                decode_ms_per_layer: 1.0,
+                prefill_ms_per_layer_128: 3.0,
+            },
+            head_conn,
+        )
+        .unwrap();
+
+    registry
+        .assign(
+            "head",
+            LayerAssignment {
+                node_id: "head".into(),
+                layer_range: 0..32,
+                role: NodeRole::Head,
+                expected_decode_ms: 32.0,
+                weight_memory_gb: 12.0,
+                cache_memory_gb: 2.0,
+            },
+        )
+        .unwrap();
+
+    let pipeline = DistributedPipeline::new(
+        &[LayerAssignment {
+            node_id: "head".into(),
+            layer_range: 0..32,
+            role: NodeRole::Head,
+            expected_decode_ms: 32.0,
+            weight_memory_gb: 12.0,
+            cache_memory_gb: 2.0,
+        }],
+        hidden_size,
+    )
+    .unwrap();
+
+    let seq_id = 1;
+    pipeline.alloc_cache(&mut registry, seq_id, 0).await.unwrap();
+
+    let sequences = vec![SequenceMetadataWire {
+        seq_id,
+        num_tokens: 1,
+        positions: vec![0],
+        block_table: vec![],
+        cache_seq_len: 0,
+        last_block_tokens: 0,
+    }];
+
+    let result = pipeline
+        .batched_forward(&mut registry, &sequences, &[1], &[0], false)
+        .await;
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("GPU error"),
+        "error should propagate worker's message: {err_msg}"
+    );
+
+    pipeline.free_cache(&mut registry, seq_id).await.unwrap();
 }

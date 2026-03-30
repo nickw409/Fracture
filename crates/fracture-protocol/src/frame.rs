@@ -47,6 +47,7 @@ pub enum MessageType {
     CacheAllocAck = 0x0B,
     BatchedForward = 0x0C,
     BatchedForwardResult = 0x0D,
+    WorkerReady = 0x0E,
 }
 
 impl MessageType {
@@ -65,6 +66,7 @@ impl MessageType {
             0x0B => Ok(Self::CacheAllocAck),
             0x0C => Ok(Self::BatchedForward),
             0x0D => Ok(Self::BatchedForwardResult),
+            0x0E => Ok(Self::WorkerReady),
             _ => Err(FractureError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -169,6 +171,7 @@ mod tests {
             MessageType::CacheAllocAck,
             MessageType::BatchedForward,
             MessageType::BatchedForwardResult,
+            MessageType::WorkerReady,
         ];
         for mt in types {
             let v = mt as u8;
@@ -180,7 +183,7 @@ mod tests {
     #[test]
     fn test_message_type_unknown() {
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x0E).is_err());
+        assert!(MessageType::from_u8(0x0F).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 

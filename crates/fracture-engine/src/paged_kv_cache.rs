@@ -6,6 +6,28 @@ use crate::kv_cache::CacheHandle;
 /// Fixed number of tokens per block. Hardcoded — the attention kernel is tuned for this.
 pub const BLOCK_SIZE: usize = 16;
 
+/// Compute the number of paged KV cache blocks that fit in the given memory budget.
+///
+/// `gpu_available`: available GPU memory in bytes after loading weights
+/// `scratch_reserve`: bytes reserved for scratch tensors during forward passes
+/// `num_layers`: number of transformer layers this worker handles
+/// `num_kv_heads`: number of KV attention heads
+/// `head_dim`: dimension per attention head
+pub fn compute_num_blocks(
+    gpu_available: usize,
+    scratch_reserve: usize,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> usize {
+    let cache_budget = gpu_available.saturating_sub(scratch_reserve);
+    let bytes_per_block = BLOCK_SIZE * num_kv_heads * head_dim * 2 * 2 * num_layers; // FP16, K+V
+    if bytes_per_block == 0 {
+        return 0;
+    }
+    cache_budget / bytes_per_block
+}
+
 /// Pre-allocated pool of KV cache blocks on GPU memory.
 ///
 /// Each block stores K and V data for `BLOCK_SIZE` tokens for one layer.
@@ -613,5 +635,371 @@ mod tests {
         assert_eq!(pool.bytes_per_block(), expected);
         // With BLOCK_SIZE=16: 16 * 8 * 128 * 2 * 2 * 32 = 2,097,152 = 2 MB
         assert_eq!(expected, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_copy_rows_offsets_during_append_kv() {
+        let backend = MockBackend::new();
+        let num_layers = 1;
+        let mut cache = PagedKvCacheManager::new(10, num_layers, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap();
+
+        // Append 1 token — first token in the block, so offset_in_block = 0.
+        let k = DeviceTensor::new(TensorId(9000), vec![1, 8, 128], DType::FP16);
+        let v = DeviceTensor::new(TensorId(9001), vec![1, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k, &v, &backend).unwrap();
+
+        let log = backend.copy_rows_log.lock().unwrap();
+        // Should have 2 copy_rows calls: one for K, one for V.
+        assert_eq!(log.len(), 2);
+
+        // K copy: (src_id=9000, dst_id=<block_k>, src_offset=0, dst_offset=0, count=1)
+        let (src_id, _dst_id, src_offset, dst_offset, count) = log[0];
+        assert_eq!(src_id, 9000);
+        assert_eq!(src_offset, 0);
+        assert_eq!(dst_offset, 0); // first token in block
+        assert_eq!(count, 1);
+
+        // V copy: (src_id=9001, dst_id=<block_v>, src_offset=0, dst_offset=0, count=1)
+        let (src_id, _dst_id, src_offset, dst_offset, count) = log[1];
+        assert_eq!(src_id, 9001);
+        assert_eq!(src_offset, 0);
+        assert_eq!(dst_offset, 0);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_prefill_spanning_multiple_blocks_copy_rows() {
+        let backend = MockBackend::new();
+        let num_layers = 1;
+        let mut cache = PagedKvCacheManager::new(10, num_layers, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap();
+
+        // Prefill 50 tokens at once. BLOCK_SIZE=16, so chunks: 16, 16, 16, 2.
+        let k = DeviceTensor::new(TensorId(9000), vec![50, 8, 128], DType::FP16);
+        let v = DeviceTensor::new(TensorId(9001), vec![50, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k, &v, &backend).unwrap();
+
+        let log = backend.copy_rows_log.lock().unwrap();
+        // 4 chunks × 2 (K + V) = 8 copy_rows calls.
+        assert_eq!(log.len(), 8);
+
+        // Expected chunks: (src_offset, dst_offset, count)
+        // Chunk 0: tokens 0..16  → block 0, offset 0, count 16
+        // Chunk 1: tokens 16..32 → block 1, offset 0, count 16
+        // Chunk 2: tokens 32..48 → block 2, offset 0, count 16
+        // Chunk 3: tokens 48..50 → block 3, offset 0, count 2
+        let expected_chunks = [
+            (0, 0, super::BLOCK_SIZE),   // 16
+            (super::BLOCK_SIZE, 0, super::BLOCK_SIZE),   // 16
+            (2 * super::BLOCK_SIZE, 0, super::BLOCK_SIZE),   // 16
+            (3 * super::BLOCK_SIZE, 0, 2),   // 2
+        ];
+
+        for (i, &(exp_src_off, exp_dst_off, exp_count)) in expected_chunks.iter().enumerate() {
+            // K copy is at index i*2, V copy at i*2+1.
+            let (src_id, _dst_id, src_offset, dst_offset, count) = log[i * 2];
+            assert_eq!(src_id, 9000, "chunk {i} K: wrong src_id");
+            assert_eq!(src_offset, exp_src_off, "chunk {i} K: wrong src_offset");
+            assert_eq!(dst_offset, exp_dst_off, "chunk {i} K: wrong dst_offset");
+            assert_eq!(count, exp_count, "chunk {i} K: wrong count");
+
+            let (src_id, _dst_id, src_offset, dst_offset, count) = log[i * 2 + 1];
+            assert_eq!(src_id, 9001, "chunk {i} V: wrong src_id");
+            assert_eq!(src_offset, exp_src_off, "chunk {i} V: wrong src_offset");
+            assert_eq!(dst_offset, exp_dst_off, "chunk {i} V: wrong dst_offset");
+            assert_eq!(count, exp_count, "chunk {i} V: wrong count");
+        }
+    }
+
+    #[test]
+    fn test_oom_sequence_remains_valid() {
+        let backend = MockBackend::new();
+        // Only 2 blocks total.
+        let mut cache = PagedKvCacheManager::new(2, 1, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap(); // uses 1 block, 1 free remaining
+
+        // Fill both blocks: append 32 tokens (2 full blocks).
+        let k32 = DeviceTensor::new(TensorId(9000), vec![super::BLOCK_SIZE * 2, 8, 128], DType::FP16);
+        let v32 = DeviceTensor::new(TensorId(9001), vec![super::BLOCK_SIZE * 2, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k32, &v32, &backend).unwrap();
+
+        // Record state before OOM attempt.
+        let seq_len_before = cache.seq_len(h).unwrap();
+        let block_table_len_before = cache.block_table(h).unwrap().len();
+        let last_block_tokens_before = cache.last_block_tokens(h).unwrap();
+
+        assert_eq!(seq_len_before, super::BLOCK_SIZE * 2);
+        assert_eq!(block_table_len_before, 2);
+        assert_eq!(last_block_tokens_before, super::BLOCK_SIZE);
+        assert_eq!(cache.num_free_blocks(), 0);
+
+        // Attempt to append 1 more token — should fail with OOM.
+        let k1 = DeviceTensor::new(TensorId(9002), vec![1, 8, 128], DType::FP16);
+        let v1 = DeviceTensor::new(TensorId(9003), vec![1, 8, 128], DType::FP16);
+        let result = cache.append_kv(h, 0, &k1, &v1, &backend);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), FractureError::OutOfMemory { .. }));
+
+        // Sequence state must be unchanged after OOM.
+        assert_eq!(cache.seq_len(h).unwrap(), seq_len_before);
+        assert_eq!(cache.block_table(h).unwrap().len(), block_table_len_before);
+        assert_eq!(cache.last_block_tokens(h).unwrap(), last_block_tokens_before);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_normal() {
+        // 16 GB available, 512 MB reserve, 32 layers, 8 heads, 128 dim
+        let gpu_available = 16 * 1024 * 1024 * 1024;
+        let scratch_reserve = 512 * 1024 * 1024;
+        let num_layers = 32;
+        let num_kv_heads = 8;
+        let head_dim = 128;
+
+        let result = compute_num_blocks(gpu_available, scratch_reserve, num_layers, num_kv_heads, head_dim);
+
+        let cache_budget = gpu_available - scratch_reserve;
+        let bytes_per_block = BLOCK_SIZE * num_kv_heads * head_dim * 2 * 2 * num_layers;
+        let expected = cache_budget / bytes_per_block;
+        assert_eq!(result, expected);
+        assert!(result > 0);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_zero_budget() {
+        // scratch_reserve >= gpu_available → 0 blocks
+        let result = compute_num_blocks(512 * 1024 * 1024, 1024 * 1024 * 1024, 32, 8, 128);
+        assert_eq!(result, 0);
+
+        // Exactly equal
+        let result = compute_num_blocks(512 * 1024 * 1024, 512 * 1024 * 1024, 32, 8, 128);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_small_gpu() {
+        // Very small available memory — not enough for even one block
+        let bytes_per_block = BLOCK_SIZE * 8 * 128 * 2 * 2 * 32; // ~2 MB
+        let result = compute_num_blocks(bytes_per_block - 1, 0, 32, 8, 128);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_zero_layers() {
+        // 0 layers → bytes_per_block=0 → 0 blocks
+        let result = compute_num_blocks(16 * 1024 * 1024 * 1024, 0, 0, 8, 128);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_block_table_and_seq_len_for_attention() {
+        // Verify the block_table, seq_len, and last_block_tokens values that would be
+        // passed to attention_paged are correct after multi-step appends spanning blocks.
+        let backend = MockBackend::new();
+        let num_layers = 1;
+        let mut cache = PagedKvCacheManager::new(10, num_layers, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap();
+
+        // Append 20 tokens (prefill). BLOCK_SIZE=16, so: block 0 (16) + block 1 (4).
+        let k20 = DeviceTensor::new(TensorId(9000), vec![20, 8, 128], DType::FP16);
+        let v20 = DeviceTensor::new(TensorId(9001), vec![20, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k20, &v20, &backend).unwrap();
+
+        assert_eq!(cache.block_table(h).unwrap().len(), 2);
+        assert_eq!(cache.seq_len(h).unwrap(), 20);
+        assert_eq!(cache.last_block_tokens(h).unwrap(), 4);
+
+        // Append 13 more tokens (decode burst). Total = 33 tokens.
+        // block 0: 16, block 1: 4+12=16 (full), block 2: 1.
+        let k13 = DeviceTensor::new(TensorId(9002), vec![13, 8, 128], DType::FP16);
+        let v13 = DeviceTensor::new(TensorId(9003), vec![13, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k13, &v13, &backend).unwrap();
+
+        assert_eq!(cache.block_table(h).unwrap().len(), 3);
+        assert_eq!(cache.seq_len(h).unwrap(), 33);
+        assert_eq!(cache.last_block_tokens(h).unwrap(), 1);
+
+        cache.free(h).unwrap();
+    }
+
+    // ── Invalid handle tests ─────────────────────────────────────
+
+    /// All PagedKvCacheManager operations on an unknown CacheHandle(999) return
+    /// an error whose message contains "999".
+    #[test]
+    fn test_paged_cache_invalid_handle_all_ops() {
+        let backend = MockBackend::new();
+        let mut cache = PagedKvCacheManager::new(10, 2, 8, 128, &backend).unwrap();
+
+        let bad = CacheHandle(999);
+
+        let err = cache.seq_len(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "seq_len error should mention 999, got: {err}"
+        );
+
+        let err = cache.block_table(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "block_table error should mention 999, got: {err}"
+        );
+
+        let err = cache.last_block_tokens(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "last_block_tokens error should mention 999, got: {err}"
+        );
+
+        let k = DeviceTensor::new(TensorId(9000), vec![1, 8, 128], DType::FP16);
+        let v = DeviceTensor::new(TensorId(9001), vec![1, 8, 128], DType::FP16);
+        let err = cache.append_kv(bad, 0, &k, &v, &backend).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "append_kv error should mention 999, got: {err}"
+        );
+
+        let err = cache.free(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "free error should mention 999, got: {err}"
+        );
+    }
+
+    // ── BlockPool alloc failure test ─────────────────────────────
+
+    /// A backend whose alloc() always fails causes BlockPool::new() to return
+    /// an error whose message contains "block pool alloc failed".
+    struct FailingAllocBackend;
+
+    impl Backend for FailingAllocBackend {
+        fn alloc(&self, _shape: &[usize], _dtype: DType) -> Result<DeviceTensor> {
+            Err(FractureError::Backend("forced alloc error".into()))
+        }
+        fn free(&self, _t: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_to_device(&self, _dst: &DeviceTensor, _src: &[u8]) -> Result<()> { Ok(()) }
+        fn copy_to_host(&self, _src: &DeviceTensor, _dst: &mut [u8]) -> Result<()> { Ok(()) }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rmsnorm(&self, _i: &DeviceTensor, _w: &DeviceTensor, _e: f64, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _p: &[u32], _t: f64, _h: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k: &DeviceTensor, _v: &DeviceTensor, _n: usize, _s: usize, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _g: &DeviceTensor, _u: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _ids: &[u32], _t: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, _s: &DeviceTensor, _d: &DeviceTensor, _so: usize, _do_: usize, _c: usize) -> Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "failing-alloc" }
+        fn total_memory(&self) -> usize { 1 << 30 }
+        fn available_memory(&self) -> usize { 1 << 30 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<fracture_core::DeviceTimer> { Ok(fracture_core::DeviceTimer(0)) }
+        fn start_timer(&self, _t: &fracture_core::DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _t: &fracture_core::DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _t: &fracture_core::DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn test_block_pool_alloc_failure() {
+        let backend = FailingAllocBackend;
+        // Requesting 1 block — alloc() fails immediately.
+        let result = BlockPool::new(1, 2, 8, 128, &backend);
+        assert!(result.is_err(), "BlockPool::new should fail when backend alloc fails");
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("block pool alloc failed"),
+            "error should contain 'block pool alloc failed', got: {err}"
+        );
+    }
+
+    // ── Multi-layer append offsets test ─────────────────────────
+
+    /// With num_layers=2, appending tokens to each layer in sequence produces
+    /// the same block table offsets for both layers (block allocation happens
+    /// only on layer 0, layer 1 reuses the allocated blocks).
+    #[test]
+    fn test_append_kv_multilayer_same_offsets() {
+        let backend = MockBackend::new();
+        let num_layers = 2;
+        let mut cache = PagedKvCacheManager::new(10, num_layers, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap();
+
+        // Append 3 tokens to each layer (simulating one forward pass iteration).
+        for layer in 0..num_layers {
+            let k = DeviceTensor::new(TensorId(9000 + layer as u64), vec![3, 8, 128], DType::FP16);
+            let v = DeviceTensor::new(TensorId(9010 + layer as u64), vec![3, 8, 128], DType::FP16);
+            cache.append_kv(h, layer, &k, &v, &backend).unwrap();
+        }
+
+        // seq_len reflects layer-0 write (the only one that updates metadata).
+        assert_eq!(cache.seq_len(h).unwrap(), 3);
+        let block_table = cache.block_table(h).unwrap();
+        assert_eq!(block_table.len(), 1); // 3 tokens fit in 1 block
+
+        // copy_rows log: 2 calls per layer (K + V) × 2 layers = 4 total.
+        // All calls should have src_offset=0, dst_offset=0, count=3.
+        let log = backend.copy_rows_log.lock().unwrap();
+        assert_eq!(log.len(), 4, "expected 4 copy_rows calls (K+V × 2 layers), got {}", log.len());
+        for (i, &(_src_id, _dst_id, src_offset, dst_offset, count)) in log.iter().enumerate() {
+            assert_eq!(src_offset, 0, "call {i}: src_offset should be 0");
+            assert_eq!(dst_offset, 0, "call {i}: dst_offset should be 0 (first position in block)");
+            assert_eq!(count, 3, "call {i}: count should be 3");
+        }
+
+        cache.free(h).unwrap();
+    }
+
+    // ── OOM preserves sequence state test ────────────────────────
+
+    /// After OOM on append_kv, the sequence's pre-OOM state (seq_len, block_table
+    /// length, last_block_tokens) is preserved unchanged.
+    #[test]
+    fn test_paged_cache_oom_sequence_remains_valid() {
+        let backend = MockBackend::new();
+        // 2 blocks total. alloc() takes 1, then alloc another sequence uses the last.
+        let mut cache = PagedKvCacheManager::new(2, 1, 8, 128, &backend).unwrap();
+
+        let h = cache.alloc().unwrap(); // 1 block used, 1 free
+
+        // Fill the initial block completely (stays in 1 block, no new block allocated).
+        let k_fill = DeviceTensor::new(TensorId(9000), vec![BLOCK_SIZE, 8, 128], DType::FP16);
+        let v_fill = DeviceTensor::new(TensorId(9001), vec![BLOCK_SIZE, 8, 128], DType::FP16);
+        cache.append_kv(h, 0, &k_fill, &v_fill, &backend).unwrap(); // still 1 block used, 1 free
+
+        // Allocate another sequence to consume the remaining free block.
+        let _h2 = cache.alloc().unwrap(); // 2 blocks used, 0 free
+        assert_eq!(cache.num_free_blocks(), 0);
+
+        // Record pre-OOM state.
+        let seq_len_before = cache.seq_len(h).unwrap();
+        let block_table_len_before = cache.block_table(h).unwrap().len();
+        let last_tokens_before = cache.last_block_tokens(h).unwrap();
+
+        // OOM attempt: appending 1 more token needs a new block but pool is empty.
+        let k1 = DeviceTensor::new(TensorId(9002), vec![1, 8, 128], DType::FP16);
+        let v1 = DeviceTensor::new(TensorId(9003), vec![1, 8, 128], DType::FP16);
+        let result = cache.append_kv(h, 0, &k1, &v1, &backend);
+        assert!(result.is_err(), "expected OOM error");
+        assert!(
+            matches!(result.unwrap_err(), FractureError::OutOfMemory { .. }),
+            "error should be OutOfMemory"
+        );
+
+        // State must be unchanged.
+        assert_eq!(
+            cache.seq_len(h).unwrap(), seq_len_before,
+            "seq_len should be unchanged after OOM"
+        );
+        assert_eq!(
+            cache.block_table(h).unwrap().len(), block_table_len_before,
+            "block_table length should be unchanged after OOM"
+        );
+        assert_eq!(
+            cache.last_block_tokens(h).unwrap(), last_tokens_before,
+            "last_block_tokens should be unchanged after OOM"
+        );
     }
 }

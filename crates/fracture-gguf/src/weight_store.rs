@@ -1697,4 +1697,356 @@ mod tests {
             "expected 'exceeds mmap' in: {err}"
         );
     }
+
+    /// Build a GGUF identical to build_complete_gguf(1, &[]) but with known non-zero
+    /// FP16 data in the q_proj and k_proj tensors of layer 0. Returns the buffer plus
+    /// the byte ranges [q_start, q_end) and [k_start, k_end) relative to the start of
+    /// the tensor data section (i.e. relative to `tensor_data_offset`).
+    ///
+    /// Config: hidden=64, num_q_heads=4, head_dim=16, num_kv_heads=2, ffn=128, vocab=4.
+    /// q shape: [64, 64], k shape: [32, 64] (both FP16).
+    fn build_gguf_with_nonzero_qk() -> (Vec<u8>, usize, usize, usize, usize) {
+        let hidden: u64 = 64;
+        let kv_dim: u64 = 32; // num_kv_heads * head_dim = 2 * 16
+        let ffn: u64 = 128;
+        let vocab: u64 = 4;
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+        }
+
+        let mut tensors: Vec<TensorSpec> = Vec::new();
+        tensors.push(TensorSpec { name: "token_embd.weight".into(), shape: vec![vocab, hidden] });
+        tensors.push(TensorSpec { name: "output_norm.weight".into(), shape: vec![hidden] });
+        tensors.push(TensorSpec { name: "output.weight".into(), shape: vec![vocab, hidden] });
+
+        // Layer 0 tensors in order they appear in the file
+        let layer_defs: Vec<(&str, Vec<u64>)> = vec![
+            ("attn_q.weight",    vec![hidden, hidden]),
+            ("attn_k.weight",    vec![kv_dim, hidden]),
+            ("attn_v.weight",    vec![kv_dim, hidden]),
+            ("attn_output.weight", vec![hidden, hidden]),
+            ("ffn_gate.weight",  vec![ffn, hidden]),
+            ("ffn_up.weight",    vec![ffn, hidden]),
+            ("ffn_down.weight",  vec![hidden, ffn]),
+            ("attn_norm.weight", vec![hidden]),
+            ("ffn_norm.weight",  vec![hidden]),
+        ];
+        for (suffix, shape) in &layer_defs {
+            tensors.push(TensorSpec { name: format!("blk.0.{suffix}"), shape: shape.clone() });
+        }
+
+        // Compute offsets (all FP16, 2 bytes each)
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut data_size: u64 = 0;
+        for t in &tensors {
+            offsets.push(data_size);
+            let numel: u64 = t.shape.iter().product();
+            data_size += numel * 2;
+        }
+
+        let tensor_count = tensors.len();
+        let metadata_count: u64 = 8;
+
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
+        buf.write_u64::<LittleEndian>(metadata_count).unwrap();
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", hidden as u32);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 1);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", ffn as u32);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+
+        for (i, t) in tensors.iter().enumerate() {
+            write_tensor_info(&mut buf, &t.name, &t.shape, 1, offsets[i]);
+        }
+
+        let current = buf.len();
+        let tensor_data_offset = align_offset(current, 32);
+        buf.resize(tensor_data_offset, 0);
+
+        // Append all-zeros tensor data initially
+        buf.extend(vec![0u8; data_size as usize]);
+
+        // Write distinct non-zero FP16 patterns into q and k tensors.
+        // q is tensor index 3 (after token_embd, output_norm, output), k is index 4.
+        let q_idx = 3usize;
+        let k_idx = 4usize;
+
+        let q_start = tensor_data_offset + offsets[q_idx] as usize;
+        let q_numel = tensors[q_idx].shape.iter().product::<u64>() as usize;
+        let _q_end = q_start + q_numel * 2;
+
+        let k_start = tensor_data_offset + offsets[k_idx] as usize;
+        let k_numel = tensors[k_idx].shape.iter().product::<u64>() as usize;
+        let _k_end = k_start + k_numel * 2;
+
+        // Fill q bytes: each row gets a unique repeating byte pattern based on row index.
+        // row_bytes = hidden * 2 = 128, num_rows = hidden = 64
+        let q_row_bytes = (hidden as usize) * 2;
+        let q_rows = hidden as usize;
+        for row in 0..q_rows {
+            let fill = ((row + 1) as u8).wrapping_mul(3);
+            let start = q_start + row * q_row_bytes;
+            for b in &mut buf[start..start + q_row_bytes] {
+                *b = fill;
+            }
+        }
+
+        // Fill k bytes: each row gets a unique repeating byte pattern based on row index.
+        // row_bytes = hidden * 2 = 128, num_rows = kv_dim = 32
+        let k_row_bytes = (hidden as usize) * 2;
+        let k_rows = kv_dim as usize;
+        for row in 0..k_rows {
+            let fill = ((row + 1) as u8).wrapping_mul(5);
+            let start = k_start + row * k_row_bytes;
+            for b in &mut buf[start..start + k_row_bytes] {
+                *b = fill;
+            }
+        }
+
+        // Return: (bytes, q_raw_start_relative_to_tdo, q_raw_end_relative_to_tdo, same for k)
+        let q_rel_start = offsets[q_idx] as usize;
+        let q_rel_end = q_rel_start + q_numel * 2;
+        let k_rel_start = offsets[k_idx] as usize;
+        let k_rel_end = k_rel_start + k_numel * 2;
+
+        (buf, q_rel_start, q_rel_end, k_rel_start, k_rel_end)
+    }
+
+    #[test]
+    fn test_qk_permutation_applied_during_load() {
+        // Config: hidden=64, num_q_heads=4, head_dim=16, num_kv_heads=2, ffn=128, vocab=4
+        let (data, q_rel_start, q_rel_end, k_rel_start, k_rel_end) =
+            build_gguf_with_nonzero_qk();
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = CapturingMockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+        assert_eq!(store.layers.len(), 1);
+
+        let layer = &store.layers[0];
+
+        // Determine tensor_data_offset from the file (we know it's 32-byte aligned past header).
+        // Re-derive it from the data we wrote — use GgufParser directly.
+        let gguf = crate::parser::GgufParser::parse(&path).unwrap();
+        let tdo = gguf.tensor_data_offset;
+        let mmap_bytes = &gguf.mmap[..];
+
+        // Fetch the raw GGUF bytes for q and k (relative to tensor_data_offset)
+        let q_raw = &mmap_bytes[tdo + q_rel_start..tdo + q_rel_end];
+        let k_raw = &mmap_bytes[tdo + k_rel_start..tdo + k_rel_end];
+
+        // Compute the expected permuted output using the same function WeightStore calls
+        let num_q_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 16usize;
+        let hidden = 64usize;
+
+        let expected_q = reverse_qk_permutation(q_raw, num_q_heads, head_dim, hidden);
+        let expected_k = reverse_qk_permutation(k_raw, num_kv_heads, head_dim, hidden);
+
+        // The raw input is non-zero, so the permuted output should differ from raw for non-trivial
+        // permutations. Verify by checking at least one row that differs.
+        let row_bytes = hidden * 2; // 128 bytes per row in the weight matrix
+        let half = head_dim / 2; // 8
+        // In GGUF interleaved layout, head 0 row 0 (even) maps to original row 0.
+        // Head 0 row 1 (odd) maps to original row half (=8).
+        // For our fill pattern: GGUF row 0 = fill 3, GGUF row 1 = fill 6.
+        // After de-interleaving: original row 0 = fill 3 (from GGUF row 0), original row 8 = fill 6.
+        // GGUF row 2 (even, i=1) -> original row 1: fill 9.
+        // So expected_q row 0 should all be 0x03, row 8 should all be 0x06.
+        assert!(
+            expected_q[0..row_bytes].iter().all(|&b| b == 0x03),
+            "expected row 0 of de-interleaved q to be all 0x03"
+        );
+        assert!(
+            expected_q[half * row_bytes..(half + 1) * row_bytes].iter().all(|&b| b == 0x06),
+            "expected row {} of de-interleaved q to be all 0x06 (from GGUF odd row 1)",
+            half
+        );
+
+        // Get captured bytes for q_proj and k_proj
+        let q_id = layer.q_proj.id.0;
+        let k_id = layer.k_proj.id.0;
+
+        let (_, _, captured_q_bytes) = backend.get_captured(q_id).unwrap();
+        let (_, _, captured_k_bytes) = backend.get_captured(k_id).unwrap();
+
+        // The captured bytes should match the expected permuted output exactly.
+        assert_eq!(
+            captured_q_bytes, expected_q,
+            "q_proj bytes should match de-interleaved permutation output"
+        );
+        assert_eq!(
+            captured_k_bytes, expected_k,
+            "k_proj bytes should match de-interleaved permutation output"
+        );
+
+        // Confirm the raw bytes differ from the permuted bytes (proves the permutation did something)
+        assert_ne!(
+            captured_q_bytes, q_raw,
+            "q_proj captured bytes should differ from raw GGUF bytes (permutation was applied)"
+        );
+    }
+
+    #[test]
+    fn test_weight_store_layer_range_loads_globals() {
+        // Load a 2-layer GGUF with layer_range=Some(0..1) and verify that global tensors
+        // (token_embedding, output_norm, lm_head) are always present with correct shapes.
+        // Config: hidden=64, vocab=4.
+        let data = build_complete_gguf(2, &[]);
+        let (_dir, path) = write_gguf_to_file(&data);
+        let backend = MockBackend::new();
+
+        let store = WeightStore::load(&path, &backend, Some(0..1)).unwrap();
+
+        // Only 1 layer loaded
+        assert_eq!(store.layers.len(), 1, "expected 1 layer with layer_range 0..1");
+
+        // Global tensors must be present regardless of layer_range
+        assert_eq!(
+            store.token_embedding.shape,
+            vec![4, 64],
+            "token_embedding shape should be [vocab=4, hidden=64]"
+        );
+        assert_eq!(
+            store.output_norm.shape,
+            vec![64],
+            "output_norm shape should be [hidden=64]"
+        );
+        assert_eq!(
+            store.lm_head.shape,
+            vec![4, 64],
+            "lm_head shape should be [vocab=4, hidden=64]"
+        );
+
+        // Layer 0's weights are also present
+        let layer = &store.layers[0];
+        assert_eq!(layer.q_proj.shape, vec![64, 64], "q_proj shape");
+        assert_eq!(layer.k_proj.shape, vec![32, 64], "k_proj shape");
+    }
+
+    /// Build a GGUF with `general.alignment=64` in metadata.
+    /// Identical to build_complete_gguf(1, &[]) except for the extra alignment key
+    /// and the tensor data section aligned to 64 bytes.
+    fn build_gguf_with_custom_alignment(alignment: u32) -> Vec<u8> {
+        let hidden: u64 = 64;
+        let kv_dim: u64 = 32;
+        let ffn: u64 = 128;
+        let vocab: u64 = 4;
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+        }
+
+        let mut tensors: Vec<TensorSpec> = Vec::new();
+        tensors.push(TensorSpec { name: "token_embd.weight".into(), shape: vec![vocab, hidden] });
+        tensors.push(TensorSpec { name: "output_norm.weight".into(), shape: vec![hidden] });
+        tensors.push(TensorSpec { name: "output.weight".into(), shape: vec![vocab, hidden] });
+
+        let layer_defs: Vec<(&str, Vec<u64>)> = vec![
+            ("attn_q.weight",    vec![hidden, hidden]),
+            ("attn_k.weight",    vec![kv_dim, hidden]),
+            ("attn_v.weight",    vec![kv_dim, hidden]),
+            ("attn_output.weight", vec![hidden, hidden]),
+            ("ffn_gate.weight",  vec![ffn, hidden]),
+            ("ffn_up.weight",    vec![ffn, hidden]),
+            ("ffn_down.weight",  vec![hidden, ffn]),
+            ("attn_norm.weight", vec![hidden]),
+            ("ffn_norm.weight",  vec![hidden]),
+        ];
+        for (suffix, shape) in &layer_defs {
+            tensors.push(TensorSpec { name: format!("blk.0.{suffix}"), shape: shape.clone() });
+        }
+
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut data_size: u64 = 0;
+        for t in &tensors {
+            offsets.push(data_size);
+            let numel: u64 = t.shape.iter().product();
+            data_size += numel * 2; // FP16
+        }
+
+        let tensor_count = tensors.len();
+        // 9 metadata entries: the standard 8 plus general.alignment
+        let metadata_count: u64 = 9;
+
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(0x46554747).unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap();
+        buf.write_u64::<LittleEndian>(tensor_count as u64).unwrap();
+        buf.write_u64::<LittleEndian>(metadata_count).unwrap();
+
+        write_metadata_kv_string(&mut buf, "general.architecture", "llama");
+        write_metadata_kv_u32(&mut buf, "llama.embedding_length", hidden as u32);
+        write_metadata_kv_u32(&mut buf, "llama.block_count", 1);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count", 4);
+        write_metadata_kv_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        write_metadata_kv_u32(&mut buf, "llama.feed_forward_length", ffn as u32);
+        write_metadata_kv_f32(&mut buf, "llama.rope.freq_base", 500000.0);
+        write_metadata_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+        // The alignment metadata key
+        write_metadata_kv_u32(&mut buf, "general.alignment", alignment);
+
+        for (i, t) in tensors.iter().enumerate() {
+            write_tensor_info(&mut buf, &t.name, &t.shape, 1, offsets[i]);
+        }
+
+        // Align to the custom alignment value
+        let current = buf.len();
+        let aligned = align_offset(current, alignment as usize);
+        buf.resize(aligned, 0);
+
+        buf.extend(vec![0u8; data_size as usize]);
+
+        buf
+    }
+
+    #[test]
+    fn test_custom_alignment() {
+        // Build a GGUF with general.alignment=64 and verify the parser respects it:
+        // tensor_data_offset must be 64-byte aligned, and WeightStore::load must succeed
+        // (i.e. all tensor byte ranges are valid under the 64-byte-aligned data section).
+        let alignment = 64u32;
+        let data = build_gguf_with_custom_alignment(alignment);
+        let (_dir, path) = write_gguf_to_file(&data);
+
+        // Verify parser uses the custom alignment
+        let gguf = crate::parser::GgufParser::parse(&path).unwrap();
+        assert_eq!(
+            gguf.tensor_data_offset % alignment as usize,
+            0,
+            "tensor_data_offset {} should be {}-byte aligned",
+            gguf.tensor_data_offset,
+            alignment
+        );
+
+        // Verify WeightStore::load succeeds and shapes are correct
+        let backend = MockBackend::new();
+        let store = WeightStore::load(&path, &backend, None).unwrap();
+
+        assert_eq!(store.config.num_layers, 1);
+        assert_eq!(store.config.hidden_size, 64);
+        assert_eq!(store.layers.len(), 1);
+
+        // Global tensors accessible
+        assert_eq!(store.token_embedding.shape, vec![4, 64]);
+        assert_eq!(store.output_norm.shape, vec![64]);
+        assert_eq!(store.lm_head.shape, vec![4, 64]);
+
+        // Layer tensors accessible
+        let layer = &store.layers[0];
+        assert_eq!(layer.q_proj.shape, vec![64, 64]);
+        assert_eq!(layer.k_proj.shape, vec![32, 64]);
+        assert_eq!(layer.attn_norm.shape, vec![64]);
+    }
 }

@@ -178,6 +178,7 @@ mod tests {
         assert_eq!(seq.current_pos, 128);
         assert_eq!(seq.max_tokens, 256);
         assert_eq!(seq.cache_allocated_on, vec!["a", "b"]);
+        assert!(seq.generated_tokens.is_empty());
     }
 
     #[test]
@@ -359,6 +360,39 @@ mod tests {
         mgr.begin_decoding(id).unwrap();
         assert!(mgr.mark_error(id).is_ok());
         assert_eq!(mgr.get(id).unwrap().status, SequenceStatus::Error);
+    }
+
+    #[test]
+    fn test_error_transition_includes_context() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        // Attempt an invalid transition from Prefilling to Complete (must be Decoding)
+        let err = mgr.complete(id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&id.to_string()),
+            "error message should contain seq_id {id}: {msg}"
+        );
+    }
+
+    /// Verify that attempting complete() from the Error state produces an error
+    /// message that names the state ("Error") so callers can diagnose which
+    /// invalid transition was attempted.
+    #[test]
+    fn test_error_transition_includes_state_name() {
+        let mut mgr = SequenceStateManager::new();
+        let id = mgr.create(10, 100, vec![]);
+        // Transition to Error state first.
+        mgr.mark_error(id).unwrap();
+        assert_eq!(mgr.get(id).unwrap().status, SequenceStatus::Error);
+
+        // Now attempt complete() from Error — must fail.
+        let err = mgr.complete(id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Error"),
+            "error message should name the current state 'Error', got: {msg}"
+        );
     }
 
     #[test]

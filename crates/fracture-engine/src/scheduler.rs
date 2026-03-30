@@ -558,6 +558,47 @@ mod tests {
         assert_eq!(sched.num_active(), 0);
     }
 
+    /// Verify that cleanup_completed() sends a GenerationEvent::Finished with
+    /// StopReason::Length when a sequence hits its max_tokens limit.
+    ///
+    /// The previous test dropped `_rx` immediately, so the send was never
+    /// verified. This test retains the receiver and asserts the event is delivered.
+    #[test]
+    fn test_scheduler_cleanup_sends_length_event() {
+        let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let seq_id = sched.next_seq_id();
+        sched.active.insert(seq_id, ActiveSequence {
+            seq_id,
+            handle: CacheHandle(seq_id),
+            max_tokens: 3,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            stop_tokens: vec![],
+            current_pos: 5,
+            generated_tokens: vec![10, 20, 30], // exactly at max_tokens
+            event_tx: tx,
+            remaining_prefill: Vec::new(),
+        });
+
+        let removed = sched.cleanup_completed();
+        assert_eq!(removed.len(), 1, "sequence should be removed");
+        assert_eq!(sched.num_active(), 0);
+
+        // The Finished event must have been sent to the client channel.
+        let event = rx.try_recv().expect("expected GenerationEvent::Finished on rx");
+        match event {
+            GenerationEvent::Finished { stop_reason, completion_tokens } => {
+                assert_eq!(stop_reason, StopReason::Length, "stop reason should be Length");
+                assert_eq!(completion_tokens, 3, "completion_tokens should equal generated token count");
+            }
+            other => panic!("expected Finished event, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_scheduler_cleanup_on_stop_token() {
         let backend = MockBackend::new();
@@ -614,5 +655,133 @@ mod tests {
 
         let removed = sched.cleanup_completed();
         assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn test_admission_rejected_by_block_pool() {
+        let backend = MockBackend::new();
+        // 3 blocks × BLOCK_SIZE(16) = 48 tokens max capacity.
+        let cache = PagedKvCacheManager::new(3, 2, 2, 16, &backend).unwrap();
+        // block_pool_reserve = 0.5 → reserved = ceil(3 * 0.5) = 2 blocks.
+        // Available after reserve = 3 - 2 = 1 block = 16 tokens.
+        let mut sched = BatchScheduler::new(64, 4096, 512, 0.5);
+
+        // Prompt of 20 tokens → needs ceil(20/16) = 2 blocks > 1 available.
+        let _rx = make_request(&mut sched, 20);
+
+        let decision = sched.schedule(&cache);
+        assert!(decision.prefills.is_empty(), "should not admit when blocks insufficient after reserve");
+        assert_eq!(decision.total_tokens, 0);
+        // Request stays in the prefill queue.
+        assert_eq!(sched.num_pending(), 1);
+    }
+
+    #[test]
+    fn test_block_pool_reserve_prevents_starvation() {
+        let backend = MockBackend::new();
+        // 6 blocks total; reserve = 0.5 → reserved = 3 blocks.
+        let cache = PagedKvCacheManager::new(6, 2, 2, 16, &backend).unwrap();
+        let mut sched = BatchScheduler::new(64, 4096, 512, 0.5);
+
+        // Insert an active decode sequence (already prefilled, has a generated token).
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let seq_id = sched.next_seq_id();
+        sched.active.insert(seq_id, ActiveSequence {
+            seq_id,
+            handle: CacheHandle(seq_id),
+            max_tokens: 100,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            stop_tokens: vec![999],
+            current_pos: 10,
+            generated_tokens: vec![42],
+            event_tx: tx1,
+            remaining_prefill: Vec::new(),
+        });
+
+        // Enqueue a new prefill request needing ceil(48/16)=3 blocks.
+        // Available after reserve: 6 free - 3 reserved = 3.
+        // But 3 blocks needed == 3 available, so it should be admitted at this point.
+        // Enqueue a bigger one: 64 tokens → needs 4 blocks > 3 available.
+        let _rx2 = make_request(&mut sched, 64);
+
+        let decision = sched.schedule(&cache);
+        // Active decode should still be scheduled.
+        assert_eq!(decision.decodes.len(), 1, "active decode should still run");
+        assert_eq!(decision.decodes[0].seq_id, seq_id);
+        // New prefill should be blocked (needs 4 blocks, only 3 available after reserve).
+        assert!(decision.prefills.is_empty(), "prefill should be blocked by reserve");
+        assert_eq!(sched.num_pending(), 1);
+    }
+
+    #[test]
+    fn test_max_batch_size_limit() {
+        let backend = MockBackend::new();
+        let cache = make_cache(&backend);
+        let mut sched = BatchScheduler::new(2, 4096, 512, 0.1);
+
+        // Admit 3 sequences via prefill, then move them to active decode state.
+        let mut rxs = Vec::new();
+        for _ in 0..3 {
+            rxs.push(make_request(&mut sched, 3));
+        }
+        // First schedule admits up to max_batch_size=2 prefills.
+        let d1 = sched.schedule(&cache);
+        assert_eq!(d1.prefills.len(), 2);
+        assert_eq!(sched.num_pending(), 1);
+
+        // Give the 2 admitted sequences generated tokens so they become decodes.
+        for (_, seq) in sched.active.iter_mut() {
+            seq.generated_tokens.push(42);
+        }
+
+        // Schedule again: 2 active decodes fill max_batch_size, third still pending.
+        let d2 = sched.schedule(&cache);
+        assert!(d2.decodes.len() <= 2, "decodes should be capped at max_batch_size");
+        assert_eq!(
+            d2.decodes.len() + d2.prefills.len(),
+            2,
+            "total scheduled should not exceed max_batch_size"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_completed_frees_cache_blocks() {
+        let backend = MockBackend::new();
+        let mut cache = PagedKvCacheManager::new(10, 2, 2, 16, &backend).unwrap();
+        let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
+
+        // Allocate a cache handle (takes 1 block from pool).
+        let handle = cache.alloc().unwrap();
+        let free_before = cache.num_free_blocks();
+
+        // Insert an active sequence that has hit its stop token.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let seq_id = sched.next_seq_id();
+        sched.active.insert(seq_id, ActiveSequence {
+            seq_id,
+            handle,
+            max_tokens: 100,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            stop_tokens: vec![999],
+            current_pos: 5,
+            generated_tokens: vec![1, 2, 999], // stop token
+            event_tx: tx,
+            remaining_prefill: Vec::new(),
+        });
+
+        let removed = sched.cleanup_completed();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, seq_id);
+
+        // Free the returned handle and verify blocks returned to pool.
+        cache.free(removed[0].1).unwrap();
+        let free_after = cache.num_free_blocks();
+        assert!(free_after > free_before, "freeing handle should return blocks to pool");
     }
 }

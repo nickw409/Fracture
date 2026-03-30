@@ -3672,7 +3672,9 @@ mod tests {
 
         let err = b.matmul(&a, &bt, &out);
         assert!(err.is_err(), "matmul should fail on K dimension mismatch");
-        let msg = err.unwrap_err().to_string();
+        let err = err.unwrap_err();
+        assert!(matches!(err, FractureError::InvalidShape(_)), "expected InvalidShape, got: {err:?}");
+        let msg = err.to_string();
         assert!(msg.contains("matmul"), "error should mention matmul: {msg}");
 
         b.free(&a).unwrap();
@@ -3709,5 +3711,925 @@ mod tests {
 
         b.free(&src).unwrap();
         b.free(&dst).unwrap();
+    }
+
+    // ── New gap-closing tests ──────────────────────────────────────
+
+    #[test]
+    fn test_matmul_llama3_prefill_ffn_512() {
+        // A[512,4096] x B[14336,4096]^T = C[512,14336]
+        // Verify 5 sampled output positions against CPU dot product.
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 512;
+        let k = 4096;
+        let n = 14336;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let c = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &c).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &c);
+        assert_eq!(result.len(), m * n);
+
+        // Sample 5 output positions spread across the output matrix.
+        let samples = [(0usize, 0usize), (0, n - 1), (m / 2, n / 2), (m - 1, 0), (m - 1, n - 1)];
+        for &(row, col) in &samples {
+            // CPU reference: account for FP16 storage by rounding inputs first.
+            let expected: f32 = (0..k)
+                .map(|ki| {
+                    let av = f16::from_f32(a_data[row * k + ki]).to_f32();
+                    let bv = f16::from_f32(b_data[col * k + ki]).to_f32();
+                    av * bv
+                })
+                .sum();
+            let got = result[row * n + col];
+            let tol = expected.abs() * 1e-2 + 0.5;
+            assert!(
+                (got - expected).abs() <= tol,
+                "prefill_ffn_512 ({row},{col}): got {got}, expected {expected} (tol={tol})"
+            );
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&c).unwrap();
+    }
+
+    #[test]
+    fn test_matmul_llama3_vocab_projection() {
+        // A[1,4096] x B[128256,4096]^T = C[1,128256]
+        // Sample a few output columns and compare against CPU dot product.
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 1;
+        let k = 4096;
+        let n = 128256;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let c = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &c).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &c);
+        assert_eq!(result.len(), m * n);
+
+        // Sample 5 columns.
+        let sample_cols = [0usize, n / 4, n / 2, 3 * n / 4, n - 1];
+        for col in sample_cols {
+            let expected: f32 = (0..k)
+                .map(|ki| {
+                    let av = f16::from_f32(a_data[ki]).to_f32();
+                    let bv = f16::from_f32(b_data[col * k + ki]).to_f32();
+                    av * bv
+                })
+                .sum();
+            let got = result[col];
+            let tol = expected.abs() * 1e-2 + 0.5;
+            assert!(
+                (got - expected).abs() <= tol,
+                "vocab_proj col {col}: got {got}, expected {expected} (tol={tol})"
+            );
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&c).unwrap();
+    }
+
+    #[test]
+    fn test_matmul_llama3_qkv_correctness() {
+        // A[1,4096] x B[4096,4096]^T = C[1,4096]
+        // Verify sampled output positions match CPU dot products (not just is_finite).
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let m = 1;
+        let k = 4096;
+        let n = 4096;
+
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+
+        let a = alloc_with_data(&b, &[m, k], &a_data);
+        let bt = alloc_with_data(&b, &[n, k], &b_data);
+        let c = b.alloc(&[m, n], DType::FP16).unwrap();
+
+        b.matmul(&a, &bt, &c).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &c);
+        assert_eq!(result.len(), m * n);
+
+        // Sample 5 output columns.
+        let sample_cols = [0usize, n / 4, n / 2, 3 * n / 4, n - 1];
+        for col in sample_cols {
+            let expected: f32 = (0..k)
+                .map(|ki| {
+                    let av = f16::from_f32(a_data[ki]).to_f32();
+                    let bv = f16::from_f32(b_data[col * k + ki]).to_f32();
+                    av * bv
+                })
+                .sum();
+            let got = result[col];
+            let tol = expected.abs() * 1e-2 + 0.1;
+            assert!(
+                (got - expected).abs() <= tol,
+                "qkv_correctness col {col}: got {got}, expected {expected} (tol={tol})"
+            );
+        }
+
+        b.free(&a).unwrap();
+        b.free(&bt).unwrap();
+        b.free(&c).unwrap();
+    }
+
+    #[test]
+    fn test_attention_decode_various_cache_lengths() {
+        // Run decode attention at production dims (Q=[1,32,128], KV heads=8) for
+        // several cache lengths. Verify all outputs are finite with correct shape.
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let head_dim = 128;
+        let num_q_heads = 32;
+        let num_kv_heads = 8;
+        let max_seq = 512;
+
+        let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .collect();
+        let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .collect();
+        let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
+        let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
+
+        for &cache_len in &[1usize, 16, 64, 256] {
+            let q_data: Vec<f32> = (0..num_q_heads * head_dim)
+                .map(|_| rng.gen_range(-0.3f32..0.3))
+                .collect();
+            let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+            let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+
+            // start_pos = cache_len - 1 so kv_len = cache_len.
+            b.attention(&q, &k_cache, &v_cache, num_kv_heads, cache_len - 1, &out).unwrap();
+            b.synchronize().unwrap();
+
+            let result = read_fp16(&b, &out);
+            assert_eq!(result.len(), num_q_heads * head_dim,
+                "cache_len={cache_len}: wrong output length");
+            for (i, &val) in result.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "cache_len={cache_len} output[{i}] is not finite: {val}"
+                );
+            }
+
+            b.free(&q).unwrap();
+            b.free(&out).unwrap();
+        }
+
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+    }
+
+    #[test]
+    fn test_attention_decode_production_correctness() {
+        // Q=[1,4,128], KV=[cache_len,2,128], num_kv_heads=2, num_q_heads=4 (GQA group=2).
+        // cache_len=8. Compare GPU output against CPU scaled dot-product attention with GQA.
+        use rand::Rng;
+        let b = make_backend();
+        let mut rng = rand::thread_rng();
+        let head_dim = 128;
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let cache_len = 8usize;
+        let max_seq = 16usize;
+
+        let q_data: Vec<f32> = (0..num_q_heads * head_dim)
+            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .collect();
+        let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .collect();
+        let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .collect();
+
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+        let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
+        let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+
+        // start_pos = cache_len - 1 so kv_len = cache_len.
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, cache_len - 1, &out).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        assert_eq!(result.len(), num_q_heads * head_dim);
+
+        // CPU reference: GQA scaled dot-product attention.
+        // group_size = num_q_heads / num_kv_heads = 2.
+        // For each Q head h, the KV head index is h / group_size.
+        let scale = 1.0f64 / (head_dim as f64).sqrt();
+        let group_size = num_q_heads / num_kv_heads;
+
+        for qh in 0..num_q_heads {
+            let kvh = qh / group_size;
+            let q_base = qh * head_dim;
+
+            // Compute attention scores: Q[qh] . K[t, kvh] for t in 0..cache_len
+            let scores: Vec<f64> = (0..cache_len)
+                .map(|t| {
+                    let k_base = t * num_kv_heads * head_dim + kvh * head_dim;
+                    let dot: f64 = (0..head_dim)
+                        .map(|d| q_data[q_base + d] as f64 * k_data[k_base + d] as f64)
+                        .sum();
+                    dot * scale
+                })
+                .collect();
+
+            // Softmax.
+            let max_score = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exp_scores: Vec<f64> = scores.iter().map(|&s| (s - max_score).exp()).collect();
+            let sum_exp: f64 = exp_scores.iter().sum();
+            let weights: Vec<f64> = exp_scores.iter().map(|&e| e / sum_exp).collect();
+
+            // Weighted sum of V.
+            for d in 0..head_dim {
+                let expected: f64 = (0..cache_len)
+                    .map(|t| {
+                        let v_base = t * num_kv_heads * head_dim + kvh * head_dim;
+                        weights[t] * v_data[v_base + d] as f64
+                    })
+                    .sum();
+                let got = result[qh * head_dim + d] as f64;
+                // FP16 tolerance: rtol=2e-2, atol=5e-3 (small cache, FP16 rounding)
+                let tol = expected.abs() * 2e-2 + 5e-3;
+                assert!(
+                    (got - expected).abs() <= tol,
+                    "attn_correctness qh={qh} d={d}: got {got}, expected {expected} (tol={tol})"
+                );
+            }
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_nvtx_push_null_byte_name() {
+        // marker_push with a string containing \0 should not panic.
+        // The nvtx::range_push implementation falls back to "invalid" for null-byte strings.
+        let b = make_backend();
+        b.marker_push("test\0embedded");
+        b.marker_pop();
+        // If we reach here without panicking, the test passes.
+    }
+
+    #[test]
+    fn test_backend_error_mapping() {
+        // Call copy_to_host with a wrong-sized buffer and verify the error is
+        // a typed FractureError (not a panic).
+        let b = make_backend();
+        let t = b.alloc(&[4, 4], DType::FP16).unwrap(); // 32 elements = 64 bytes
+        let mut small_buf = vec![0u8; 16]; // intentionally too small
+        let err = b.copy_to_host(&t, &mut small_buf).unwrap_err();
+        assert!(
+            matches!(err, FractureError::InvalidShape(_)),
+            "expected FractureError::InvalidShape for wrong-size buffer, got: {err:?}"
+        );
+        b.free(&t).unwrap();
+    }
+
+    // ── Paged attention tests ──────────────────────────────────────
+
+    // BLOCK_SIZE matches the paged attention kernel constant (PAGED_BLOCK_SIZE = 16).
+    const BLOCK_SIZE: usize = 16;
+
+    /// Allocate a KV block of shape [BLOCK_SIZE, num_kv_heads, head_dim] filled with
+    /// the provided data (length must equal BLOCK_SIZE * num_kv_heads * head_dim).
+    fn alloc_kv_block(
+        backend: &CudaBackend,
+        num_kv_heads: usize,
+        head_dim: usize,
+        data: &[f32],
+    ) -> DeviceTensor {
+        alloc_with_data(backend, &[BLOCK_SIZE, num_kv_heads, head_dim], data)
+    }
+
+    /// Build a block of shape [BLOCK_SIZE, num_kv_heads, head_dim] where token slot
+    /// `slot` in [0..BLOCK_SIZE) is filled with `token_data` and all other slots are 0.
+    fn block_with_token(
+        num_kv_heads: usize,
+        head_dim: usize,
+        slot: usize,
+        token_data: &[f32],
+    ) -> Vec<f32> {
+        let stride = num_kv_heads * head_dim;
+        let mut data = vec![0.0f32; BLOCK_SIZE * stride];
+        let base = slot * stride;
+        data[base..base + token_data.len()].copy_from_slice(token_data);
+        data
+    }
+
+    /// Build a block of shape [BLOCK_SIZE, num_kv_heads, head_dim] filled with
+    /// sequential slots: slot `i` gets `per_slot[i]` (head-replicated across kv heads).
+    fn block_with_slots(
+        num_kv_heads: usize,
+        head_dim: usize,
+        per_slot: &[Vec<f32>],
+    ) -> Vec<f32> {
+        let stride = num_kv_heads * head_dim;
+        let mut data = vec![0.0f32; BLOCK_SIZE * stride];
+        for (slot, slot_data) in per_slot.iter().enumerate().take(BLOCK_SIZE) {
+            let base = slot * stride;
+            // Replicate across all KV heads.
+            for kv_h in 0..num_kv_heads {
+                let offset = base + kv_h * head_dim;
+                data[offset..offset + head_dim].copy_from_slice(slot_data);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_attention_prefill_production_dims() {
+        // Prefill: 8 tokens, 32 Q heads, 8 KV heads (GQA group=4), head_dim=128.
+        // This exercises the production Llama 3.1 GQA shape.
+        use rand::Rng;
+        let b = make_backend();
+        let n_tokens = 8usize;
+        let num_q_heads = 32usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let mut rng = rand::thread_rng();
+
+        // Allocate Q with small random data.
+        let q_data: Vec<f32> = (0..n_tokens * num_q_heads * head_dim)
+            .map(|_| rng.gen_range(-0.1f32..0.1f32))
+            .collect();
+        let q = alloc_with_data(&b, &[n_tokens, num_q_heads, head_dim], &q_data);
+
+        // We need ceil(8/16) = 1 block for kv_len=8 tokens at start_pos=0.
+        // Block layout: tokens 0..8 in slot 0..8 of block 0.
+        let k_block_data: Vec<f32> = (0..BLOCK_SIZE * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.1f32..0.1f32))
+            .collect();
+        let v_block_data: Vec<f32> = (0..BLOCK_SIZE * num_kv_heads * head_dim)
+            .map(|_| rng.gen_range(-0.1f32..0.1f32))
+            .collect();
+
+        let k_block = alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data);
+        let v_block = alloc_kv_block(&b, num_kv_heads, head_dim, &v_block_data);
+
+        // block_table: logical block 0 → physical block 0.
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let out = b.alloc(&[n_tokens, num_q_heads, head_dim], DType::FP16).unwrap();
+
+        b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            n_tokens, // kv_len = start_pos(0) + n_tokens(8)
+            0,        // start_pos
+            &out,
+        ).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+
+        // Verify output shape: n_tokens * num_q_heads * head_dim elements.
+        assert_eq!(
+            result.len(),
+            n_tokens * num_q_heads * head_dim,
+            "output length mismatch"
+        );
+
+        // Verify all values are finite (no NaN/Inf from FP16 overflow).
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "output[{i}] = {v} is not finite"
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_block).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_single_token() {
+        // 1 token, 2 Q heads, 1 KV head, head_dim=4, kv_len=4 (fits in 1 block).
+        // Compare paged output to contiguous attention on identical data.
+        let b = make_backend();
+        let num_q_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let kv_len = 4usize; // 4 prior tokens in cache, new token at position 4
+
+        // Q for 1 new token (start_pos = kv_len, so the new token attends to all 4 prior).
+        let q_data: Vec<f32> = vec![1.0, 0.5, 0.0, -0.5,  // Q head 0
+                                    0.0, 1.0, 0.5,  0.25]; // Q head 1
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        // KV data for 4 tokens (each kv_head row = [head_dim] values).
+        // Layout in contiguous cache: [max_seq, num_kv_heads, head_dim].
+        let k_vals: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.5, 0.5, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        let v_vals: Vec<Vec<f32>> = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![2.0, 0.0, 1.0, 0.5],
+            vec![0.0, 3.0, 0.0, 1.0],
+        ];
+
+        // ── Contiguous reference ──────────────────────────────────
+        let max_seq = 8usize;
+        let k_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let v_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        for pos in 0..kv_len {
+            let ks = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &k_vals[pos]);
+            let vs = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &v_vals[pos]);
+            b.copy_rows(&ks, &k_cache, 0, pos, 1).unwrap();
+            b.copy_rows(&vs, &v_cache, 0, pos, 1).unwrap();
+            b.free(&ks).unwrap();
+            b.free(&vs).unwrap();
+        }
+        let out_contiguous = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        // start_pos = kv_len (new token at position kv_len).
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, kv_len, &out_contiguous).unwrap();
+        b.synchronize().unwrap();
+        let ref_result = read_fp16(&b, &out_contiguous);
+
+        // ── Paged attention ──────────────────────────────────────
+        // kv_len=4 fits in 1 block (BLOCK_SIZE=16). All 4 tokens go in slots 0..4 of block 0.
+        let mut k_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        let mut v_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        for pos in 0..kv_len {
+            let base = pos * num_kv_heads * head_dim;
+            k_block_data[base..base + head_dim].copy_from_slice(&k_vals[pos]);
+            v_block_data[base..base + head_dim].copy_from_slice(&v_vals[pos]);
+        }
+        let k_block = alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data);
+        let v_block = alloc_kv_block(&b, num_kv_heads, head_dim, &v_block_data);
+
+        // block_table: logical block 0 → physical block 0.
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let out_paged = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        // kv_len passed to attention_paged = start_pos + new_seq_len = kv_len + 1.
+        b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            kv_len + 1, // kv_len = start_pos(4) + new_seq_len(1)
+            kv_len,     // start_pos
+            &out_paged,
+        ).unwrap();
+        b.synchronize().unwrap();
+        let paged_result = read_fp16(&b, &out_paged);
+
+        // Compare element-wise: rtol=1e-3, atol=1e-3.
+        assert_eq!(ref_result.len(), paged_result.len(), "output lengths differ");
+        for (i, (&r, &p)) in ref_result.iter().zip(paged_result.iter()).enumerate() {
+            let tol = r.abs() * 1e-3 + 1e-3;
+            assert!(
+                (r - p).abs() <= tol,
+                "paged vs contiguous mismatch at [{}]: paged={p}, contiguous={r} (tol={tol})",
+                i
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&out_contiguous).unwrap();
+        b.free(&k_block).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out_paged).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_multi_block() {
+        // kv_len=35 spans 3 blocks (slots 0..16, 0..16, 0..3 in blocks 0,1,2).
+        // 1 new decode token (start_pos=35), 2 Q heads, 1 KV head, head_dim=4.
+        // Compare paged output against contiguous attention.
+        let b = make_backend();
+        let num_q_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let kv_len = 35usize; // 3 full blocks would be 48; we use 35 (3 partial blocks: 16+16+3)
+
+        // Q for 1 new decode token.
+        let q_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0,  // Q head 0
+                                    0.0, 1.0, 0.0, 0.0];  // Q head 1
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        // Generate deterministic KV data: token i → K[i] = [cos(i*0.1), sin(i*0.1), 0, 0].
+        let kv_data: Vec<Vec<f32>> = (0..kv_len)
+            .map(|i| {
+                let angle = i as f32 * 0.1;
+                vec![angle.cos(), angle.sin(), 0.0, 0.0]
+            })
+            .collect();
+
+        // ── Contiguous reference ──────────────────────────────────
+        let max_seq = 64usize;
+        let k_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let v_cache = b.alloc(&[max_seq, num_kv_heads, head_dim], DType::FP16).unwrap();
+        for pos in 0..kv_len {
+            let ks = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &kv_data[pos]);
+            let vs = alloc_with_data(&b, &[1, num_kv_heads, head_dim], &kv_data[pos]);
+            b.copy_rows(&ks, &k_cache, 0, pos, 1).unwrap();
+            b.copy_rows(&vs, &v_cache, 0, pos, 1).unwrap();
+            b.free(&ks).unwrap();
+            b.free(&vs).unwrap();
+        }
+        let out_contiguous = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention(&q, &k_cache, &v_cache, num_kv_heads, kv_len, &out_contiguous).unwrap();
+        b.synchronize().unwrap();
+        let ref_result = read_fp16(&b, &out_contiguous);
+
+        // ── Paged attention ──────────────────────────────────────
+        // 3 blocks: block 0 holds tokens 0..16, block 1 holds 16..32, block 2 holds 32..35.
+        let num_blocks = 3usize;
+        let mut k_block_data: Vec<Vec<f32>> = vec![
+            vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim]; num_blocks
+        ];
+        let mut v_block_data: Vec<Vec<f32>> = vec![
+            vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim]; num_blocks
+        ];
+        for pos in 0..kv_len {
+            let blk = pos / BLOCK_SIZE;
+            let slot = pos % BLOCK_SIZE;
+            let base = slot * num_kv_heads * head_dim;
+            k_block_data[blk][base..base + head_dim].copy_from_slice(&kv_data[pos]);
+            v_block_data[blk][base..base + head_dim].copy_from_slice(&kv_data[pos]);
+        }
+        let k_blocks_alloc: Vec<DeviceTensor> = (0..num_blocks)
+            .map(|blk| alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data[blk]))
+            .collect();
+        let v_blocks_alloc: Vec<DeviceTensor> = (0..num_blocks)
+            .map(|blk| alloc_kv_block(&b, num_kv_heads, head_dim, &v_block_data[blk]))
+            .collect();
+
+        // block_table maps logical blocks 0,1,2 → physical block IDs 0,1,2.
+        let block_table: Vec<i32> = vec![0, 1, 2];
+        let k_blocks: Vec<&DeviceTensor> = k_blocks_alloc.iter().collect();
+        let v_blocks: Vec<&DeviceTensor> = v_blocks_alloc.iter().collect();
+
+        let out_paged = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            kv_len + 1, // start_pos=kv_len, new_seq_len=1 → kv_len+1
+            kv_len,
+            &out_paged,
+        ).unwrap();
+        b.synchronize().unwrap();
+        let paged_result = read_fp16(&b, &out_paged);
+
+        // Compare element-wise: rtol=1e-3, atol=1e-3.
+        assert_eq!(ref_result.len(), paged_result.len());
+        for (i, (&r, &p)) in ref_result.iter().zip(paged_result.iter()).enumerate() {
+            let tol = r.abs() * 1e-3 + 1e-3;
+            assert!(
+                (r - p).abs() <= tol,
+                "multi_block mismatch at [{}]: paged={p}, contiguous={r} (tol={tol})",
+                i
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_cache).unwrap();
+        b.free(&v_cache).unwrap();
+        b.free(&out_contiguous).unwrap();
+        for t in k_blocks_alloc { b.free(&t).unwrap(); }
+        for t in v_blocks_alloc { b.free(&t).unwrap(); }
+        b.free(&out_paged).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_prefill_causal() {
+        // N=4 tokens, start_pos=0, 1 Q head, 1 KV head, head_dim=4.
+        // Distinct V values per position, uniform Q/K so attention is uniform within causal window.
+        // Token 0 → V[0], token 1 → avg(V[0..2]), token 2 → avg(V[0..3]), token 3 → avg(V[0..4]).
+        let b = make_backend();
+        let n_tokens = 4usize;
+        let num_q_heads = 1usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+
+        // Distinct V values per position (same as contiguous causal test).
+        let v_values: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0], // pos 0
+            vec![0.0, 1.0, 0.0, 0.0], // pos 1
+            vec![0.0, 0.0, 1.0, 0.0], // pos 2
+            vec![0.0, 0.0, 0.0, 1.0], // pos 3
+        ];
+        // K values: identical so attention scores are equal (uniform within causal mask).
+        let k_val = vec![1.0f32, 0.0, 0.0, 0.0];
+
+        // Q: all tokens query with same direction as K.
+        let q_data: Vec<f32> = (0..n_tokens)
+            .flat_map(|_| k_val.iter().copied())
+            .collect();
+        let q = alloc_with_data(&b, &[n_tokens, num_q_heads, head_dim], &q_data);
+
+        // Put all 4 tokens into block 0 (BLOCK_SIZE=16, 4 tokens fit in slots 0..4).
+        let mut k_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        let mut v_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        for pos in 0..n_tokens {
+            let base = pos * num_kv_heads * head_dim;
+            k_block_data[base..base + head_dim].copy_from_slice(&k_val);
+            v_block_data[base..base + head_dim].copy_from_slice(&v_values[pos]);
+        }
+        let k_block = alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data);
+        let v_block = alloc_kv_block(&b, num_kv_heads, head_dim, &v_block_data);
+
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let out = b.alloc(&[n_tokens, num_q_heads, head_dim], DType::FP16).unwrap();
+        // start_pos=0, kv_len = start_pos + n_tokens = 4.
+        b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            n_tokens, // kv_len
+            0,        // start_pos
+            &out,
+        ).unwrap();
+        b.synchronize().unwrap();
+
+        let result = read_fp16(&b, &out);
+        // Token 0 sees only pos 0 → output = V[0] = [1,0,0,0].
+        assert!(
+            (result[0] - 1.0).abs() < 0.1,
+            "causal token0 d0: {}", result[0]
+        );
+        for d in 1..head_dim {
+            assert!(
+                result[d].abs() < 0.1,
+                "causal token0 d{d}: {}", result[d]
+            );
+        }
+
+        // Token 1 sees pos 0,1 → avg(V[0], V[1]) = [0.5, 0.5, 0, 0].
+        let t1 = num_q_heads * head_dim;
+        assert!(
+            (result[t1] - 0.5).abs() < 0.15,
+            "causal token1 d0: {}", result[t1]
+        );
+        assert!(
+            (result[t1 + 1] - 0.5).abs() < 0.15,
+            "causal token1 d1: {}", result[t1 + 1]
+        );
+
+        // Token 3 sees pos 0..3 → avg([1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]) = [0.25;4].
+        let t3 = 3 * num_q_heads * head_dim;
+        for d in 0..head_dim {
+            assert!(
+                (result[t3 + d] - 0.25).abs() < 0.15,
+                "causal token3 d{d}: {}", result[t3 + d]
+            );
+        }
+
+        b.free(&q).unwrap();
+        b.free(&k_block).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_gqa() {
+        // 4 Q heads, 2 KV heads: Q heads 0,1 share KV head 0; Q heads 2,3 share KV head 1.
+        // 1 decode token, kv_len=4 (4 tokens already in cache), head_dim=4.
+        // Verify: Q heads 0 and 1 produce identical output; Q heads 2 and 3 produce identical output.
+        let b = make_backend();
+        let num_q_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 4usize;
+        let kv_len = 4usize;
+
+        // Q: 1 decode token, 4 heads — heads 0,1 identical; heads 2,3 identical but different.
+        let q_data: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, // Q head 0
+            1.0, 0.0, 0.0, 0.0, // Q head 1 (same as 0 → same KV head 0 output)
+            0.0, 1.0, 0.0, 0.0, // Q head 2
+            0.0, 1.0, 0.0, 0.0, // Q head 3 (same as 2 → same KV head 1 output)
+        ];
+        let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
+
+        // KV data for 4 tokens.
+        // KV head 0 K vals: all [1,0,0,0] for uniform attention.
+        // KV head 1 K vals: all [0,1,0,0] for uniform attention.
+        // KV head 0 V vals: different per position.
+        // KV head 1 V vals: different per position (but different from KV head 0).
+        let kh0_k = vec![1.0f32, 0.0, 0.0, 0.0];
+        let kh1_k = vec![0.0f32, 1.0, 0.0, 0.0];
+        let kh0_v: Vec<Vec<f32>> = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![9.0, 0.0, 1.0, 2.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+        ];
+        let kh1_v: Vec<Vec<f32>> = vec![
+            vec![0.1, 0.2, 0.3, 0.4],
+            vec![0.5, 0.6, 0.7, 0.8],
+            vec![0.9, 0.0, 0.1, 0.2],
+            vec![0.3, 0.4, 0.5, 0.6],
+        ];
+
+        // Build paged block: 1 block, tokens 0..4 in slots 0..4.
+        // Layout: slot * num_kv_heads * head_dim, with kv_head stride.
+        let mut k_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        let mut v_block_data = vec![0.0f32; BLOCK_SIZE * num_kv_heads * head_dim];
+        for pos in 0..kv_len {
+            let base = pos * num_kv_heads * head_dim;
+            // KV head 0
+            k_block_data[base..base + head_dim].copy_from_slice(&kh0_k);
+            v_block_data[base..base + head_dim].copy_from_slice(&kh0_v[pos]);
+            // KV head 1
+            let h1_off = base + head_dim;
+            k_block_data[h1_off..h1_off + head_dim].copy_from_slice(&kh1_k);
+            v_block_data[h1_off..h1_off + head_dim].copy_from_slice(&kh1_v[pos]);
+        }
+        let k_block = alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data);
+        let v_block = alloc_kv_block(&b, num_kv_heads, head_dim, &v_block_data);
+
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
+        b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            kv_len + 1, // kv_len total (start_pos=4, new_seq_len=1)
+            kv_len,
+            &out,
+        ).unwrap();
+        b.synchronize().unwrap();
+        let result = read_fp16(&b, &out);
+
+        // Q heads 0 and 1 share KV head 0 and have identical Q vectors → identical outputs.
+        for d in 0..head_dim {
+            let h0 = result[0 * head_dim + d];
+            let h1 = result[1 * head_dim + d];
+            assert!(
+                (h0 - h1).abs() < 0.05,
+                "GQA: Q head 0 and 1 should be identical at d={d}: h0={h0}, h1={h1}"
+            );
+        }
+
+        // Q heads 2 and 3 share KV head 1 and have identical Q vectors → identical outputs.
+        for d in 0..head_dim {
+            let h2 = result[2 * head_dim + d];
+            let h3 = result[3 * head_dim + d];
+            assert!(
+                (h2 - h3).abs() < 0.05,
+                "GQA: Q head 2 and 3 should be identical at d={d}: h2={h2}, h3={h3}"
+            );
+        }
+
+        // Q heads 0,1 (KV head 0) and Q heads 2,3 (KV head 1) should differ
+        // (they attend to different KV data).
+        let heads_01_differ_from_23 = (0..head_dim).any(|d| {
+            let h0 = result[0 * head_dim + d];
+            let h2 = result[2 * head_dim + d];
+            (h0 - h2).abs() > 0.05
+        });
+        assert!(
+            heads_01_differ_from_23,
+            "GQA: Q head groups 0-1 and 2-3 should differ (they share different KV heads)"
+        );
+
+        b.free(&q).unwrap();
+        b.free(&k_block).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_invalid_q_tensor() {
+        // Passing a fake q tensor (TensorId not registered) should return an error.
+        let b = make_backend();
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+
+        // Valid block tensors.
+        let k_block = b.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let v_block = b.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let out = b.alloc(&[1, 1, head_dim], DType::FP16).unwrap();
+
+        // Fake q tensor with unregistered TensorId.
+        let fake_q = DeviceTensor::new(TensorId(999999), vec![1, 1, head_dim], DType::FP16);
+
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let result = b.attention_paged(
+            &fake_q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            1,
+            0,
+            &out,
+        );
+        assert!(
+            result.is_err(),
+            "attention_paged with invalid q tensor should return Err"
+        );
+
+        b.free(&k_block).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out).unwrap();
+    }
+
+    #[test]
+    fn test_paged_attention_invalid_block_tensor() {
+        // Including a fake TensorId in k_blocks should return an error.
+        let b = make_backend();
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+
+        let q = alloc_with_data(&b, &[1, 1, head_dim], &[1.0, 0.0, 0.0, 0.0]);
+        let v_block = b.alloc(&[BLOCK_SIZE, num_kv_heads, head_dim], DType::FP16).unwrap();
+        let out = b.alloc(&[1, 1, head_dim], DType::FP16).unwrap();
+
+        // Fake k_block with unregistered TensorId.
+        let fake_k_block = DeviceTensor::new(
+            TensorId(999999),
+            vec![BLOCK_SIZE, num_kv_heads, head_dim],
+            DType::FP16,
+        );
+
+        let block_table: Vec<i32> = vec![0];
+        let k_blocks: Vec<&DeviceTensor> = vec![&fake_k_block];
+        let v_blocks: Vec<&DeviceTensor> = vec![&v_block];
+
+        let result = b.attention_paged(
+            &q,
+            &block_table,
+            &k_blocks,
+            &v_blocks,
+            num_kv_heads,
+            1,
+            0,
+            &out,
+        );
+        assert!(
+            result.is_err(),
+            "attention_paged with invalid k_block tensor should return Err"
+        );
+
+        b.free(&q).unwrap();
+        b.free(&v_block).unwrap();
+        b.free(&out).unwrap();
     }
 }

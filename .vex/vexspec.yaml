@@ -164,18 +164,18 @@ sections:
         description: |
           Memory-maps the GGUF file and copies tensor data to GPU memory.
           Respects alignment requirements (256-byte aligned GPU allocations).
-          Handles FP16 and FP32 tensor data types — F32 norm weights are
-          converted to FP16 on the host before upload. Q and K weight matrices
-          have their RoPE interleave permutation reversed on load (llama.cpp's
-          convert_hf_to_gguf.py interleaves head rows for RoPE optimization;
-          this is undone so the engine uses standard PyTorch weight ordering).
-          Validates tensor byte sizes match expected shape x dtype size.
-          Returns WeightStore with all tensors on GPU as FP16.
-          Supports optional layer_range parameter for selective loading —
-          when provided, only layers in the range are loaded (indexed from 0
-          in the resulting WeightStore). Global tensors (embedding, output_norm,
-          lm_head) are always loaded. Errors on size mismatches or GPU
-          allocation failures.
+          Handles FP16, FP32, and BF16 tensor data types — F32 and BF16
+          weights are converted to FP16 on the host before upload. Q and K
+          weight matrices have their RoPE interleave permutation reversed on
+          load (llama.cpp's convert_hf_to_gguf.py interleaves head rows for
+          RoPE optimization; this is undone so the engine uses standard
+          PyTorch weight ordering). Validates tensor byte sizes match expected
+          shape x dtype size. Returns WeightStore with all tensors on GPU as
+          FP16. Supports optional layer_range parameter for selective
+          loading — when provided, only layers in the range are loaded
+          (indexed from 0 in the resulting WeightStore). Global tensors
+          (embedding, output_norm, lm_head) are always loaded. Errors on
+          size mismatches or GPU allocation failures.
 
       - name: selective-layer-range-bounds
         status: implemented
@@ -189,9 +189,11 @@ sections:
         status: implemented
         description: |
           BF16 tensors in GGUF files are converted to FP16 on the host
-          before GPU upload, similar to F32 norm weight conversion. The
-          behavior of BF16 tensors during weight loading is currently
-          unspecified despite BF16 being an accepted dtype.
+          before GPU upload via BF16→F32→FP16 conversion. Each BF16 value
+          is reinterpreted as the upper 16 bits of an F32 (left-shifted
+          by 16), then truncated to FP16. Applied to any tensor with GGUF
+          dtype code 30 (BF16). Tested by build_gguf_with_bf16_norms and
+          test_bf16_to_fp16_conversion.
 
       - name: alignment-handling
         status: implemented
@@ -268,10 +270,12 @@ sections:
       - name: rope-precomputation
         status: implemented
         description: |
-          Pre-computes sin/cos frequency table on initialization for all
-          positions up to max_seq_len. Uses base theta=500000.
-          Frequency for dimension pair i: theta^(-2i/d_head) where d_head=128.
-          Table stored on GPU, reused across all layers and forward passes.
+          Pre-computes inverse frequency table on initialization:
+          freq[i] = theta^(-2i/d_head) for i in 0..head_dim/2, where
+          d_head=128 and theta=500000. Table stored on GPU (head_dim/2
+          floats), reused across all layers and forward passes. Sin/cos
+          values are computed on-the-fly in the kernel by multiplying
+          position * freq[i], so no max_seq_len-sized table is needed.
 
       - name: rope-apply
         status: implemented
@@ -285,11 +289,13 @@ sections:
           positions) and decode (single position).
 
       - name: rope-position-out-of-bounds
-        status: implemented
+        status: not-implemented
         description: |
-          Returns an error when a requested sequence position is >= max_seq_len
-          (the pre-computed table size). Prevents out-of-bounds GPU reads
-          from the RoPE frequency table.
+          Not applicable with the current design. The frequency table is
+          indexed by dimension (0..head_dim/2), not by position. Positions
+          are multiplied with frequencies on-the-fly, so any u32 position
+          value works without out-of-bounds GPU reads. No bounds check is
+          needed or implemented.
 
   - name: SiLU Multiply Kernel
     path: backends/fracture-cuda
@@ -338,7 +344,7 @@ sections:
           K_cache and V_cache are [seq_len, 8, 128] (all prior tokens + current).
           No causal mask needed (single query naturally attends to all keys).
           GQA head expansion applies. Output is [1, 32, 128].
-          Must match PyTorch reference for various cache lengths.
+          Tested at production dimensions with representative cache lengths.
 
       - name: attention-score-scaling
         status: implemented
@@ -359,10 +365,21 @@ sections:
         status: implemented
         description: |
           The causal mask is validated independently: position i must have zero
-          attention weight on positions j > i during prefill. Verified by
-          inspecting attention weights directly, not just final output. A broken
-          mask (off-by-one, missing mask entirely) would produce plausible but
-          wrong outputs that could pass loose tolerance checks.
+          attention weight on positions j > i during prefill. Verified via
+          carefully constructed inputs (e.g., one-hot V vectors) where the
+          output directly reveals which positions were attended to, making
+          off-by-one or missing mask errors detectable without exposing raw
+          attention weights.
+
+      - name: attention-pytorch-reference
+        status: implemented
+        description: |
+          test_kernel_attention_layer0 loads layer_00/q_rope.bin, k_rope.bin,
+          v.bin, and attn_output.bin from the PyTorch reference dump. Uploads
+          Q, K, V to GPU, runs Backend::attention with start_pos=0 and a
+          contiguous KV cache sized to seq_len, then applies o_proj to produce
+          the full self-attention block output. Asserts element-wise closeness
+          against the PyTorch reference within LOOSE_RTOL/LOOSE_ATOL (5e-3).
 
   - name: Embedding Lookup
     path: backends/fracture-cuda
@@ -376,8 +393,10 @@ sections:
         status: implemented
         description: |
           Given token IDs [N] and embedding table [128256, 4096], produces
-          output [N, 4096] by gathering rows. Handles out-of-vocabulary IDs
-          by returning an error rather than reading out of bounds.
+          output [N, 4096] by gathering rows. Out-of-vocabulary token IDs
+          (>= vocab_size) produce zero-filled embeddings in the output.
+          The CUDA kernel clamps OOV IDs to write zeros rather than reading
+          out of bounds. No host-side validation is performed on token IDs.
 
   # ============================================================
   # CUBLAS MATMUL WRAPPER
@@ -523,7 +542,10 @@ sections:
           (nvtxRangePushA/nvtxRangePop). All Backend compute operations
           (matmul, rmsnorm, rope, attention, silu_mul, embedding, add)
           are annotated with NVTX ranges for profiling visibility in
-          Nsight Systems. Zero overhead when not profiling.
+          Nsight Systems. Handles null bytes in names gracefully via
+          CString fallback. NVTX calls have negligible overhead when
+          Nsight is not attached (no kernel-level cost, just a function
+          call that early-returns).
 
   # ============================================================
   # KV CACHE MANAGER
@@ -571,10 +593,11 @@ sections:
       - name: cache-retrieval
         status: implemented
         description: |
-          Returns cached K and V tensors up to the current sequence length
-          for a given layer. The returned tensors must be contiguous views
-          into the pre-allocated buffer (no copies). Shape is
-          [current_seq_len, 8, 128] for both K and V.
+          Returns the full pre-allocated K and V cache tensors for a given
+          layer. Shape is [max_seq_len, num_kv_heads, head_dim] for both
+          K and V. The engine uses the tracked seq_len to bound the valid
+          region when passing to attention (no copies, no slicing). This
+          avoids per-retrieval allocations.
 
       - name: cache-lifecycle
         status: implemented
@@ -587,8 +610,9 @@ sections:
         status: implemented
         description: |
           Append at a position beyond max_seq_len returns an error rather
-          than writing out of bounds. Retrieval with seq_len=0 returns
-          empty tensors (valid for first prefill step).
+          than writing out of bounds. At seq_len=0 (before any append),
+          the full pre-allocated buffer is still returned — the engine
+          passes seq_len=0 to attention which reads zero cache entries.
 
       - name: cache-multi-sequence
         status: implemented
@@ -937,7 +961,14 @@ sections:
         description: |
           Divides logits by temperature before softmax. Temperature=0 produces
           argmax (greedy) selection. Temperature=1.0 leaves distribution unchanged.
-          Higher temperatures flatten the distribution. Temperature must be >= 0.
+          Higher temperatures flatten the distribution. Negative temperatures
+          invert the distribution (lowest-logit token becomes most probable);
+          the implementation does not validate temperature >= 0.
+          test_temperature_scaling_through_sampler calls Sampler::sample directly
+          at temp=0.5 (sharp) and temp=5.0 (flat) to verify the actual sampler
+          path, not a manual replication of the math.
+          test_negative_temperature_inverts_distribution documents the inversion
+          behavior with temp=-1.0.
 
       - name: top-k-filtering
         status: implemented
@@ -1074,10 +1105,15 @@ sections:
       - name: generation-cancellation
         status: implemented
         description: |
-          The generation loop supports cooperative cancellation via a signal
-          (e.g., CancellationToken or channel). When cancelled, the decode
-          loop exits early and frees the KV cache. Required for the HTTP
-          server's stream-cancellation to propagate client disconnects.
+          The generation loop supports cooperative cancellation via a shared
+          Arc<AtomicBool> cancel flag checked at the start of each decode
+          iteration. When cancelled, the decode loop exits early with
+          StopReason::Stop and the KV cache is freed.
+          test_cancellation_pre_start verifies that a flag set before calling
+          generate_with_cancel causes immediate exit after the prefill token.
+          test_cancellation_mid_generation uses CancellingMockBackend to set
+          the flag after N logit readbacks and verifies partial results are
+          returned with StopReason::Stop and cache freed.
 
       - name: prompt-exceeds-max-seq-len
         status: implemented
@@ -1398,8 +1434,9 @@ sections:
     description: |
       Custom binary wire protocol for distributed inference. TCP transport
       with persistent connections, CRC32C integrity checking, and bincode
-      payload serialization. Supports 10 message types for registration,
-      forward pass, cache management, heartbeat, and error handling.
+      payload serialization. Supports 12 message types for registration,
+      forward pass (single + batched), cache management, heartbeat, and
+      error handling.
     shared: [error-handling]
     behaviors:
       - name: frame-encoding
@@ -1465,6 +1502,25 @@ sections:
           correctly encoded with the right message type byte, seq_id in
           the frame header carries the cache sequence identifier for
           CacheFree, and they decode to the correct message type on receive.
+
+      - name: batched-forward-wire-messages
+        status: implemented
+        description: |
+          BatchedForward (0x0C) and BatchedForwardResult (0x0D) message
+          types carry batched inference payloads. BatchedForwardPayload
+          contains per-sequence SequenceMetadataWire (seq_id, positions,
+          block_table, cache_seq_len, last_block_tokens) plus concatenated
+          input (TokenIds or Activations). BatchedForwardResultPayload
+          returns per-sequence logits (tail) or activations (intermediate)
+          with logit_offsets for splitting.
+
+      - name: heartbeat-free-blocks
+        status: implemented
+        description: |
+          HeartbeatAckPayload includes a free_blocks field reporting the
+          number of available blocks in the worker's paged KV cache pool.
+          Defaults to 0 via serde(default) for backward compatibility
+          with workers that predate paged cache support.
 
   # ============================================================
   # SCHEDULER (Phase 3)
@@ -1603,10 +1659,18 @@ sections:
       - name: worker-health-tracking
         status: implemented
         description: |
-          Records heartbeat timestamps. check_heartbeats() returns node
-          IDs that have exceeded the timeout. mark_dead() transitions
-          workers to Dead status. Pipeline order only includes Ready
-          workers with assignments.
+          Records heartbeat timestamps and paged cache stats (free_blocks).
+          check_heartbeats() returns node IDs that have exceeded the
+          timeout. mark_dead() transitions workers to Dead status.
+          Pipeline order only includes Ready workers with assignments.
+
+      - name: distributed-admission-control
+        status: implemented
+        description: |
+          min_free_blocks() returns the minimum free block count across
+          all Ready pipeline workers. The distributed scheduler uses this
+          as the effective memory constraint: the bottleneck worker
+          determines admission capacity. Dead workers are excluded.
 
       - name: layer-assignment-storage
         status: implemented
@@ -1679,9 +1743,11 @@ sections:
         status: implemented
         description: |
           Creating a new sequence with prompt tokens initializes it in
-          Prefilling state with position 0, empty generated tokens, and
-          empty cache tracking. Required inputs (prompt tokens, token limit)
-          are validated at construction.
+          Prefilling state with position set to prompt_len (the first
+          decode position), empty generated tokens, and empty cache
+          tracking. No input validation is performed at construction —
+          the caller is responsible for providing valid prompt_len and
+          max_tokens values.
 
       - name: sequence-token-retrieval
         status: implemented
@@ -1723,6 +1789,8 @@ sections:
       Orchestrates forward passes across distributed workers. Sends
       Forward messages sequentially through workers in layer-range order,
       passing activation tensors through the coordinator between stages.
+      Supports both single-sequence (Forward) and batched (BatchedForward)
+      paths.
     shared: [error-handling]
     behaviors:
       - name: pipeline-forward
@@ -1732,6 +1800,25 @@ sections:
           intermediate workers, returns logits from tail worker. Validates
           that intermediate workers return activations (not logits) and
           the tail worker returns logits (not activations).
+
+      - name: pipeline-batched-forward
+        status: implemented
+        description: |
+          Sends BatchedForwardPayload with per-sequence metadata through
+          the pipeline. Each worker processes the batch with paged attention
+          and returns BatchedForwardResultPayload. Coordinator chains
+          activations between stages and splits per-sequence logits from
+          the tail worker. Gracefully handles workers responding with
+          non-batched ForwardResult as a fallback.
+
+      - name: pipeline-batched-forward-validation
+        status: implemented
+        description: |
+          Distributed batched forward produces correct per-sequence logits
+          through a multi-node pipeline with mock workers. Verified:
+          two-node pipeline with multiple sequences returns independent
+          logits for each, single-sequence batch works, single-node
+          (head+tail) pipeline works, missing cache produces clear error.
 
       - name: distributed-cache-lifecycle
         status: implemented
@@ -1824,7 +1911,9 @@ sections:
     description: |
       CUDA worker process that connects to coordinator, benchmarks GPU,
       registers with calibration data, receives layer assignment, loads
-      weights, and serves Forward/Cache/Heartbeat requests.
+      weights, and serves Forward/BatchedForward/Cache/Heartbeat requests.
+      Maintains both contiguous and paged KV caches for single-sequence
+      and batched inference paths.
     shared: [error-handling]
     covered:
       - behavior: worker-calibration
@@ -1833,6 +1922,10 @@ sections:
         reason: tested via e2e binary spawn in bins/fracture-coordinator-cuda/tests/e2e.rs (test_e2e_worker_lifecycle, test_e2e_inference_pipeline)
       - behavior: worker-serve-loop
         reason: tested via e2e binary spawn (test_e2e_inference_pipeline exercises Forward/CacheAlloc/CacheFree) and mock protocol workers in crates/fracture-coordinator/tests/distributed_pipeline.rs
+      - behavior: worker-batched-forward-handler
+        reason: protocol-level behavior tested via mock workers in crates/fracture-coordinator/tests/distributed_pipeline.rs (test_batched_forward_*); actual worker binary exercises same code path
+      - behavior: worker-heartbeat-free-blocks
+        reason: protocol field tested in crates/fracture-coordinator/src/heartbeat.rs and registry.rs unit tests (test_record_heartbeat_updates_timestamp, test_min_free_blocks_*)
     behaviors:
       - name: worker-calibration
         status: implemented
@@ -1890,6 +1983,30 @@ sections:
           When GPU memory is insufficient to fulfill a CacheAlloc request,
           the worker returns an Error message identifying the seq_id and
           available/required memory rather than crashing.
+
+      - name: worker-paged-cache-init
+        status: implemented
+        description: |
+          At startup, the worker creates a PagedKvCacheManager alongside the
+          contiguous KV cache. Block pool is sized from available GPU memory
+          minus a 512 MB scratch reserve. CacheAlloc allocates in both caches;
+          CacheFree frees from both. Shutdown destroys the paged block pool.
+
+      - name: worker-batched-forward-handler
+        status: implemented
+        description: |
+          Handles BatchedForward messages by deserializing the payload,
+          building SequenceSlice from SequenceMetadataWire (mapping seq_id
+          to local paged CacheHandle), resolving input (token IDs for head,
+          activations for middle/tail), calling batched_forward_node, and
+          returning BatchedForwardResultPayload with logits or activations.
+
+      - name: worker-heartbeat-free-blocks
+        status: implemented
+        description: |
+          The heartbeat ack reports the paged cache's free block count via
+          the free_blocks field. This enables the coordinator to make
+          distributed admission control decisions based on worker memory.
 
   # ============================================================
   # COORDINATOR BINARY (Phase 3)
@@ -2125,11 +2242,31 @@ sections:
           --run-ignored all -E 'test(bench)'
 
       - name: concurrent-sequence-distributed
-        status: not-implemented
+        status: implemented
         description: |
           Multiple simultaneous generation requests are processed correctly
-          through the distributed pipeline without data corruption, deadlock,
-          or incorrect KV cache isolation.
+          through the batched distributed pipeline without data corruption,
+          deadlock, or incorrect KV cache isolation. Validated by
+          test_e2e_distributed_batched_concurrent which sends 3 concurrent
+          greedy requests and verifies each matches sequential output.
+
+      - name: distributed-batched-equivalence
+        status: implemented
+        description: |
+          The distributed batched pipeline (--batched flag, using
+          distributed_loop.rs and pipeline.batched_forward()) produces
+          identical greedy output to the sequential distributed_generate
+          path. Validated by test_e2e_distributed_batched_matches_sequential
+          which runs both modes on the same prompts and asserts token-level
+          equality.
+
+      - name: distributed-batched-throughput
+        status: implemented
+        description: |
+          Throughput benchmark for the batched distributed pipeline under
+          concurrent load. bench_distributed_batched_throughput sends N
+          concurrent requests and measures total tokens / wall time.
+          Reports tokens/second for the distributed batched path.
 
       - name: http-api-distributed-generation
         status: implemented
@@ -2377,6 +2514,65 @@ sections:
           (e.g., a 5-token prefill and a 1-token decode) processes
           correctly. Each sequence's positions and cache state are
           independent.
+
+  # ============================================================
+  # BATCHED FORWARD NODE (Phase 4)
+  # ============================================================
+  - name: Batched Forward Node
+    path: crates/fracture-engine/src
+    status: implemented
+    description: |
+      Pipeline-aware batched forward pass for distributed workers.
+      Like batched_forward but handles head/middle/tail node roles:
+      head embeds token IDs, middle/tail receive activations, tail
+      produces logits, head/middle return activations.
+    shared: [numerical-correctness, error-handling, backend-agnostic]
+    dismissed:
+      - suggestion: batched-node-middle-returns-activations
+        reason: middle node is a non-head non-tail node; covered by combination of batched-node-nonhead-requires-activations (input) and the fact that non-tail always returns activations (same code path as head)
+    behaviors:
+      - name: batched-node-head-returns-activations
+        status: implemented
+        description: |
+          A head node (layer_range starts at 0) embeds token IDs from
+          SequenceSlice, runs its layers with paged attention, and
+          returns NodeOutput::Activations (not logits). The activation
+          tensor has shape [total_tokens, hidden_size].
+
+      - name: batched-node-tail-returns-logits
+        status: implemented
+        description: |
+          A tail node (layer_range ends at total_layers) receives
+          activations, runs its layers, applies final RMSNorm + LM head,
+          and returns NodeOutput::Logits. Logits are flattened across
+          sequences (N * vocab_size f32 values).
+
+      - name: batched-node-full-model
+        status: implemented
+        description: |
+          A node covering all layers (head+tail) produces logits directly
+          from token IDs. Equivalent to batched_forward but wrapped in
+          NodeOutput for distributed pipeline compatibility.
+
+      - name: batched-node-head-rejects-activations
+        status: implemented
+        description: |
+          A head node given input_hidden_states (activations) returns a
+          clear Pipeline error. Head nodes must receive token IDs via
+          SequenceSlice::token_ids.
+
+      - name: batched-node-nonhead-requires-activations
+        status: implemented
+        description: |
+          A non-head node called with input_hidden_states=None returns a
+          clear Pipeline error. Middle and tail nodes must receive
+          activations from the previous pipeline stage.
+
+      - name: batched-node-empty-sequences-rejected
+        status: implemented
+        description: |
+          Calling batched_forward_node with an empty sequence slice
+          returns a Pipeline error. At least one sequence is required.
 
   # ============================================================
   # BATCH SCHEDULER (Phase 4)

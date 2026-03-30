@@ -714,6 +714,114 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Verify temperature scaling works end-to-end through `Sampler::sample`.
+    ///
+    /// This is distinct from `test_temperature_scaling_flattens_distribution`,
+    /// which manually replicates the division math outside the sampler. Here we
+    /// call the actual sampler at two temperatures and assert the empirical
+    /// token-count distributions differ in the expected direction: low temperature
+    /// (0.5) sharpens toward token 0, high temperature (5.0) flattens toward
+    /// a more uniform count distribution.
+    #[test]
+    fn test_temperature_scaling_through_sampler() {
+        // Token 0 has logit 10.0; tokens 1-3 have logit 0.0.
+        // At low temp (0.5), token 0 dominates even more than at temp=1.0.
+        // At high temp (5.0), the distribution flattens and other tokens appear more.
+        let logits = vec![10.0f32, 0.0, 0.0, 0.0];
+        let trials = 2000;
+
+        let low_params = SamplingParams {
+            temperature: 0.5,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+        };
+        let high_params = SamplingParams {
+            temperature: 5.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+        };
+
+        let mut low_counts = [0u32; 4];
+        let mut high_counts = [0u32; 4];
+
+        for _ in 0..trials {
+            let t = Sampler::sample(&logits, &low_params).unwrap();
+            low_counts[t as usize] += 1;
+            let t = Sampler::sample(&logits, &high_params).unwrap();
+            high_counts[t as usize] += 1;
+        }
+
+        // Low temperature: token 0 should be sampled in the vast majority of trials.
+        // With temp=0.5, scaled logits are [20.0, 0.0, 0.0, 0.0].
+        // e^20 / (e^20 + 3) ≈ 1.0, so token 0 should appear nearly every time.
+        assert!(
+            low_counts[0] > (trials as u32 * 99 / 100),
+            "at temp=0.5, token 0 should dominate (>99%): counts={:?}",
+            low_counts
+        );
+
+        // High temperature: other tokens should appear more often.
+        // With temp=5.0, scaled logits are [2.0, 0.0, 0.0, 0.0].
+        // e^2 / (e^2 + 3) ≈ 0.71, so other tokens collectively appear ~29% of the time.
+        let high_others: u32 = high_counts[1] + high_counts[2] + high_counts[3];
+        let low_others: u32 = low_counts[1] + low_counts[2] + low_counts[3];
+        assert!(
+            high_others > low_others,
+            "at temp=5.0 non-dominant tokens should appear more than at temp=0.5: high_others={high_others}, low_others={low_others}"
+        );
+
+        // At high temperature, non-dominant tokens should collectively appear
+        // in a meaningful fraction of trials (at least 15% to give generous slack).
+        assert!(
+            high_others > (trials as u32 * 15 / 100),
+            "at temp=5.0, non-dominant tokens should appear in >15% of trials: counts={:?}",
+            high_counts
+        );
+    }
+
+    /// Verify that negative temperature inverts the logit ordering.
+    ///
+    /// The spec states 'Temperature must be >= 0', but the current implementation
+    /// does not validate this and instead silently inverts the distribution.
+    /// This test documents the actual behavior: with temp=-1.0, the token with
+    /// the lowest logit receives the highest probability after softmax.
+    #[test]
+    fn test_negative_temperature_inverts_distribution() {
+        // logits: index 0 = 10.0 (highest), index 1 = 0.0 (lowest), index 2 = 5.0 (middle)
+        // With temp=-1.0, scaled logits = [-10.0, 0.0, -5.0].
+        // Softmax favors the largest scaled value, which is index 1 (0.0 → highest after negation).
+        let logits = vec![10.0f32, 0.0, 5.0];
+        let params = SamplingParams {
+            temperature: -1.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+        };
+
+        let mut counts = [0u32; 3];
+        for _ in 0..1000 {
+            let token = Sampler::sample(&logits, &params).unwrap();
+            counts[token as usize] += 1;
+        }
+
+        // Index 1 (originally lowest logit, 0.0) should dominate with negative temp.
+        assert!(
+            counts[1] > counts[0] && counts[1] > counts[2],
+            "negative temperature should invert distribution so lowest-logit token dominates: counts={:?}",
+            counts
+        );
+
+        // Index 1 should appear in the vast majority of samples
+        // (scaled[1]=0.0 vs scaled[0]=-10.0 vs scaled[2]=-5.0 → e^0 / (e^0 + e^{-10} + e^{-5}) ≈ 0.993)
+        assert!(
+            counts[1] > 900,
+            "index 1 should dominate with negative temperature: counts={:?}",
+            counts
+        );
+    }
+
     #[test]
     fn test_single_logit_vocab() {
         let logits = vec![42.0];

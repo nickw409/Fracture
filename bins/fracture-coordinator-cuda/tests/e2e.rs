@@ -54,22 +54,36 @@ fn spawn_pipeline(coord_port: u16, http_port: u16) -> ProcessGuard {
 }
 
 fn spawn_pipeline_timed(coord_port: u16, http_port: u16) -> (ProcessGuard, Duration) {
+    spawn_pipeline_inner(coord_port, http_port, false)
+}
+
+fn spawn_batched_pipeline(coord_port: u16, http_port: u16) -> ProcessGuard {
+    let (guard, _) = spawn_pipeline_inner(coord_port, http_port, true);
+    guard
+}
+
+fn spawn_pipeline_inner(coord_port: u16, http_port: u16, batched: bool) -> (ProcessGuard, Duration) {
     let setup_start = Instant::now();
     let bin_c = coord_bin();
     let bin_w = worker_bin();
     let model = model_path();
 
+    let mut args = vec![
+        "--model".to_string(), model.to_str().unwrap().to_string(),
+        "--listen".to_string(), format!("127.0.0.1:{coord_port}"),
+        "--workers".to_string(), "1".to_string(),
+        "--http-port".to_string(), http_port.to_string(),
+        "--scheduling".to_string(), "equal".to_string(),
+    ];
+    if batched {
+        args.push("--batched".to_string());
+    }
+
     let coordinator = Command::new(&bin_c)
-        .args([
-            "--model", model.to_str().unwrap(),
-            "--listen", &format!("127.0.0.1:{coord_port}"),
-            "--workers", "1",
-            "--http-port", &http_port.to_string(),
-            "--scheduling", "equal",
-        ])
+        .args(&args)
         .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin_c.display()));
 
@@ -82,8 +96,8 @@ fn spawn_pipeline_timed(coord_port: u16, http_port: u16) -> (ProcessGuard, Durat
             "--node-id", "e2e-worker",
         ])
         .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin_w.display()));
 
@@ -111,7 +125,10 @@ fn spawn_pipeline_timed(coord_port: u16, http_port: u16) -> (ProcessGuard, Durat
 }
 
 fn send_completion(http_port: u16, prompt: &str, max_tokens: usize, temperature: f32) -> serde_json::Value {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
     let resp = client
         .post(format!("http://127.0.0.1:{http_port}/v1/completions"))
         .json(&serde_json::json!({
@@ -199,6 +216,393 @@ fn test_e2e_worker_lifecycle() {
     assert!(tokens > 0, "should generate tokens after full lifecycle setup");
 }
 
+/// Tests that the coordinator exits with a non-zero status when it cannot
+/// gather the required number of workers within the acceptance timeout window.
+///
+/// Spawns only the coordinator (no workers) with `--workers 2
+/// --acceptance-timeout 3`. The coordinator must exit on its own within ~5
+/// seconds with a non-zero exit code and emit a timeout message to stderr.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_acceptance_timeout() {
+    let bin_c = coord_bin();
+    let model = model_path();
+
+    let mut coordinator = Command::new(&bin_c)
+        .args([
+            "--model", model.to_str().unwrap(),
+            "--listen", "127.0.0.1:9413",
+            "--workers", "2",
+            "--http-port", "8094",
+            "--acceptance-timeout", "3",
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin_c.display()));
+
+    // Poll for exit, giving up to 8 seconds (3s timeout + model-load headroom).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        match coordinator.try_wait().expect("try_wait failed") {
+            Some(s) => break s,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = coordinator.kill();
+                    let _ = coordinator.wait();
+                    panic!("coordinator did not exit within 8 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    // Collect stderr for diagnostics.
+    let output = coordinator.wait_with_output().unwrap_or_else(|_| {
+        // Process already waited above; build a stub output.
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    });
+
+    assert!(
+        !output.status.success(),
+        "coordinator should exit with non-zero status on acceptance timeout"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out") || stderr.contains("timeout") || stderr.contains("workers"),
+        "stderr should mention timeout or worker count: {stderr}"
+    );
+}
+
+/// Tests that the pipeline can serve multiple concurrent completion requests
+/// without errors or data corruption. Three requests are sent in parallel
+/// threads; all must complete successfully with non-empty generated text.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_concurrent_sequences() {
+    let _guard = spawn_pipeline(9414, 8095);
+
+    let prompts = [
+        ("The speed of light is", 20usize),
+        ("Water is composed of", 20usize),
+        ("The Great Wall of China was built", 20usize),
+    ];
+
+    let results: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|(prompt, max_tokens)| {
+                s.spawn(move || send_completion(8095, prompt, *max_tokens, 0.0))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("thread panicked")).collect()
+    });
+
+    for (i, resp) in results.iter().enumerate() {
+        let text = resp["choices"][0]["text"].as_str().unwrap_or_else(|| {
+            panic!("request {i} missing choices[0].text: {resp}")
+        });
+        assert!(!text.is_empty(), "request {i} returned empty text");
+
+        let completion_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or_else(|| {
+            panic!("request {i} missing usage.completion_tokens: {resp}")
+        });
+        assert!(completion_tokens > 0, "request {i} produced no tokens");
+
+        let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap();
+        let total_tokens = resp["usage"]["total_tokens"].as_u64().unwrap();
+        assert_eq!(
+            total_tokens,
+            prompt_tokens + completion_tokens,
+            "request {i} usage totals inconsistent"
+        );
+    }
+}
+
+/// Tests that the pipeline remains stable over a longer generation run.
+/// Requests 500 tokens and verifies that at least 400 tokens were produced,
+/// all usage fields are present, and the response is well-formed.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_long_generation_stability() {
+    let _guard = spawn_pipeline(9415, 8096);
+
+    let resp = send_completion(8096, "Write a detailed essay about the history of mathematics", 500, 0.0);
+
+    // Verify all usage fields are present and sensible.
+    let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.prompt_tokens: {resp}")
+    });
+    let completion_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.completion_tokens: {resp}")
+    });
+    let total_tokens = resp["usage"]["total_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.total_tokens: {resp}")
+    });
+
+    assert!(prompt_tokens > 0, "prompt_tokens should be > 0");
+    assert!(
+        completion_tokens >= 400,
+        "expected >= 400 completion tokens for long generation, got {completion_tokens}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "total_tokens != prompt_tokens + completion_tokens"
+    );
+
+    // Verify choices structure.
+    let text = resp["choices"][0]["text"].as_str().unwrap_or_else(|| {
+        panic!("missing choices[0].text: {resp}")
+    });
+    assert!(!text.is_empty(), "generated text should not be empty");
+
+    // Verify top-level response fields.
+    assert!(resp["id"].as_str().is_some(), "missing id field");
+    assert!(resp["object"].as_str().is_some(), "missing object field");
+    assert!(resp["created"].as_u64().is_some(), "missing created field");
+}
+
+/// Tests that a running pipeline correctly reports an error or a changed health
+/// state when the worker process is killed mid-request.
+///
+/// Spawns coordinator + worker on unique ports (9416/8097). A background thread
+/// starts a long generation (500 tokens). While that request is in flight we kill
+/// the worker and confirm that either (a) the HTTP request returns a non-2xx
+/// status, (b) the JSON body contains an error field, or (c) a subsequent health
+/// check no longer reports status=ready.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_network_failure_detection() {
+    // We need direct access to the worker process so we can kill it.
+    let bin_c = coord_bin();
+    let bin_w = worker_bin();
+    let model = model_path();
+    const COORD_PORT: u16 = 9416;
+    const HTTP_PORT: u16 = 8097;
+
+    let coordinator = Command::new(&bin_c)
+        .args([
+            "--model", model.to_str().unwrap(),
+            "--listen", &format!("127.0.0.1:{COORD_PORT}"),
+            "--workers", "1",
+            "--http-port", &HTTP_PORT.to_string(),
+            "--scheduling", "equal",
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn coordinator: {e}"));
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut worker = Command::new(&bin_w)
+        .args([
+            "--model", model.to_str().unwrap(),
+            "--coordinator", &format!("127.0.0.1:{COORD_PORT}"),
+            "--node-id", "e2e-failure-worker",
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn worker: {e}"));
+
+    // Wrap coordinator in guard so it's always killed on drop.
+    let guard = ProcessGuard { coordinator, worker: {
+        // Temporarily move worker out — we'll put a placeholder in.
+        // We need to own the worker separately to kill it mid-test.
+        // Rebuild the guard manually below after the test.
+        Command::new("true").spawn().unwrap()
+    }};
+
+    // Wait for HTTP readiness.
+    let client = reqwest::blocking::Client::new();
+    let setup_start = Instant::now();
+    loop {
+        if setup_start.elapsed() > Duration::from_secs(60) {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            panic!("HTTP server not ready within 60 seconds");
+        }
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{HTTP_PORT}/health")).send() {
+            if resp.status().is_success() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Start a long generation in a background thread.
+    let gen_thread = std::thread::spawn(move || {
+        let c = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        c.post(format!("http://127.0.0.1:{HTTP_PORT}/v1/completions"))
+            .json(&serde_json::json!({
+                "prompt": "Write a very long essay about the history of computing",
+                "max_tokens": 500,
+                "temperature": 0.0,
+            }))
+            .send()
+    });
+
+    // Give the generation a moment to start, then kill the worker.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = worker.kill();
+    let _ = worker.wait();
+
+    // The background request should either fail at the transport layer or
+    // return a non-success HTTP status.
+    match gen_thread.join().expect("generation thread panicked") {
+        Err(_transport_err) => {
+            // Transport-level failure is expected after worker death.
+        }
+        Ok(resp) => {
+            // If we got a response, it should indicate failure.
+            let status = resp.status();
+            if status.is_success() {
+                // The coordinator might have returned a successful response
+                // before realising the worker died. Check for an error field
+                // in the JSON, or check that health now reports not-ready.
+                let body: serde_json::Value = resp.json().unwrap_or(serde_json::json!({}));
+                let has_error = body.get("error").is_some()
+                    || body["choices"][0]["finish_reason"]
+                        .as_str()
+                        .map_or(false, |r| r == "error");
+                if !has_error {
+                    // Verify health degraded after the kill.
+                    std::thread::sleep(Duration::from_secs(2));
+                    let health_resp = client
+                        .get(format!("http://127.0.0.1:{HTTP_PORT}/health"))
+                        .send();
+                    match health_resp {
+                        Err(_) => {} // coordinator also down — acceptable
+                        Ok(h) => {
+                            let health: serde_json::Value =
+                                h.json().unwrap_or(serde_json::json!({}));
+                            assert_ne!(
+                                health["status"].as_str().unwrap_or(""),
+                                "ready",
+                                "health should no longer be 'ready' after worker killed"
+                            );
+                        }
+                    }
+                }
+            }
+            // Non-success HTTP (4xx / 5xx) is the expected path — no assertion needed.
+        }
+    }
+
+    // Ensure coordinator is cleaned up (guard.coordinator is already in the ProcessGuard).
+    drop(guard);
+}
+
+/// Cross-machine inference test using environment variables.
+///
+/// Set FRACTURE_COORD_HOST (e.g. "192.168.1.10:8091") to point at a running
+/// coordinator HTTP endpoint. If not set the test is skipped.
+///
+/// This test is always `#[ignore]` — it must be run explicitly:
+///   FRACTURE_COORD_HOST=host:port cargo nextest run ... --run-ignored all
+///       -E 'test(cross_machine)'
+#[test]
+#[ignore = "cross-machine: requires FRACTURE_COORD_HOST env var pointing at running coordinator"]
+fn test_e2e_cross_machine_inference() {
+    let coord_host = match std::env::var("FRACTURE_COORD_HOST") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            eprintln!("FRACTURE_COORD_HOST not set — skipping cross-machine test");
+            return;
+        }
+    };
+
+    let base_url = if coord_host.starts_with("http://") || coord_host.starts_with("https://") {
+        coord_host.clone()
+    } else {
+        format!("http://{coord_host}")
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+
+    // Health check first.
+    let health: serde_json::Value = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .expect("health check failed")
+        .json()
+        .expect("health response is not JSON");
+    assert_eq!(
+        health["status"].as_str().unwrap_or(""),
+        "ready",
+        "coordinator at {base_url} is not ready: {health}"
+    );
+
+    // Send a greedy completion and validate the response.
+    let resp = client
+        .post(format!("{base_url}/v1/completions"))
+        .json(&serde_json::json!({
+            "prompt": "The capital of France is",
+            "max_tokens": 10,
+            "temperature": 0.0,
+        }))
+        .send()
+        .expect("completion request failed");
+
+    assert!(
+        resp.status().is_success(),
+        "completion returned HTTP {}: check coordinator logs",
+        resp.status()
+    );
+
+    let body: serde_json::Value = resp.json().expect("response is not JSON");
+
+    // Validate OpenAI-compatible response structure.
+    assert!(body["id"].as_str().is_some(), "missing id field: {body}");
+    assert_eq!(body["object"].as_str().unwrap_or(""), "text_completion", "wrong object type: {body}");
+    assert!(body["created"].as_u64().is_some(), "missing created field: {body}");
+
+    let text = body["choices"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing choices[0].text: {body}"));
+    assert!(!text.is_empty(), "generated text is empty: {body}");
+
+    let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.prompt_tokens: {body}")
+    });
+    let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.completion_tokens: {body}")
+    });
+    let total_tokens = body["usage"]["total_tokens"].as_u64().unwrap_or_else(|| {
+        panic!("missing usage.total_tokens: {body}")
+    });
+
+    assert!(prompt_tokens > 0, "prompt_tokens should be > 0");
+    assert!(completion_tokens > 0, "completion_tokens should be > 0");
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "usage totals inconsistent: {body}"
+    );
+
+    // Check it says something sensible (Paris is the capital of France).
+    assert!(
+        text.to_lowercase().contains("paris"),
+        "expected 'Paris' in greedy completion for 'The capital of France is'; got: {text:?}"
+    );
+}
+
 /// Benchmark: measures pipeline setup latency (calibration + registration +
 /// scheduling + weight loading). Asserts < 30 seconds per the Phase 3 arch doc.
 ///
@@ -219,4 +623,151 @@ fn bench_pipeline_setup_latency() {
         "pipeline setup took {:.1}s, exceeds 30s threshold",
         setup_duration.as_secs_f64()
     );
+}
+
+// ── Phase 4 Step 4: Distributed Batching Validation ──────────────────────
+
+/// Validates that the distributed batched pipeline (--batched) produces
+/// identical greedy output to the sequential distributed_generate path.
+///
+/// Runs the two pipelines sequentially (not simultaneously) to avoid OOM
+/// from loading the model twice on one GPU.
+///
+/// This is the key validation for Phase 4 Step 4 item 6.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_distributed_batched_matches_sequential() {
+    let prompts = [
+        "The capital of France is",
+        "In the year 2025, artificial intelligence",
+    ];
+
+    // Collect sequential results first, then tear down.
+    let seq_results: Vec<serde_json::Value> = {
+        let _guard = spawn_pipeline(9420, 8100);
+        prompts.iter().map(|p| send_completion(8100, p, 20, 0.0)).collect()
+    };
+    // _guard dropped → coordinator + worker killed. Brief pause for GPU memory release
+    // and OS port cleanup before reusing the same ports.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Now run batched on the same ports (safe since previous processes are dead).
+    let bat_results: Vec<serde_json::Value> = {
+        let _guard = spawn_batched_pipeline(9420, 8100);
+        prompts.iter().map(|p| send_completion(8100, p, 20, 0.0)).collect()
+    };
+
+    for (i, prompt) in prompts.iter().enumerate() {
+        let seq_text = seq_results[i]["choices"][0]["text"].as_str().unwrap();
+        let bat_text = bat_results[i]["choices"][0]["text"].as_str().unwrap();
+
+        assert_eq!(
+            seq_text, bat_text,
+            "batched and sequential must produce identical greedy output for prompt: {prompt:?}\n  sequential: {seq_text:?}\n  batched:    {bat_text:?}"
+        );
+
+        let seq_ct = seq_results[i]["usage"]["completion_tokens"].as_u64().unwrap();
+        let bat_ct = bat_results[i]["usage"]["completion_tokens"].as_u64().unwrap();
+        assert_eq!(seq_ct, bat_ct, "completion_tokens must match");
+    }
+}
+
+/// Validates concurrent requests through the batched distributed pipeline.
+/// Multiple greedy requests sent simultaneously must all produce correct
+/// output with no cross-contamination.
+#[test]
+#[ignore = "e2e: requires GPU, release binaries, and GGUF model"]
+fn test_e2e_distributed_batched_concurrent() {
+    let _guard = spawn_batched_pipeline(9422, 8102);
+
+    let prompts = [
+        "The capital of France is",
+        "Water boils at a temperature of",
+        "The largest planet in the solar system is",
+    ];
+
+    // Send all concurrently
+    let handles: Vec<_> = prompts
+        .iter()
+        .map(|&prompt| {
+            std::thread::spawn(move || send_completion(8102, prompt, 20, 0.0))
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All must succeed with valid output
+    for (i, resp) in results.iter().enumerate() {
+        let text = resp["choices"][0]["text"].as_str().unwrap();
+        assert!(!text.is_empty(), "prompt {i} returned empty text");
+        let ct = resp["usage"]["completion_tokens"].as_u64().unwrap();
+        assert!(ct > 0, "prompt {i} generated 0 tokens");
+        let pt = resp["usage"]["prompt_tokens"].as_u64().unwrap();
+        let tt = resp["usage"]["total_tokens"].as_u64().unwrap();
+        assert_eq!(tt, pt + ct, "prompt {i}: total_tokens mismatch");
+    }
+
+    // Send same prompts sequentially and verify identical greedy output
+    for (i, &prompt) in prompts.iter().enumerate() {
+        let seq_resp = send_completion(8102, prompt, 20, 0.0);
+        let seq_text = seq_resp["choices"][0]["text"].as_str().unwrap();
+        let conc_text = results[i]["choices"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            seq_text, conc_text,
+            "concurrent vs sequential mismatch for prompt {i}: {prompt:?}"
+        );
+    }
+}
+
+/// Benchmark: measures throughput (tokens/second) of the batched distributed
+/// pipeline under concurrent load.
+///
+/// Run separately:
+///   cargo nextest run -p fracture-coordinator-cuda --run-ignored all -E 'test(bench_batched)'
+#[test]
+#[ignore = "benchmark: requires GPU, release binaries, and GGUF model"]
+fn bench_distributed_batched_throughput() {
+    let _guard = spawn_batched_pipeline(9423, 8103);
+
+    // Warmup
+    send_completion(8103, "Warmup prompt for the model", 10, 0.0);
+
+    let num_requests = 3;
+    let max_tokens = 20;
+    let prompt = "Explain the concept of distributed computing in simple terms.";
+
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..num_requests)
+        .map(|_| {
+            std::thread::spawn(move || send_completion(8103, prompt, max_tokens, 0.0))
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let elapsed = start.elapsed();
+
+    let total_generated: u64 = results
+        .iter()
+        .map(|r| r["usage"]["completion_tokens"].as_u64().unwrap())
+        .sum();
+
+    let tokens_per_sec = total_generated as f64 / elapsed.as_secs_f64();
+
+    eprintln!(
+        "distributed batched throughput: {num_requests} concurrent requests × {max_tokens} max_tokens"
+    );
+    eprintln!(
+        "  total tokens: {total_generated}, wall time: {:.2}s, throughput: {:.1} tok/s",
+        elapsed.as_secs_f64(),
+        tokens_per_sec,
+    );
+
+    // Sanity: all requests completed
+    assert_eq!(results.len(), num_requests);
+    for (i, r) in results.iter().enumerate() {
+        let ct = r["usage"]["completion_tokens"].as_u64().unwrap();
+        assert!(ct > 0, "request {i} generated 0 tokens");
+    }
 }

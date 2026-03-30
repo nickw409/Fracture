@@ -711,4 +711,261 @@ mod tests {
             _ => panic!("expected ForwardResponse"),
         }
     }
+
+    // ── IpcNodeServer tests ───────────────────────────────────────
+
+    use fracture_core::{DeviceTimer, TensorId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A mock backend used by IpcNodeServer tests.
+    struct IpcTestBackend {
+        next_id: AtomicU64,
+        store: std::sync::Mutex<HashMap<u64, Vec<u8>>>,
+    }
+
+    impl IpcTestBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+                store: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl Backend for IpcTestBackend {
+        fn alloc(&self, shape: &[usize], dtype: DType) -> Result<DeviceTensor> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let size = shape.iter().product::<usize>() * dtype.size_bytes();
+            self.store.lock().unwrap().insert(id, vec![0u8; size]);
+            Ok(DeviceTensor::new(TensorId(id), shape.to_vec(), dtype))
+        }
+        fn free(&self, tensor: &DeviceTensor) -> Result<()> {
+            self.store.lock().unwrap().remove(&tensor.id.0);
+            Ok(())
+        }
+        fn copy_to_device(&self, dst: &DeviceTensor, src: &[u8]) -> Result<()> {
+            if let Some(buf) = self.store.lock().unwrap().get_mut(&dst.id.0) {
+                buf.copy_from_slice(src);
+            }
+            Ok(())
+        }
+        fn copy_to_host(&self, src: &DeviceTensor, dst: &mut [u8]) -> Result<()> {
+            let store = self.store.lock().unwrap();
+            if let Some(buf) = store.get(&src.id.0) {
+                dst.copy_from_slice(buf);
+            }
+            Ok(())
+        }
+        fn matmul(&self, _a: &DeviceTensor, _b: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rmsnorm(&self, _i: &DeviceTensor, _w: &DeviceTensor, _e: f64, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _p: &[u32], _t: f64, _h: usize) -> Result<()> { Ok(()) }
+        fn attention(&self, _q: &DeviceTensor, _k: &DeviceTensor, _v: &DeviceTensor, _n: usize, _s: usize, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _g: &DeviceTensor, _u: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn embedding(&self, _t: &[u32], _e: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _o: &DeviceTensor) -> Result<()> { Ok(()) }
+        fn copy_rows(&self, _s: &DeviceTensor, _d: &DeviceTensor, _so: usize, _do_: usize, _c: usize) -> Result<()> { Ok(()) }
+        fn device_name(&self) -> &str { "ipc-test" }
+        fn total_memory(&self) -> usize { 1 << 30 }
+        fn available_memory(&self) -> usize { 1 << 30 }
+        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn create_timer(&self) -> Result<DeviceTimer> { Ok(DeviceTimer(0)) }
+        fn start_timer(&self, _t: &DeviceTimer) -> Result<()> { Ok(()) }
+        fn stop_timer(&self, _t: &DeviceTimer) -> Result<f32> { Ok(0.0) }
+        fn destroy_timer(&self, _t: &DeviceTimer) -> Result<()> { Ok(()) }
+    }
+
+    /// A mock ComputeNode that returns a fixed logit vector, used to test
+    /// IpcNodeServer without requiring a real Engine or GPU backend.
+    struct MockComputeNode {
+        cfg: crate::node::NodeConfig,
+        /// Logits that this node will return for every forward call.
+        fixed_logits: Vec<f32>,
+    }
+
+    impl MockComputeNode {
+        fn new(cfg: crate::node::NodeConfig, fixed_logits: Vec<f32>) -> Self {
+            Self { cfg, fixed_logits }
+        }
+    }
+
+    impl crate::node::ComputeNode for MockComputeNode {
+        fn forward(
+            &self,
+            _input: crate::node::NodeInput,
+            _cache: &mut KvCacheManager,
+            _cache_handle: crate::kv_cache::CacheHandle,
+            _profile: Option<&mut fracture_core::ForwardProfile>,
+        ) -> Result<crate::node::NodeOutput> {
+            Ok(crate::node::NodeOutput::Logits(self.fixed_logits.clone()))
+        }
+
+        fn config(&self) -> &crate::node::NodeConfig {
+            &self.cfg
+        }
+    }
+
+    /// Helper: create a temp socket path under /tmp with a unique suffix.
+    fn temp_socket_path(suffix: &str) -> String {
+        format!("/tmp/fracture_ipc_test_{suffix}_{}.sock", std::process::id())
+    }
+
+    /// Verify that IpcNodeServer handles a ForwardRequest from a head node,
+    /// calls the wrapped ComputeNode, and sends back a ForwardResponse with
+    /// is_logits=true and the correct seq_id.
+    #[test]
+    fn test_ipc_node_server_forward_request() {
+        let socket_path = temp_socket_path("fwd");
+        // Clean up any leftover socket from a previous run.
+        let _ = std::fs::remove_file(&socket_path);
+
+        let expected_logits = vec![1.0f32, 2.0, 3.0, -1.5];
+        let expected_seq_id = 42u64;
+
+        // The node config must be a head (is_head=true) so IpcNodeServer uses
+        // the TokenIds path rather than trying to deserialize a tensor.
+        let node_config = crate::node::NodeConfig::new(0..1, 1).unwrap();
+        assert!(node_config.is_head());
+        assert!(node_config.is_tail());
+
+        let mock_node = MockComputeNode::new(node_config, expected_logits.clone());
+        let backend = IpcTestBackend::new();
+        // Cache sized for 1 layer (the node's layer range)
+        let cache = KvCacheManager::new(1, 2, 4, 512);
+
+        let mut server = IpcNodeServer::new(mock_node, cache);
+
+        let listener = UnixListener::bind(&socket_path).expect("failed to bind socket");
+
+        // Connect from a client thread and send a ForwardRequest.
+        let socket_path_client = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket_path_client)
+                .expect("client failed to connect");
+
+            let req = IpcMessage::ForwardRequest {
+                seq_id: expected_seq_id,
+                positions: vec![0],
+                is_prefill: true,
+                tensor_data: vec![],
+                token_ids: vec![5],
+            };
+            write_message(&mut stream, &req).expect("client failed to write request");
+
+            let response = read_message(&mut stream).expect("client failed to read response");
+            response
+        });
+
+        server.serve_one(&listener, &backend).expect("serve_one failed");
+
+        let response = client_thread.join().expect("client thread panicked");
+
+        match response {
+            IpcMessage::ForwardResponse {
+                seq_id,
+                is_logits,
+                payload,
+            } => {
+                assert_eq!(seq_id, expected_seq_id, "seq_id should match");
+                assert!(is_logits, "response should be logits (tail node)");
+
+                let decoded_logits: Vec<f32> = payload
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                assert_eq!(
+                    decoded_logits, expected_logits,
+                    "logit values should match mock node's fixed_logits"
+                );
+            }
+            _ => panic!("expected ForwardResponse, got something else"),
+        }
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Verify that IpcNodeServer handles an InfoRequest and returns an InfoResponse
+    /// with the node's layer_range, is_head, and is_tail fields.
+    #[test]
+    fn test_ipc_node_server_info_request() {
+        let socket_path = temp_socket_path("info");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let node_config = crate::node::NodeConfig::new(0..4, 8).unwrap();
+        assert!(node_config.is_head());
+        assert!(!node_config.is_tail());
+
+        let mock_node = MockComputeNode::new(node_config, vec![]);
+        let backend = IpcTestBackend::new();
+        let cache = KvCacheManager::new(4, 2, 4, 512);
+
+        let mut server = IpcNodeServer::new(mock_node, cache);
+
+        let listener = UnixListener::bind(&socket_path).expect("failed to bind socket");
+
+        let socket_path_client = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket_path_client)
+                .expect("client failed to connect");
+            write_message(&mut stream, &IpcMessage::InfoRequest)
+                .expect("client failed to write InfoRequest");
+            let response = read_message(&mut stream).expect("client failed to read InfoResponse");
+            response
+        });
+
+        server.serve_one(&listener, &backend).expect("serve_one failed");
+
+        let response = client_thread.join().expect("client thread panicked");
+
+        match response {
+            IpcMessage::InfoResponse {
+                node_id,
+                layer_start,
+                layer_end,
+                is_head,
+                is_tail,
+                ..
+            } => {
+                // node_id is formatted as "node-{start}-{end}"
+                assert_eq!(node_id, "node-0-4", "node_id should reflect layer range");
+                assert_eq!(layer_start, 0, "layer_start should be 0");
+                assert_eq!(layer_end, 4, "layer_end should be 4");
+                assert!(is_head, "is_head should be true (range starts at 0)");
+                assert!(!is_tail, "is_tail should be false (range ends at 4, total=8)");
+            }
+            _ => panic!("expected InfoResponse, got something else"),
+        }
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Verify that attempting to bind a UnixListener to a path that is already in
+    /// use returns an error (AddrInUse or similar I/O error).
+    ///
+    /// This corresponds to the ipc-connection-failure behavior: "IpcNodeServer
+    /// returns an error when the socket path is already in use."
+    #[test]
+    fn test_ipc_socket_already_in_use() {
+        let socket_path = temp_socket_path("dup");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Bind the first listener successfully.
+        let _first = UnixListener::bind(&socket_path)
+            .expect("first bind should succeed");
+
+        // Attempt to bind a second listener to the same path — should fail.
+        let second_result = UnixListener::bind(&socket_path);
+        assert!(
+            second_result.is_err(),
+            "binding a second UnixListener to the same path should fail"
+        );
+
+        let err = second_result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "expected AddrInUse error, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
 }

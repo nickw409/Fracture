@@ -328,6 +328,160 @@ mod tests {
     }
 
     #[test]
+    fn test_heartbeat_ack_free_blocks_nonzero_roundtrip() {
+        let payload = HeartbeatAckPayload {
+            timestamp_echo: 0,
+            nonce_echo: 0,
+            gpu_memory_used: 0,
+            active_sequences: 5,
+            free_blocks: 1024,
+        };
+        let decoded: HeartbeatAckPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.free_blocks, 1024);
+        assert_eq!(decoded.active_sequences, 5);
+    }
+
+    #[test]
+    fn test_batched_forward_payload_token_ids_roundtrip() {
+        let payload = BatchedForwardPayload {
+            is_prefill: true,
+            sequences: vec![
+                SequenceMetadataWire {
+                    seq_id: 1,
+                    num_tokens: 3,
+                    positions: vec![0, 1, 2],
+                    block_table: vec![0, 5],
+                    cache_seq_len: 3,
+                    last_block_tokens: 3,
+                },
+                SequenceMetadataWire {
+                    seq_id: 2,
+                    num_tokens: 1,
+                    positions: vec![10],
+                    block_table: vec![1, 2, 7],
+                    cache_seq_len: 11,
+                    last_block_tokens: 11,
+                },
+            ],
+            input: ForwardInputWire::TokenIds {
+                ids: vec![128000, 791, 1401, 42],
+            },
+        };
+        let decoded: BatchedForwardPayload = bincode_roundtrip(&payload);
+        assert!(decoded.is_prefill);
+        assert_eq!(decoded.sequences.len(), 2);
+        assert_eq!(decoded.sequences[0].seq_id, 1);
+        assert_eq!(decoded.sequences[0].num_tokens, 3);
+        assert_eq!(decoded.sequences[0].positions, vec![0, 1, 2]);
+        assert_eq!(decoded.sequences[0].block_table, vec![0, 5]);
+        assert_eq!(decoded.sequences[1].seq_id, 2);
+        assert_eq!(decoded.sequences[1].cache_seq_len, 11);
+        match decoded.input {
+            ForwardInputWire::TokenIds { ids } => {
+                assert_eq!(ids, vec![128000, 791, 1401, 42]);
+            }
+            _ => panic!("expected TokenIds"),
+        }
+    }
+
+    #[test]
+    fn test_batched_forward_payload_activations_roundtrip() {
+        let header = TensorWireHeader {
+            ndim: 2,
+            shape: vec![4, 4096],
+            dtype: 0,
+            compression: 0,
+            data_len: 4 * 4096 * 2,
+        };
+        let tensor_data = vec![0xCD; 4 * 4096 * 2];
+        let payload = BatchedForwardPayload {
+            is_prefill: false,
+            sequences: vec![SequenceMetadataWire {
+                seq_id: 99,
+                num_tokens: 4,
+                positions: vec![0, 1, 2, 3],
+                block_table: vec![10],
+                cache_seq_len: 4,
+                last_block_tokens: 4,
+            }],
+            input: ForwardInputWire::Activations {
+                tensor_header: header,
+                tensor_data: tensor_data.clone(),
+            },
+        };
+        let decoded: BatchedForwardPayload = bincode_roundtrip(&payload);
+        assert!(!decoded.is_prefill);
+        assert_eq!(decoded.sequences.len(), 1);
+        assert_eq!(decoded.sequences[0].seq_id, 99);
+        match decoded.input {
+            ForwardInputWire::Activations {
+                tensor_header,
+                tensor_data: data,
+            } => {
+                assert_eq!(tensor_header.shape, vec![4, 4096]);
+                assert_eq!(data, tensor_data);
+            }
+            _ => panic!("expected Activations"),
+        }
+    }
+
+    #[test]
+    fn test_batched_forward_result_logits_roundtrip() {
+        let logit_bytes: Vec<u8> = (0..10u32)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
+        let payload = BatchedForwardResultPayload {
+            output: ForwardOutputWire::Logits {
+                data: logit_bytes.clone(),
+            },
+            num_sequences: 2,
+            logit_offsets: vec![0, 20],
+        };
+        let decoded: BatchedForwardResultPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.num_sequences, 2);
+        assert_eq!(decoded.logit_offsets, vec![0, 20]);
+        match decoded.output {
+            ForwardOutputWire::Logits { data } => {
+                assert_eq!(data, logit_bytes);
+            }
+            _ => panic!("expected Logits"),
+        }
+    }
+
+    #[test]
+    fn test_batched_forward_result_activations_roundtrip() {
+        let header = TensorWireHeader {
+            ndim: 2,
+            shape: vec![6, 4096],
+            dtype: 0,
+            compression: 0,
+            data_len: 6 * 4096 * 2,
+        };
+        let tensor_data = vec![0u8; 6 * 4096 * 2];
+        let payload = BatchedForwardResultPayload {
+            output: ForwardOutputWire::Activations {
+                tensor_header: header,
+                tensor_data: tensor_data.clone(),
+            },
+            num_sequences: 3,
+            logit_offsets: Vec::new(),
+        };
+        let decoded: BatchedForwardResultPayload = bincode_roundtrip(&payload);
+        assert_eq!(decoded.num_sequences, 3);
+        assert!(decoded.logit_offsets.is_empty());
+        match decoded.output {
+            ForwardOutputWire::Activations {
+                tensor_header,
+                tensor_data: data,
+            } => {
+                assert_eq!(tensor_header.shape, vec![6, 4096]);
+                assert_eq!(data, tensor_data);
+            }
+            _ => panic!("expected Activations"),
+        }
+    }
+
+    #[test]
     fn test_cache_alloc_roundtrip() {
         let payload = CacheAllocPayload { max_seq_len: 4096 };
         let decoded: CacheAllocPayload = bincode_roundtrip(&payload);

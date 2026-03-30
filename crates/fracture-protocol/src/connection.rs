@@ -378,4 +378,95 @@ mod tests {
             _ => panic!("expected Activations"),
         }
     }
+
+    #[tokio::test]
+    async fn test_send_recv_batched_forward() {
+        let (client_stream, server_stream) = tcp_pair().await;
+        let mut client = FramedConnection::new(client_stream);
+        let mut server = FramedConnection::new(server_stream);
+
+        let payload = BatchedForwardPayload {
+            is_prefill: true,
+            sequences: vec![
+                SequenceMetadataWire {
+                    seq_id: 1,
+                    num_tokens: 3,
+                    positions: vec![0, 1, 2],
+                    block_table: vec![0, 5],
+                    cache_seq_len: 3,
+                    last_block_tokens: 3,
+                },
+                SequenceMetadataWire {
+                    seq_id: 2,
+                    num_tokens: 1,
+                    positions: vec![10],
+                    block_table: vec![1],
+                    cache_seq_len: 11,
+                    last_block_tokens: 11,
+                },
+            ],
+            input: ForwardInputWire::TokenIds {
+                ids: vec![128000, 791, 1401, 42],
+            },
+        };
+
+        client
+            .send(MessageType::BatchedForward, 1, &payload)
+            .await
+            .unwrap();
+
+        let (header, data) = server.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::BatchedForward);
+        assert_eq!(header.seq_id, 1);
+
+        let decoded: BatchedForwardPayload =
+            FramedConnection::deserialize_payload(&data).unwrap();
+        assert!(decoded.is_prefill);
+        assert_eq!(decoded.sequences.len(), 2);
+        assert_eq!(decoded.sequences[0].seq_id, 1);
+        assert_eq!(decoded.sequences[1].seq_id, 2);
+        match decoded.input {
+            ForwardInputWire::TokenIds { ids } => {
+                assert_eq!(ids, vec![128000, 791, 1401, 42]);
+            }
+            _ => panic!("expected TokenIds"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_recv_batched_forward_result() {
+        let (client_stream, server_stream) = tcp_pair().await;
+        let mut client = FramedConnection::new(client_stream);
+        let mut server = FramedConnection::new(server_stream);
+
+        let logit_data: Vec<u8> = (0..20u32)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
+        let payload = BatchedForwardResultPayload {
+            output: ForwardOutputWire::Logits {
+                data: logit_data.clone(),
+            },
+            num_sequences: 2,
+            logit_offsets: vec![0, 40],
+        };
+
+        client
+            .send(MessageType::BatchedForwardResult, 1, &payload)
+            .await
+            .unwrap();
+
+        let (header, data) = server.recv().await.unwrap();
+        assert_eq!(header.msg_type, MessageType::BatchedForwardResult);
+
+        let decoded: BatchedForwardResultPayload =
+            FramedConnection::deserialize_payload(&data).unwrap();
+        assert_eq!(decoded.num_sequences, 2);
+        assert_eq!(decoded.logit_offsets, vec![0, 40]);
+        match decoded.output {
+            ForwardOutputWire::Logits { data } => {
+                assert_eq!(data, logit_data);
+            }
+            _ => panic!("expected Logits"),
+        }
+    }
 }

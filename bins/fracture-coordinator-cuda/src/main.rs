@@ -23,12 +23,15 @@ use fracture_protocol::{
     messages::*,
 };
 use fracture_server::api::*;
+use fracture_server::{create_batched_router, BatchedAppState, SchedulerHandle};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokenizers::Tokenizer;
 use tracing_subscriber::EnvFilter;
+
+mod distributed_loop;
 
 /// Shared state for the coordinator's HTTP handlers.
 struct CoordState {
@@ -51,6 +54,9 @@ struct CoordinatorConfig {
     /// Timeout in seconds for waiting for all workers to register.
     /// 0 = no timeout (wait indefinitely).
     acceptance_timeout_secs: u64,
+    /// Use the batched scheduler loop (Phase 4) instead of the
+    /// one-at-a-time distributed_generate path.
+    batched: bool,
 }
 
 #[tokio::main]
@@ -105,6 +111,7 @@ async fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .and_then(|p| p.parse().ok())
             .unwrap_or(120), // default 2 minutes
+        batched: args.iter().any(|a| a == "--batched"),
     };
 
     tracing::info!("Fracture coordinator");
@@ -280,24 +287,54 @@ async fn main() -> Result<()> {
         pipeline.pipeline_order().len()
     );
 
+    // Wait for all workers to finish weight loading and report ready.
+    tracing::info!("waiting for workers to finish weight loading...");
+    for assignment in &schedule_result.assignments {
+        let entry = registry.get_mut(&assignment.node_id).ok_or_else(|| {
+            anyhow::anyhow!("worker '{}' disappeared", assignment.node_id)
+        })?;
+        let (header, _) = entry.connection.recv().await?;
+        if header.msg_type != MessageType::WorkerReady {
+            anyhow::bail!(
+                "expected WorkerReady from '{}', got {:?}",
+                assignment.node_id, header.msg_type
+            );
+        }
+        tracing::info!("worker '{}' ready", assignment.node_id);
+    }
+    tracing::info!("all workers ready");
+
     // Load tokenizer
     let tokenizer = load_tokenizer(&config)?;
 
-    // Build shared state
-    let state = Arc::new(CoordState {
-        pipeline: Arc::new(pipeline),
-        registry: Arc::new(Mutex::new(registry)),
-        seq_mgr: Arc::new(Mutex::new(SequenceStateManager::new())),
-        tokenizer,
-        max_seq_len: config.max_seq_len,
-    });
+    let pipeline = Arc::new(pipeline);
+    let registry = Arc::new(Mutex::new(registry));
 
-    // Build HTTP router
-    let router = Router::new()
-        .route("/v1/completions", post(completions_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/health", get(health_handler))
-        .with_state(state.clone());
+    // Build HTTP router — either batched (Phase 4) or sequential.
+    let router: Router = if config.batched {
+        tracing::info!("using batched scheduler loop (Phase 4)");
+        let handle = distributed_loop::start_distributed_loop(
+            Arc::clone(&pipeline),
+            Arc::clone(&registry),
+            distributed_loop::DistributedLoopConfig::default(),
+        );
+        let batched_state = Arc::new(BatchedAppState::new(handle, tokenizer));
+        create_batched_router(batched_state)
+    } else {
+        tracing::info!("using sequential distributed_generate");
+        let state = Arc::new(CoordState {
+            pipeline: Arc::clone(&pipeline),
+            registry: Arc::clone(&registry),
+            seq_mgr: Arc::new(Mutex::new(SequenceStateManager::new())),
+            tokenizer,
+            max_seq_len: config.max_seq_len,
+        });
+        Router::new()
+            .route("/v1/completions", post(completions_handler))
+            .route("/v1/models", get(models_handler))
+            .route("/health", get(health_handler))
+            .with_state(state)
+    };
 
     // Start HTTP server
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -314,8 +351,7 @@ async fn main() -> Result<()> {
 
     // Send Shutdown to all workers
     {
-        let pipeline = &state.pipeline;
-        let mut reg = state.registry.lock().await;
+        let mut reg = registry.lock().await;
         for node_id in pipeline.pipeline_order() {
             if let Some(entry) = reg.get_mut(node_id) {
                 let _ = entry

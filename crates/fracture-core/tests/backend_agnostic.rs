@@ -7,6 +7,7 @@ fn test_no_backend_dependencies() {
         "crates/fracture-engine/Cargo.toml",
         "crates/fracture-generate/Cargo.toml",
         "crates/fracture-server/Cargo.toml",
+        "crates/fracture-protocol/Cargo.toml",
     ];
 
     let backend_names = ["fracture-cuda", "fracture-metal"];

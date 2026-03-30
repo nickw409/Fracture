@@ -254,6 +254,18 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_gap_rejected() {
+        // Node 0 covers [0, 8) and node 1 covers [10, 32) — there is a gap at layers 8 and 9.
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 8, 32, false)),
+            Box::new(MockNode::new(10, 32, 32, true)),
+        ];
+        let result = PipelineCoordinator::new(nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("gap or overlap"));
+    }
+
+    #[test]
     fn test_pipeline_three_node_middle_passes_activations() {
         // 3-node pipeline: head(0..2) -> middle(2..6) -> tail(6..8)
         // Middle node accepts Activations and returns Activations.
@@ -301,5 +313,25 @@ mod tests {
         let result = PipelineCoordinator::new(nodes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("tail"));
+    }
+
+    /// Verify that a 2-node pipeline where the second node does not reach total_layers
+    /// is rejected with an error mentioning "tail".
+    ///
+    /// MockNode(0..16, 32) + MockNode(16..24, 32): together they cover layers 0..24 but
+    /// the model has 32 layers total — the last node is not a tail node.
+    #[test]
+    fn test_pipeline_incomplete_layer_coverage() {
+        let nodes: Vec<Box<dyn ComputeNode>> = vec![
+            Box::new(MockNode::new(0, 16, 32, false)), // head, not tail
+            Box::new(MockNode::new(16, 24, 32, true)), // ends at 24, not 32 — not a tail node
+        ];
+        let result = PipelineCoordinator::new(nodes);
+        assert!(result.is_err(), "pipeline with incomplete coverage should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("tail"),
+            "error should mention 'tail' for incomplete layer coverage, got: {err}"
+        );
     }
 }
