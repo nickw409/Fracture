@@ -1,106 +1,148 @@
+<div align="center">
+
 # Fracture
 
-Distributed cross-platform LLM inference engine in Rust with pluggable GPU backends.
+**Distributed LLM inference engine in Rust with pluggable GPU backends**
 
-Fracture splits large language models across multiple GPUs on multiple machines using pipeline parallelism. Each machine runs a worker process that owns a contiguous range of transformer layers. A coordinator process orchestrates activation passing between workers over TCP, schedules layer assignments based on measured GPU performance, and serves an OpenAI-compatible HTTP API.
+Split large language models across multiple GPUs on multiple machines.\
+Pipeline-parallel execution over TCP. OpenAI-compatible API. Zero engine changes to add new backends.
 
-The engine is backend-agnostic — all GPU operations go through a `Backend` trait, keeping the door open for Metal (Phase 5) and other backends without engine changes.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-Supported-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+
+[Architecture](#architecture) · [Features](#features) · [Quick Start](#quick-start) · [Distributed Inference](#distributed-inference) · [Testing](#testing) · [Roadmap](#roadmap)
+
+</div>
+
+---
+
+Fracture is a from-scratch LLM inference engine (~37k lines of Rust, ~650 lines of CUDA) designed around one principle: **the engine never knows what GPU it's running on**. All compute flows through a `Backend` trait, making the core engine, generation loop, HTTP server, and wire protocol completely backend-agnostic. Today that backend is CUDA; tomorrow it's Metal, and a single inference cluster can mix both.
+
+The system runs Llama 3.1 8B with full numerical validation against PyTorch — greedy generation is token-for-token identical. It has been validated across heterogeneous hardware (RTX 5090 + RTX 3090) in multi-machine distributed inference.
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │       Coordinator (HTTP API)         │
-                    │  /v1/completions  /v1/chat  /health  │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │      Distributed Pipeline            │
-                    │  sequence state, cache lifecycle,    │
-                    │  activation shape validation         │
-                    └──┬───────────────┬──────────────┬───┘
-                       │               │              │
-              ┌────────▼───┐  ┌────────▼───┐  ┌──────▼─────┐
-              │  Worker 0  │  │  Worker 1  │  │  Worker 2  │
-              │ Layers 0-9 │  │ Layers 10-19│ │ Layers 20-31│
-              │  (Head)    │  │  (Middle)  │  │  (Tail)    │
-              └────────────┘  └────────────┘  └────────────┘
-                   GPU 0           GPU 1           GPU 2
+                          ┌──────────────────────────────────────┐
+                          │        Coordinator (HTTP API)         │
+                          │  /v1/completions  /v1/chat  /health   │
+                          └─────────────────┬────────────────────┘
+                                            │
+                          ┌─────────────────▼────────────────────┐
+                          │        Distributed Pipeline           │
+                          │  Continuous batching, paged KV cache, │
+                          │  sequence state, cache lifecycle       │
+                          └──┬──────────────┬───────────────┬────┘
+                             │              │               │
+                    ┌────────▼───┐  ┌───────▼────┐  ┌───────▼─────┐
+                    │  Worker 0  │  │  Worker 1  │  │  Worker 2   │
+                    │ Layers 0-9 │  │Layers 10-19│  │Layers 20-31 │
+                    │   (Head)   │  │  (Middle)  │  │   (Tail)    │
+                    └────────────┘  └────────────┘  └─────────────┘
+                        GPU 0           GPU 1            GPU 2
 ```
 
-Each worker runs the same engine code — a backend-generic transformer forward pass over its assigned layer range. The coordinator chains activations through workers in order: the head worker embeds token IDs into activations, middle workers transform them through their layers, and the tail worker produces logits.
+Each worker runs the same backend-generic transformer forward pass over its assigned layer range. The coordinator chains activations through workers in order: the head worker embeds tokens, middle workers transform activations through their layers, and the tail worker produces logits. For single-node inference, a standalone server binary runs the full model on one GPU without the coordinator/worker overhead.
 
-For single-node inference, a standalone server binary runs the full model on one GPU without the coordinator/worker overhead.
+### Crate Map
 
-### Crate Structure
+The workspace enforces strict dependency boundaries — engine, server, and protocol crates never import a backend crate.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Binaries                                                           │
+│  fracture-server-cuda · fracture-worker-cuda · fracture-coordinator │
+└────────┬────────────────────┬──────────────────────┬────────────────┘
+         │                    │                      │
+┌────────▼─────────┐  ┌──────▼───────────┐  ┌───────▼──────────┐
+│  fracture-server  │  │ fracture-generate │  │fracture-coordin. │
+│  HTTP + SSE       │  │ Sampling + loop   │  │ Scheduling +     │
+│                   │  │                   │  │ pipeline + HB    │
+└────────┬──────────┘  └───────┬───────────┘  └───────┬──────────┘
+         │                     │                      │
+         │              ┌──────▼───────────┐  ┌───────▼──────────┐
+         │              │  fracture-engine  │  │fracture-protocol │
+         │              │  Forward pass,    │  │ Wire protocol,   │
+         │              │  KV cache, batch  │  │ CRC32C, TCP      │
+         │              └──────┬───────────┘  └──────────────────┘
+         │                     │
+┌────────▼─────────────────────▼──────────────────────────────────┐
+│  fracture-core  ·  fracture-gguf                                │
+│  Backend trait, DeviceTensor, ModelConfig  ·  GGUF parser/loader │
+└─────────────────────────────────────────────────────────────────┘
+         ▲
+┌────────┴──────────┐
+│  fracture-cuda    │
+│  CUDA Backend     │
+│  impl + kernels   │
+└───────────────────┘
+```
 
 | Crate | Purpose |
 |---|---|
-| **Core** | |
-| `crates/fracture-core` | Backend trait, DeviceTensor, ModelConfig, error types, profiling types |
-| `crates/fracture-engine` | Transformer forward pass, KV cache, node abstraction, pipeline coordinator, IPC |
-| `crates/fracture-generate` | Sampling (temperature/top-k/top-p/seeded), generation loop, cancellation |
-| `crates/fracture-server` | OpenAI-compatible HTTP API with SSE streaming |
-| `crates/fracture-gguf` | GGUF v3 parser and weight loader (FP16/FP32/BF16) |
-| **Distributed** | |
-| `crates/fracture-protocol` | Binary wire protocol (TCP, CRC32C, 10 message types) |
-| `crates/fracture-coordinator` | Scheduler, peer registry, heartbeat, distributed pipeline |
-| **Backend** | |
-| `backends/fracture-cuda` | CUDA kernels + cuBLAS matmul |
-| **Binaries** | |
-| `bins/fracture-server-cuda` | Single-node server |
-| `bins/fracture-worker-cuda` | Distributed worker (calibration, registration, forward serving) |
-| `bins/fracture-coordinator-cuda` | Distributed coordinator (scheduling, HTTP API) |
-
-**Critical invariant:** Engine, generate, server, and protocol crates never import backend crates. All GPU operations go through the `Backend` trait.
+| `fracture-core` | `Backend` trait, `DeviceTensor` (opaque GPU handle), `ModelConfig`, error types, profiling |
+| `fracture-engine` | Transformer forward pass, contiguous + paged KV cache, batched forward, node abstraction, IPC, batch scheduler |
+| `fracture-generate` | Sampling (temperature, top-k, top-p, seeded RNG), generation loop, cooperative cancellation |
+| `fracture-server` | OpenAI-compatible HTTP API (axum), SSE streaming, batched + serialized modes |
+| `fracture-gguf` | GGUF v3 file parser and weight loader (FP16/FP32/BF16) |
+| `fracture-protocol` | Binary wire protocol over TCP (CRC32C integrity, 12 message types, 256 MB cap) |
+| `fracture-coordinator` | Scheduler, peer registry, heartbeat, distributed pipeline (single + batched forward) |
+| `fracture-cuda` | CUDA `Backend` implementation: 7 hand-written kernels + cuBLAS matmul |
 
 ## Features
 
-### Inference
-- Full Llama 3 8B transformer: embedding, RMSNorm, GQA attention, RoPE, SwiGLU FFN
+### Inference Engine
+- Full Llama 3.1 8B transformer: embedding, RMSNorm, GQA attention, RoPE, SwiGLU FFN
 - FP16 storage with FP32 accumulation for numerical stability
 - Greedy and stochastic sampling (temperature, top-k, top-p, seeded RNG)
-- KV cache with contiguous per-sequence allocation
-- Prefill + decode with cache consistency validated against PyTorch reference
+- **Paged KV cache** — 16-token blocks allocated on demand (vs. contiguous pre-allocation), enabling dozens to hundreds of concurrent sequences
+- **Batched forward pass** — processes multiple sequences in a single engine call
+- **Continuous batching** — requests enter and leave the batch dynamically; decode-priority scheduling, prefill chunking (configurable, default 512 tokens)
+
+### CUDA Backend
+Hand-written kernels optimized for inference:
+- RMSNorm, RoPE, SiLU×Mul, Embedding, Residual Add
+- Contiguous and paged attention (paged reads K/V from block tables)
+- cuBLAS FP16 GEMM with FP32 accumulation
 
 ### HTTP API (OpenAI-compatible)
-- `POST /v1/completions` and `POST /v1/chat/completions` with Llama 3 chat template
-- `GET /v1/models`, `GET /health`
+- `POST /v1/completions` — text completion
+- `POST /v1/chat/completions` — chat with Llama 3 chat template
+- `GET /v1/models` · `GET /health`
 - SSE streaming with `id`, `object`, `created`, `model`, `finish_reason`, `usage`
-- `finish_reason`: `"stop"` (EOS token) vs `"length"` (max_tokens reached)
-- Request validation: empty prompt, invalid temperature/top_p, unknown model, invalid chat roles
-- Cooperative cancellation on client disconnect (frees GPU resources)
+- `finish_reason`: `"stop"` (EOS) or `"length"` (max_tokens)
+- Request validation, cooperative cancellation on client disconnect
 
 ### Distributed Inference
-- Custom binary wire protocol with CRC32C integrity and 256 MB payload limit
-- Compute-balanced layer scheduling with slow-node pruning and memory-aware clamping
-- Three scheduling modes: Auto (performance-optimized), EqualSplit (testing), Manual (explicit)
-- Worker calibration: 20 single-layer forward passes (5 warmup + 15 averaged) for decode and prefill
+- Custom binary wire protocol with CRC32C integrity checks
+- Compute-balanced layer scheduling with GPU calibration (5 warmup + 15 averaged forward passes)
+- Three scheduling modes: **Auto** (performance-optimized), **EqualSplit** (testing), **Manual** (explicit)
 - Heartbeat protocol with nonce-validated acks and dead-worker detection
-- Cache lifecycle: alloc with partial-failure rollback, duplicate/unknown sequence detection, reuse after free
-- Activation shape validation between pipeline stages
+- Cache lifecycle management: alloc with partial-failure rollback, reuse after free
+- Distributed batched forward with per-worker paged cache and block pool admission control
 
-### Validation
-- 542 tests: unit, GPU kernel, integration, model-validation, and e2e
-- 229 specified behaviors in vexspec (1 deferred to Phase 4)
-- Per-layer numerical validation against PyTorch reference tensors (rtol=1e-3, atol=1e-3)
-- Golden output comparison: greedy generation matches PyTorch token-for-token
-- Cross-machine inference validated with RTX 5090 + RTX 3090
+### Numerical Validation
+- Per-layer comparison against PyTorch reference tensors (rtol=1e-3, atol=1e-3)
+- Greedy generation matches PyTorch token-for-token
+- Batched output is bit-identical to sequential (max_diff=0.000000)
+- Paged attention is bit-identical to contiguous (max_diff=0.000000)
+- Cross-machine validation: RTX 5090 + RTX 3090
 
-## Requirements
+## Quick Start
+
+### Requirements
 
 - Rust (edition 2024)
 - NVIDIA GPU with CUDA toolkit (`nvcc` on PATH)
-- `cargo-nextest` for running tests
-- GGUF model file (Llama 3 8B FP16 format)
-- HuggingFace `tokenizer.json` for the model
+- [`cargo-nextest`](https://nexte.st/) for running tests
+- A GGUF model file (Llama 3 8B FP16) and its HuggingFace `tokenizer.json`
 
-## Build & Run
+### Build
 
 ```bash
-cargo check                    # Verify workspace compiles
-cargo nextest run              # Run all 542 tests
-cargo clippy                   # Lint
+cargo check            # Verify workspace compiles
+cargo clippy           # Lint
 ```
 
 ### Single-Node Server
@@ -112,8 +154,10 @@ cargo run --release -p fracture-server-cuda -- \
     --port 8080
 ```
 
+Send a request:
+
 ```bash
-# Completions
+# Text completion
 curl -s http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "The meaning of life is", "max_tokens": 64, "temperature": 0}'
@@ -124,9 +168,10 @@ curl -s http://localhost:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64, "stream": true}'
 ```
 
-### Distributed Inference (Multi-GPU)
+## Distributed Inference
 
 Start the coordinator on machine A:
+
 ```bash
 cargo run --release -p fracture-coordinator-cuda -- \
     --model /path/to/llama-3-8b.gguf \
@@ -137,62 +182,88 @@ cargo run --release -p fracture-coordinator-cuda -- \
 ```
 
 Start a worker on machine B:
+
 ```bash
 cargo run --release -p fracture-worker-cuda -- \
     --coordinator <machine-A-ip>:9410 \
     --model /path/to/llama-3-8b.gguf
 ```
 
-The coordinator waits for all workers to register, runs the scheduler, assigns layers, and starts serving HTTP requests. The same API endpoints work — clients don't know inference is distributed.
+The coordinator waits for all workers to register, runs calibration, assigns layers based on measured GPU performance, and starts serving. The HTTP API is identical — clients don't know inference is distributed.
 
-## Test Coverage
+### How Scheduling Works
 
-| Category | Scope | Count |
-|---|---|---|
-| Core types | Config validation, DType, tensor shape/reshape, error types | 39 |
-| GGUF parser | Header, metadata, tensor info, weight loading, BF16 conversion | 13 |
-| CUDA kernels | RMSNorm, RoPE, SiLU, attention, embedding, add, matmul + shape validation | 101 |
-| Engine | Forward pass, node dispatch, pipeline splits, KV cache, IPC | 65 |
-| Sampling | Temperature, top-k, top-p, greedy, NaN/Inf, seeded, single-logit | 30 |
-| Generation | Prefill/decode, stop conditions, metrics, cancellation, stop reason | 20 |
-| Server | Request validation, chat template, response format | 24 |
-| Protocol | Frame encoding, message roundtrip, CRC integrity, empty payloads | 17 |
-| Coordinator | Scheduler, registry, state, heartbeat, distributed pipeline, rollback | 123 |
-| Model validation | PyTorch reference comparison, golden generation, kernel correctness | 23 |
-| GPU integration | End-to-end generation, memory lifecycle, streaming | 7 |
-| E2E distributed | Multi-process coordinator + worker inference | 5 (ignored without model) |
+Each worker runs calibration forward passes at registration. The scheduler uses these timings to assign layers proportional to each GPU's speed, then clamps assignments to fit in available memory. Slow workers can be pruned entirely. The result: a heterogeneous cluster (e.g., RTX 5090 + RTX 3090) where each GPU gets the workload it can handle.
 
-Tests requiring the full model are gated behind `FRACTURE_MODEL_PATH` and the `#[ignore]` attribute for e2e tests.
+## Testing
+
+710 tests covering unit, GPU kernel, integration, model-validation, and end-to-end distributed scenarios.
+
+```bash
+cargo nextest run      # Run all tests
+```
+
+Tests are organized into thread groups via nextest config to manage GPU memory:
+- **GPU-memory-sensitive** (max-threads=1): model-validation tests that load the full 15 GB model
+- **E2E-distributed** (max-threads=1): tests that spawn coordinator + worker processes
+
+| Category | What's Tested |
+|---|---|
+| Core types | Config validation, DType, tensor shape/reshape, error types |
+| GGUF parser | Header, metadata, tensor info, weight loading, BF16 conversion |
+| CUDA kernels | RMSNorm, RoPE, SiLU, attention (contiguous + paged), embedding, add, matmul |
+| Engine | Forward pass, node dispatch, pipeline splits, KV cache, batched forward, IPC |
+| Sampling | Temperature, top-k, top-p, greedy, NaN/Inf handling, seeded RNG |
+| Generation | Prefill/decode, stop conditions, metrics, cancellation, stop reason |
+| Server | Request validation, chat template, response format, batched routes |
+| Protocol | Frame encoding, message roundtrip, CRC integrity, 12 message types |
+| Coordinator | Scheduler, registry, state, heartbeat, distributed pipeline, rollback |
+| Batch scheduler | Decode priority, prefill chunking, admission control, block pool reserve |
+| Model validation | PyTorch reference comparison, golden generation, kernel correctness |
+| E2E distributed | Multi-process coordinator + worker inference (gated behind `FRACTURE_MODEL_PATH`) |
 
 ### Reference Tensor Harness
 
-```bash
-# Dump PyTorch reference tensors
-python scripts/dump_reference.py --model-path <path-to-llama3-8b-hf> --output-dir tests/reference
+Generate PyTorch reference data for numerical validation:
 
-# Dump golden generation output
-python scripts/dump_reference.py --golden --model-path <path-to-llama3-8b-hf> --output-dir tests/golden
+```bash
+python scripts/dump_reference.py \
+    --model-path /path/to/llama-3-8b-hf \
+    --output-dir tests/reference
+
+python scripts/dump_reference.py --golden \
+    --model-path /path/to/llama-3-8b-hf \
+    --output-dir tests/golden
 ```
+
+## Design Decisions
+
+**Opaque tensors.** `DeviceTensor` is a handle (ID + shape + dtype), not a pointer. The engine never touches device memory directly — all reads and writes go through `Backend` methods. This is what makes backend-swapping possible without engine changes.
+
+**Static pipeline, dynamic batching.** The worker-to-layer assignment is fixed at startup (after calibration), but requests flow in and out of the batch continuously. This gives predictable memory layout with flexible throughput.
+
+**CRC32C everywhere.** Every wire protocol frame is integrity-checked. The distributed pipeline runs over TCP across machines — silent corruption would be catastrophic for inference correctness.
+
+**Decode-priority scheduling.** Active decodes are always scheduled before new prefills. A decode step is one token per sequence (fast, latency-sensitive). A prefill can be hundreds of tokens (slow, throughput-oriented). Starving decodes would spike time-to-first-token for every in-flight request.
 
 ## WSL2 Notes
 
-On WSL2, the CUDA driver library lives in `/usr/lib/wsl/lib/` rather than the standard Linux location. This is handled automatically:
-
-- `.cargo/config.toml` sets `LD_LIBRARY_PATH` for both paths
-- `libcudart` is linked statically (the dynamic version segfaults on WSL2 due to a driver/runtime version mismatch in the CUDA forwarding layer)
+On WSL2, the CUDA driver library lives in `/usr/lib/wsl/lib/`. This is handled automatically:
+- `.cargo/config.toml` sets `LD_LIBRARY_PATH` for both standard and WSL2 paths
+- `libcudart` is linked statically (the dynamic version segfaults due to WSL2 CUDA forwarding layer mismatch)
 - cuBLAS remains dynamically linked
 
 If CUDA tests segfault, verify `nvidia-smi` works and `.cargo/config.toml` is present.
 
-## Project Phases
+## Roadmap
 
 | Phase | Goal | Status |
 |---|---|---|
 | 1 | Single-node inference (Llama 3 8B, CUDA, OpenAI API) | **Complete** |
 | 2 | Node abstraction (layer-range execution, pipeline splits, IPC) | **Complete** |
 | 3 | Distribution (wire protocol, scheduling, heartbeat, multi-machine) | **Complete** |
-| 4 | Production (continuous batching, paged KV cache, fault tolerance) | Planned |
-| 5 | Cross-platform (Metal backend for Apple Silicon) | Planned |
+| 4 | Production (paged KV cache, continuous batching, distributed batching) | **In Progress** |
+| 5 | Cross-platform (Metal backend for Apple Silicon — heterogeneous clusters) | Planned |
 
 ## License
 
