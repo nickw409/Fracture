@@ -33,6 +33,21 @@ async fn recv_skipping_heartbeat_acks(
     }
 }
 
+/// Like [`recv_skipping_heartbeat_acks`] but takes an owned Arc, allowing
+/// it to be spawned into a `JoinSet` for concurrent polling.
+async fn recv_skipping_heartbeat_acks_owned(
+    reader: std::sync::Arc<tokio::sync::Mutex<FramedReader>>,
+) -> Result<(FrameHeader, Vec<u8>)> {
+    let mut r = reader.lock().await;
+    loop {
+        let (header, payload) = r.recv().await?;
+        if header.msg_type == MessageType::HeartbeatAck {
+            continue;
+        }
+        return Ok((header, payload));
+    }
+}
+
 /// Orchestrates forward passes across distributed workers.
 ///
 /// The pipeline sends Forward messages sequentially through workers in
@@ -153,7 +168,7 @@ impl DistributedPipeline {
         Ok(())
     }
 
-    /// Attempt to send CacheAlloc to all workers and collect acks.
+    /// Send CacheAlloc to all workers concurrently, then collect acks.
     /// On any failure, returns the error (caller handles rollback).
     async fn try_alloc_all(
         &self,
@@ -161,6 +176,7 @@ impl DistributedPipeline {
         seq_id: u64,
         succeeded: &mut Vec<String>,
     ) -> Result<()> {
+        // Phase 1: Send CacheAlloc to all workers (writes are fast).
         for node_id in &self.pipeline_order {
             let entry = registry.get_mut(node_id).ok_or_else(|| {
                 FractureError::Pipeline(format!("worker '{node_id}' not found in registry"))
@@ -169,9 +185,30 @@ impl DistributedPipeline {
                 .writer
                 .send_empty(MessageType::CacheAlloc, seq_id)
                 .await?;
+        }
 
-            // Wait for CacheAllocAck or Error from the worker
-            let (header, resp_payload) = recv_skipping_heartbeat_acks(&entry.reader).await?;
+        // Phase 2: Collect acks from all workers concurrently.
+        let mut readers: Vec<(String, std::sync::Arc<tokio::sync::Mutex<FramedReader>>)> =
+            self.pipeline_order
+                .iter()
+                .filter_map(|id| {
+                    registry.get(id).map(|e| (id.clone(), e.reader.clone()))
+                })
+                .collect();
+
+        let mut set = tokio::task::JoinSet::new();
+        for (node_id, reader) in readers.drain(..) {
+            set.spawn(async move {
+                let result = recv_skipping_heartbeat_acks_owned(reader).await;
+                (node_id, result)
+            });
+        }
+
+        while let Some(join_result) = set.join_next().await {
+            let (node_id, result) = join_result.map_err(|e| {
+                FractureError::Pipeline(format!("CacheAlloc task panicked: {e}"))
+            })?;
+            let (header, resp_payload) = result?;
 
             if header.msg_type == MessageType::Error {
                 let err: ErrorPayload = FramedConnection::deserialize_payload(&resp_payload)?;
@@ -188,7 +225,7 @@ impl DistributedPipeline {
                 )));
             }
 
-            succeeded.push(node_id.clone());
+            succeeded.push(node_id);
         }
         Ok(())
     }
