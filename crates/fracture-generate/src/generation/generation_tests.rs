@@ -1,5 +1,6 @@
 use super::*;
 use fracture_core::{DType, DeviceTensor, DeviceTimer, ModelConfig, TensorId};
+use fracture_engine::PagedKvCacheManager;
 use fracture_gguf::{LayerWeights, WeightStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -95,6 +96,7 @@ impl Backend for MockBackend {
     fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
     fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _q: &DeviceTensor, _block_table: &[i32], _k_blocks: &[&DeviceTensor], _v_blocks: &[&DeviceTensor], _num_kv_heads: usize, _kv_len: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
@@ -170,6 +172,7 @@ impl Backend for FailingMockBackend {
     fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
     fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _q: &DeviceTensor, _block_table: &[i32], _k_blocks: &[&DeviceTensor], _v_blocks: &[&DeviceTensor], _num_kv_heads: usize, _kv_len: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
@@ -235,8 +238,12 @@ fn make_engine<B: Backend>(backend: B, cfg: &ModelConfig) -> Engine<B> {
     Engine::new(backend, weights, 0..cfg.num_layers)
 }
 
-fn make_cache(cfg: &ModelConfig) -> KvCacheManager {
-    KvCacheManager::new(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len)
+fn make_cache<B: Backend>(cfg: &ModelConfig, backend: &B) -> PagedKvCacheManager {
+    // Block count: ceil(max_seq_len / 16) + 2 blocks of safety margin.
+    // 16 is the hardcoded BLOCK_SIZE in fracture-engine.
+    let num_blocks = cfg.max_seq_len.div_ceil(16) + 2;
+    PagedKvCacheManager::new(num_blocks, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, backend)
+        .expect("PagedKvCacheManager::new failed in test setup")
 }
 
 fn greedy_config(max_tokens: usize) -> GenerationConfig {
@@ -445,7 +452,7 @@ fn test_generate_empty_prompt_error() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(10);
@@ -462,7 +469,7 @@ fn test_prompt_exceeds_max_seq_len() {
     let cfg = tiny_config(); // max_seq_len = 512
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(10);
@@ -483,7 +490,7 @@ fn test_stop_on_eos_128008() {
     let cfg = tiny_config();
     let backend = MockBackend::cycling(vec![42, 128008], cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100);
@@ -498,7 +505,7 @@ fn test_stop_on_eos_128009() {
     let cfg = tiny_config();
     let backend = MockBackend::cycling(vec![42, 42, 128009], cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100);
@@ -514,7 +521,7 @@ fn test_prefill_to_decode_transition() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(5);
@@ -542,7 +549,7 @@ fn test_stop_on_eos_token() {
     // Cycle: 42, 42, 42, 128001, 42, 42, 42, 128001, ...
     let backend = MockBackend::cycling(vec![42, 42, 42, 128001], cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100); // high max so EOS is the real stop
@@ -561,7 +568,7 @@ fn test_stop_on_max_tokens() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(5);
@@ -577,7 +584,7 @@ fn test_stop_reason_length() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(3);
@@ -592,7 +599,7 @@ fn test_stop_reason_stop() {
     let cfg = tiny_config();
     let backend = MockBackend::cycling(vec![42, 128001], cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100);
@@ -607,7 +614,7 @@ fn test_stop_reason_immediate_eos() {
     let cfg = tiny_config();
     let backend = MockBackend::always(128001, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100);
@@ -622,7 +629,7 @@ fn test_max_tokens_one() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(1);
@@ -638,7 +645,7 @@ fn test_cache_freed_on_completion() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(3);
@@ -661,7 +668,7 @@ fn test_cache_freed_on_error() {
     // Fail on the very first matmul (during prefill), so forward() returns Err.
     let backend = FailingMockBackend::new(0, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(10);
@@ -683,7 +690,7 @@ fn test_tokens_streamed_immediately() {
     // Cycle through different tokens so we can verify ordering
     let backend = MockBackend::cycling(vec![10, 20, 30, 40, 50], cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(5);
@@ -710,7 +717,7 @@ fn test_immediate_stop_token() {
     // The first forward (prefill) returns EOS immediately
     let backend = MockBackend::always(128001, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100);
@@ -732,7 +739,7 @@ fn test_decode_forward_call_count() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(5);
@@ -752,7 +759,7 @@ fn test_kv_cache_consistent_across_prefill_decode() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(3);
@@ -827,6 +834,7 @@ impl Backend for CancellingMockBackend {
     fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
     fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _q: &DeviceTensor, _block_table: &[i32], _k_blocks: &[&DeviceTensor], _v_blocks: &[&DeviceTensor], _num_kv_heads: usize, _kv_len: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
@@ -858,7 +866,7 @@ fn test_cancellation_pre_start() {
     let cancel = Arc::new(AtomicBool::new(true)); // set BEFORE calling generate
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100); // large max_tokens so cancel is the only stop
@@ -926,7 +934,7 @@ fn test_cancellation_mid_generation() {
     let cancel = Arc::new(AtomicBool::new(false));
     let backend = CancellingMockBackend::new(2, Arc::clone(&cancel), cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(100); // large max_tokens so cancel is the only stop
@@ -1028,6 +1036,7 @@ impl Backend for PositionRecordingBackend {
         Ok(())
     }
     fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _q: &DeviceTensor, _block_table: &[i32], _k_blocks: &[&DeviceTensor], _v_blocks: &[&DeviceTensor], _num_kv_heads: usize, _kv_len: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
@@ -1064,7 +1073,7 @@ fn test_prefill_to_decode_position_tracking() {
     // Token 42 is not a stop token, so generation runs to max_tokens.
     let backend = PositionRecordingBackend::new(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(max_tokens);
@@ -1117,7 +1126,7 @@ fn test_metrics_emitted_on_generation() {
     let cfg = tiny_config();
     let backend = MockBackend::always(42, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(3);
@@ -1178,6 +1187,7 @@ fn test_tokens_streamed_before_completion() {
         fn rmsnorm(&self, _input: &DeviceTensor, _weight: &DeviceTensor, _eps: f64, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
         fn rope(&self, _q: &DeviceTensor, _k: &DeviceTensor, _positions: &[u32], _theta: f64, _head_dim: usize) -> fracture_core::Result<()> { Ok(()) }
         fn attention(&self, _q: &DeviceTensor, _k_cache: &DeviceTensor, _v_cache: &DeviceTensor, _num_kv_heads: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
+        fn attention_paged(&self, _q: &DeviceTensor, _block_table: &[i32], _k_blocks: &[&DeviceTensor], _v_blocks: &[&DeviceTensor], _num_kv_heads: usize, _kv_len: usize, _start_pos: usize, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
         fn silu_mul(&self, _gate: &DeviceTensor, _up: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
         fn embedding(&self, _token_ids: &[u32], _embedding_table: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
         fn add(&self, _a: &DeviceTensor, _b: &DeviceTensor, _out: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
@@ -1206,7 +1216,7 @@ fn test_tokens_streamed_before_completion() {
         };
         let weights = fake_weight_store(&cfg);
         let eng = Engine::new(backend, weights, 0..cfg.num_layers);
-        let mut cache = make_cache(&cfg);
+        let mut cache = make_cache(&cfg, eng.backend());
         let config = greedy_config(5);
         GenerationLoop::generate(&eng, &[1, 2, 3], &config, &mut cache, &tx).unwrap()
     });
@@ -1247,7 +1257,7 @@ fn test_error_context_propagation() {
     // the first projection), so forward() returns an error immediately.
     let backend = FailingMockBackend::new(0, cfg.vocab_size);
     let engine = make_engine(backend, &cfg);
-    let mut cache = make_cache(&cfg);
+    let mut cache = make_cache(&cfg, engine.backend());
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let config = greedy_config(10);

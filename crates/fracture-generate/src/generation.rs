@@ -1,5 +1,5 @@
 use fracture_core::{Backend, FractureError, RequestMetrics, Result};
-use fracture_engine::{CacheHandle, Engine, KvCacheManager};
+use fracture_engine::{CacheHandle, Engine, PagedCache};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,11 +50,11 @@ impl GenerationLoop {
     ///
     /// Returns the generated tokens and the reason generation stopped.
     /// If `cancel` is provided and set to `true`, the decode loop exits early.
-    pub fn generate<B: Backend>(
+    pub fn generate<B: Backend, C: PagedCache>(
         engine: &Engine<B>,
         prompt_tokens: &[u32],
         config: &GenerationConfig,
-        cache: &mut KvCacheManager,
+        cache: &mut C,
         tx: &mpsc::UnboundedSender<u32>,
     ) -> Result<GenerationResult> {
         Self::generate_with_cancel(engine, prompt_tokens, config, cache, tx, None)
@@ -64,11 +64,11 @@ impl GenerationLoop {
     ///
     /// When `cancel` is set to `true`, the decode loop exits early and the KV cache
     /// is freed. The returned `StopReason` will be `Stop`.
-    pub fn generate_with_cancel<B: Backend>(
+    pub fn generate_with_cancel<B: Backend, C: PagedCache>(
         engine: &Engine<B>,
         prompt_tokens: &[u32],
         config: &GenerationConfig,
-        cache: &mut KvCacheManager,
+        cache: &mut C,
         tx: &mpsc::UnboundedSender<u32>,
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<GenerationResult> {
@@ -83,24 +83,24 @@ impl GenerationLoop {
             )));
         }
 
-        let cache_handle = cache.alloc(engine.backend())?;
+        let cache_handle = cache.alloc()?;
 
         let result =
             Self::generate_inner(engine, prompt_tokens, config, cache, cache_handle, tx, &cancel);
 
         // Always free the cache, even on error
-        if let Err(e) = cache.free(cache_handle, engine.backend()) {
+        if let Err(e) = cache.free(cache_handle) {
             tracing::warn!("failed to free KV cache: {e}");
         }
 
         result
     }
 
-    fn generate_inner<B: Backend>(
+    fn generate_inner<B: Backend, C: PagedCache>(
         engine: &Engine<B>,
         prompt_tokens: &[u32],
         config: &GenerationConfig,
-        cache: &mut KvCacheManager,
+        cache: &mut C,
         cache_handle: CacheHandle,
         tx: &mpsc::UnboundedSender<u32>,
         cancel: &Option<Arc<AtomicBool>>,
@@ -115,7 +115,7 @@ impl GenerationLoop {
 
         // Prefill: process all prompt tokens at once
         let positions: Vec<u32> = (0..prompt_tokens.len() as u32).collect();
-        let logits = engine.forward(prompt_tokens, &positions, cache, cache_handle, None)?;
+        let logits = engine.forward_paged(prompt_tokens, &positions, cache, cache_handle)?;
 
         let ttft = request_start.elapsed();
 
@@ -143,7 +143,7 @@ impl GenerationLoop {
                     break;
                 }
             let decode_start = Instant::now();
-            let logits = engine.forward(&[next_token], &[pos], cache, cache_handle, None)?;
+            let logits = engine.forward_paged(&[next_token], &[pos], cache, cache_handle)?;
             decode_times.push(decode_start.elapsed().as_secs_f64() * 1000.0);
 
             next_token = Sampler::sample(&logits, &sampling_params)?;
@@ -164,14 +164,14 @@ impl GenerationLoop {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit_metrics<B: Backend>(
+    fn emit_metrics<B: Backend, C: PagedCache>(
         engine: &Engine<B>,
         prompt_tokens: usize,
         generated_tokens: usize,
         ttft: std::time::Duration,
         request_start: Instant,
         decode_times: &[f64],
-        cache: &KvCacheManager,
+        cache: &C,
         cache_handle: CacheHandle,
     ) {
         let total_ms = request_start.elapsed().as_secs_f64() * 1000.0;
