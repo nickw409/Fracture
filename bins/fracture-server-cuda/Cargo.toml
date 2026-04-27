@@ -27,6 +27,8 @@ tokenizers = { workspace = true }
 half = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[test]]
 name = "gpu_integration"
@@ -35,3 +37,7 @@ path = "tests/gpu_integration.rs"
 [[test]]
 name = "turboquant_gpu"
 path = "tests/turboquant_gpu.rs"
+
+[[test]]
+name = "golden"
+path = "tests/golden.rs"

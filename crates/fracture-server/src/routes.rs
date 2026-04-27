@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use fracture_core::Backend;
-use fracture_engine::{Engine, KvCacheManager};
+use fracture_engine::{Engine, PagedKvCacheManager};
 use fracture_generate::{apply_chat_template, GenerationConfig, GenerationLoop, StopReason};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,7 @@ use crate::utils::*;
 /// Shared application state passed to all handlers.
 pub struct AppState<B: Backend> {
     pub engine: Arc<Engine<B>>,
-    pub cache: Mutex<KvCacheManager>,
+    pub cache: Mutex<PagedKvCacheManager>,
     pub tokenizer: Tokenizer,
     pub dashboard: Arc<DashboardState>,
 }
@@ -89,7 +89,7 @@ async fn completions_handler<B: Backend + 'static>(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let generated = {
         let mut cache = state.cache.lock().unwrap();
-        GenerationLoop::generate(state.engine.as_ref(), &prompt_tokens, &config, &mut cache, &tx)
+        GenerationLoop::generate(state.engine.as_ref(), &prompt_tokens, &config, &mut *cache, &tx)
     };
 
     match generated {
@@ -220,7 +220,7 @@ async fn chat_completions_handler<B: Backend + 'static>(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let generated = {
         let mut cache = state.cache.lock().unwrap();
-        GenerationLoop::generate(state.engine.as_ref(), &prompt_tokens, &config, &mut cache, &tx)
+        GenerationLoop::generate(state.engine.as_ref(), &prompt_tokens, &config, &mut *cache, &tx)
     };
 
     match generated {
@@ -327,7 +327,7 @@ fn handle_streaming<B: Backend + 'static>(
             state_for_gen.engine.as_ref(),
             &prompt_tokens_gen,
             &config_gen,
-            &mut cache,
+            &mut *cache,
             &tx,
             Some(cancel_for_gen),
         );

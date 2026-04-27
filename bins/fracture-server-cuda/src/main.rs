@@ -1,7 +1,7 @@
 use anyhow::Result;
 use fracture_core::Backend;
 use fracture_cuda::CudaBackend;
-use fracture_engine::{Engine, KvCacheManager};
+use fracture_engine::{Engine, PagedKvCacheManager};
 use fracture_gguf::WeightStore;
 use fracture_server::dashboard::dto::ModelInfo;
 use fracture_server::dashboard::metrics::MetricsCollector;
@@ -85,13 +85,16 @@ async fn main() -> Result<()> {
     let layer_range = 0..config.num_layers;
     let engine = Arc::new(Engine::new(backend, weights, layer_range));
 
-    // Create KV cache manager
-    let cache = KvCacheManager::new(
+    // Create paged KV cache manager (single-sequence legacy server; one block-pool sized
+    // for max_seq_len + safety margin). 16 is the hardcoded BLOCK_SIZE.
+    let num_blocks = config.max_seq_len.div_ceil(16) + 2;
+    let cache = PagedKvCacheManager::new(
+        num_blocks,
         config.num_layers,
         config.num_kv_heads,
         config.head_dim,
-        config.max_seq_len,
-    );
+        engine.backend(),
+    )?;
 
     // Load tokenizer
     let tokenizer = if let Some(path) = tokenizer_path {

@@ -12,6 +12,10 @@ test-group = 'gpu-memory-sensitive'
 filter = 'test(test_gpu_cache_freed_after_generation) | test(/test_matmul_(prefill_correctness|llama3_ffn_shapes|large_prefill|llama3_vocab_projection|llama3_prefill_ffn)/)'
 test-group = 'gpu-memory-sensitive'
 
+[[profile.default.overrides]]
+filter = 'binary(golden) and package(fracture-server-cuda)'
+test-group = 'gpu-memory-sensitive'
+
 [test-groups.e2e-distributed]
 # E2E tests spawn coordinator + worker processes that each load the full model.
 # Must run one at a time to avoid GPU OOM and port conflicts.

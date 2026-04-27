@@ -648,6 +648,8 @@ dependencies = [
  "fracture-server",
  "half",
  "rand",
+ "serde",
+ "serde_json",
  "tokenizers",
  "tokio",
  "tracing",

@@ -125,12 +125,19 @@ fn setup_engine_and_cache() -> fracture_core::Result<(Engine<CudaBackend>, KvCac
     Ok((engine, cache, cfg))
 }
 
+fn setup_engine_and_paged_cache() -> fracture_core::Result<(Engine<CudaBackend>, PagedKvCacheManager, ModelConfig)> {
+    let (engine, cfg) = setup_engine()?;
+    let num_blocks = cfg.max_seq_len.div_ceil(16) + 2;
+    let cache = PagedKvCacheManager::new(num_blocks, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, engine.backend())?;
+    Ok((engine, cache, cfg))
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: Basic generation produces tokens
 // ---------------------------------------------------------------------------
 #[test]
 fn test_gpu_generation_basic() {
-    let (engine, mut cache, _cfg) = setup_engine_and_cache().expect("setup failed");
+    let (engine, mut cache, _cfg) = setup_engine_and_paged_cache().expect("setup failed");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let gen_config = GenerationConfig {
@@ -162,7 +169,7 @@ fn test_gpu_generation_basic() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_gpu_generation_stop_on_max_tokens() {
-    let (engine, mut cache, _cfg) = setup_engine_and_cache().expect("setup failed");
+    let (engine, mut cache, _cfg) = setup_engine_and_paged_cache().expect("setup failed");
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let gen_config = GenerationConfig {
@@ -189,7 +196,7 @@ fn test_gpu_generation_stop_on_max_tokens() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_gpu_generation_streaming() {
-    let (engine, mut cache, _cfg) = setup_engine_and_cache().expect("setup failed");
+    let (engine, mut cache, _cfg) = setup_engine_and_paged_cache().expect("setup failed");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let gen_config = GenerationConfig {
@@ -350,7 +357,7 @@ fn test_gpu_prefill_decode_consistency() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_gpu_cache_freed_after_generation() {
-    let (engine, mut cache, _cfg) = setup_engine_and_cache().expect("setup failed");
+    let (engine, mut cache, _cfg) = setup_engine_and_paged_cache().expect("setup failed");
 
     // Warm up: run a short generation so PTX JIT compilation (if using forward-
     // compatible PTX instead of native SASS) allocates its kernel cache before
