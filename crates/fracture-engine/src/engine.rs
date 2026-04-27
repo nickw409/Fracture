@@ -1,3 +1,4 @@
+use crate::batched::PagedCache;
 use crate::kv_cache::{CacheHandle, KvCacheManager};
 use crate::node::{NodeConfig, NodeInput, NodeOutput};
 use crate::paged_kv_cache::PagedKvCacheManager;
@@ -507,11 +508,11 @@ impl<B: Backend> Engine<B> {
     /// Paged KV cache forward pass: token_ids → logits.
     ///
     /// Same as `forward()` but uses paged attention with block tables.
-    pub fn forward_paged(
+    pub fn forward_paged<C: PagedCache>(
         &self,
         token_ids: &[u32],
         positions: &[u32],
-        cache: &mut PagedKvCacheManager,
+        cache: &mut C,
         cache_handle: CacheHandle,
     ) -> Result<Vec<f32>> {
         let node_config = NodeConfig::new(
@@ -535,11 +536,11 @@ impl<B: Backend> Engine<B> {
     /// Identical to forward_node except:
     /// - KV cache write uses paged append_kv instead of copy_rows into contiguous tensors
     /// - Attention uses attention_paged with block tables instead of contiguous k/v cache
-    pub fn forward_node_paged(
+    pub fn forward_node_paged<C: PagedCache>(
         &self,
         input: NodeInput,
         node_config: &NodeConfig,
-        cache: &mut PagedKvCacheManager,
+        cache: &mut C,
         cache_handle: CacheHandle,
     ) -> Result<NodeOutput> {
         let cfg = &self.weights.config;
@@ -659,30 +660,19 @@ impl<B: Backend> Engine<B> {
 
             let new_seq_len = start_pos + seq_len;
 
-            // 2f. Paged attention — reads from block table
-            let block_table = cache.block_table(cache_handle)?;
-            let block_table_i32: Vec<i32> = block_table.iter().map(|&b| b as i32).collect();
-
-            // Collect block K/V DeviceTensors for this layer
-            let pool = cache.pool();
-            let k_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.k_tensor(bid, cache_idx))
-                .collect();
-            let v_blocks: Vec<&DeviceTensor> = (0..pool.capacity())
-                .map(|bid| pool.v_tensor(bid, cache_idx))
-                .collect();
-
+            // 2f. Paged attention — dispatch through trait so this works for both
+            // FP16 paged and TurboQuant quantized caches.
             let attn_out = DeviceTensor::new(
                 attn_out_mh.id,
                 vec![seq_len, num_q_heads, head_dim],
                 DType::FP16,
             );
 
-            self.backend.attention_paged(
+            cache.dispatch_attention(
+                &self.backend,
                 &q_mh,
-                &block_table_i32,
-                &k_blocks,
-                &v_blocks,
+                cache_handle,
+                cache_idx,
                 num_kv_heads,
                 new_seq_len,
                 start_pos,
