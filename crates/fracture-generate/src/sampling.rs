@@ -9,7 +9,7 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub top_p: f32,
     /// Optional seed for deterministic sampling. When set, the sampler uses
-    /// a seeded RNG (`StdRng::seed_from_u64`) instead of `thread_rng()`.
+    /// a seeded RNG (`StdRng::seed_from_u64`) instead of `rng()`.
     pub seed: Option<u64>,
 }
 

@@ -552,9 +552,9 @@ fn test_rmsnorm_prefill() {
     let b = make_backend();
     let rows = 4;
     let cols = 256;
-    let mut rng = rand::thread_rng();
-    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+    let mut rng = rand::rng();
+    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let w_data: Vec<f32> = (0..cols).map(|_| rng.random_range(0.5..2.0)).collect();
 
     let x = alloc_with_data(&b, &[rows, cols], &x_data);
     let w = alloc_with_data(&b, &[cols], &w_data);
@@ -901,11 +901,11 @@ fn test_rope_model_dimensions() {
 fn test_silu_mul_batch() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let rows = 4;
     let cols = 8;
-    let gate_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-2.0..2.0)).collect();
-    let up_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-2.0..2.0)).collect();
+    let gate_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-2.0..2.0)).collect();
+    let up_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-2.0..2.0)).collect();
 
     let gate = alloc_with_data(&b, &[rows, cols], &gate_data);
     let up = alloc_with_data(&b, &[rows, cols], &up_data);
@@ -933,12 +933,12 @@ fn test_silu_mul_batch() {
 fn test_silu_mul_large_dim() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let rows = 2;
     let cols = 14336;
     let n = rows * cols;
-    let gate_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-3.0..3.0)).collect();
-    let up_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-3.0..3.0)).collect();
+    let gate_data: Vec<f32> = (0..n).map(|_| rng.random_range(-3.0..3.0)).collect();
+    let up_data: Vec<f32> = (0..n).map(|_| rng.random_range(-3.0..3.0)).collect();
 
     let gate = alloc_with_data(&b, &[rows, cols], &gate_data);
     let up = alloc_with_data(&b, &[rows, cols], &up_data);
@@ -1443,9 +1443,9 @@ fn test_rmsnorm_prefill_large() {
     let b = make_backend();
     let rows = 8;
     let cols = 4096;
-    let mut rng = rand::thread_rng();
-    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+    let mut rng = rand::rng();
+    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let w_data: Vec<f32> = (0..cols).map(|_| rng.random_range(0.5..2.0)).collect();
 
     let x = alloc_with_data(&b, &[rows, cols], &x_data);
     let w = alloc_with_data(&b, &[cols], &w_data);
@@ -1862,7 +1862,7 @@ fn test_embedding_oov_behavior() {
 fn test_matmul_llama3_shapes() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let shapes: Vec<(usize, usize, usize)> = vec![
         (1, 4096, 4096),
@@ -1870,8 +1870,8 @@ fn test_matmul_llama3_shapes() {
     ];
 
     for (m, k, n) in shapes {
-        let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-        let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1..0.1)).collect();
 
         let a = alloc_with_data(&b, &[m, k], &a_data);
         let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -1940,13 +1940,13 @@ fn test_matmul_fp32_accumulation() {
 fn test_matmul_large_prefill() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 128;
     let k = 4096;
     let n = 4096;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.05..0.05)).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|_| rng.gen_range(-0.05..0.05)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.05..0.05)).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|_| rng.random_range(-0.05..0.05)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[k, n], &b_data);
@@ -1972,13 +1972,13 @@ fn test_matmul_large_prefill() {
 fn test_matmul_gqa_kv_shape() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 1;
     let k = 4096;
     let n = 1024;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-    let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1..0.1)).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1..0.1)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -2025,11 +2025,11 @@ fn test_timer_double_destroy() {
 fn test_add_reference_correctness() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let n = 4096;
 
-    let a_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let b_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let a_data: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let b_data: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
 
     let a = alloc_with_data(&b, &[1, n], &a_data);
     let bt = alloc_with_data(&b, &[1, n], &b_data);
@@ -2064,13 +2064,13 @@ fn test_add_reference_correctness() {
 fn test_add_large_tensor() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let rows = 128;
     let cols = 4096;
     let n = rows * cols;
 
-    let a_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let b_data: Vec<f32> = (0..n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let a_data: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let b_data: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
 
     let a = alloc_with_data(&b, &[rows, cols], &a_data);
     let bt = alloc_with_data(&b, &[rows, cols], &b_data);
@@ -2104,13 +2104,13 @@ fn test_add_large_tensor() {
 fn test_matmul_llama3_shapes_correctness() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 1;
     let k = 64;
     let n = 64;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-    let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1..0.1)).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1..0.1)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -2197,12 +2197,12 @@ fn test_matmul_large_m_fix() {
 fn test_rmsnorm_prefill_n128() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let rows = 128;
     let cols = 4096;
 
-    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let w_data: Vec<f32> = (0..cols).map(|_| rng.random_range(0.5..2.0)).collect();
 
     let x = alloc_with_data(&b, &[rows, cols], &x_data);
     let w = alloc_with_data(&b, &[cols], &w_data);
@@ -2243,12 +2243,12 @@ fn test_rmsnorm_prefill_n128() {
 fn test_rmsnorm_prefill_n512() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let rows = 512;
     let cols = 4096;
 
-    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let w_data: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5..2.0)).collect();
+    let x_data: Vec<f32> = (0..rows * cols).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let w_data: Vec<f32> = (0..cols).map(|_| rng.random_range(0.5..2.0)).collect();
 
     let x = alloc_with_data(&b, &[rows, cols], &x_data);
     let w = alloc_with_data(&b, &[cols], &w_data);
@@ -2505,8 +2505,8 @@ fn test_rope_prod_dimensions_numerical() {
     let num_q_heads = 32;
     b.precompute_rope_freqs(head_dim, theta).unwrap();
 
-    let mut rng = rand::thread_rng();
-    let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+    let mut rng = rand::rng();
+    let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.random_range(-0.5..0.5)).collect();
 
     let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
     let k = alloc_with_data(&b, &[1, 8, head_dim], &vec![0.1f32; 8 * head_dim]);
@@ -2760,12 +2760,12 @@ fn test_attention_decode_production_dims() {
     let max_seq = 256;
     let cache_len = 64;
 
-    let mut rng = rand::thread_rng();
-    let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+    let mut rng = rand::rng();
+    let q_data: Vec<f32> = (0..num_q_heads * head_dim).map(|_| rng.random_range(-0.5..0.5)).collect();
     let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
 
-    let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
-    let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.gen_range(-0.5..0.5)).collect();
+    let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.random_range(-0.5..0.5)).collect();
+    let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim).map(|_| rng.random_range(-0.5..0.5)).collect();
     let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
     let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
 
@@ -2790,13 +2790,13 @@ fn test_attention_decode_production_dims() {
 fn test_matmul_llama3_ffn_shapes() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Gate/up projection: A[1,4096] x B[14336,4096]^T = C[1,14336]
     {
         let m = 1; let k = 4096; let n = 14336;
-        let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-        let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let a_data: Vec<f32> = (0..m*k).map(|_| rng.random_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n*k).map(|_| rng.random_range(-0.1..0.1)).collect();
         let a = alloc_with_data(&b, &[m, k], &a_data);
         let bt = alloc_with_data(&b, &[n, k], &b_data);
         let c = b.alloc(&[m, n], DType::FP16).unwrap();
@@ -2821,8 +2821,8 @@ fn test_matmul_llama3_ffn_shapes() {
     // Down projection: A[1,14336] x B[4096,14336]^T = C[1,4096]
     {
         let m = 1; let k = 14336; let n = 4096;
-        let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-        let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let a_data: Vec<f32> = (0..m*k).map(|_| rng.random_range(-0.1..0.1)).collect();
+        let b_data: Vec<f32> = (0..n*k).map(|_| rng.random_range(-0.1..0.1)).collect();
         let a = alloc_with_data(&b, &[m, k], &a_data);
         let bt = alloc_with_data(&b, &[n, k], &b_data);
         let c = b.alloc(&[m, n], DType::FP16).unwrap();
@@ -2849,12 +2849,12 @@ fn test_matmul_llama3_ffn_shapes() {
 fn test_matmul_prefill_correctness() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // A[128,4096] x B[14336,4096]^T = C[128,14336]
     let m = 128; let k = 4096; let n = 14336;
-    let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-    let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+    let a_data: Vec<f32> = (0..m*k).map(|_| rng.random_range(-0.1..0.1)).collect();
+    let b_data: Vec<f32> = (0..n*k).map(|_| rng.random_range(-0.1..0.1)).collect();
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
     let c = b.alloc(&[m, n], DType::FP16).unwrap();
@@ -2882,12 +2882,12 @@ fn test_matmul_prefill_correctness() {
 fn test_matmul_gqa_kv_correctness() {
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // GQA K/V: A[1,4096] x B[1024,4096]^T = C[1,1024]
     let m = 1; let k = 4096; let n = 1024;
-    let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
-    let b_data: Vec<f32> = (0..n*k).map(|_| rng.gen_range(-0.1..0.1)).collect();
+    let a_data: Vec<f32> = (0..m*k).map(|_| rng.random_range(-0.1..0.1)).collect();
+    let b_data: Vec<f32> = (0..n*k).map(|_| rng.random_range(-0.1..0.1)).collect();
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
     let c = b.alloc(&[m, n], DType::FP16).unwrap();
@@ -3005,13 +3005,13 @@ fn test_matmul_llama3_prefill_ffn_512() {
     // Verify 5 sampled output positions against CPU dot product.
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 512;
     let k = 4096;
     let n = 14336;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
-    let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -3053,13 +3053,13 @@ fn test_matmul_llama3_vocab_projection() {
     // Sample a few output columns and compare against CPU dot product.
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 1;
     let k = 4096;
     let n = 128256;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
-    let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -3100,13 +3100,13 @@ fn test_matmul_llama3_qkv_correctness() {
     // Verify sampled output positions match CPU dot products (not just is_finite).
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let m = 1;
     let k = 4096;
     let n = 4096;
 
-    let a_data: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
-    let b_data: Vec<f32> = (0..n * k).map(|_| rng.gen_range(-0.1f32..0.1)).collect();
+    let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-0.1f32..0.1)).collect();
 
     let a = alloc_with_data(&b, &[m, k], &a_data);
     let bt = alloc_with_data(&b, &[n, k], &b_data);
@@ -3147,24 +3147,24 @@ fn test_attention_decode_various_cache_lengths() {
     // several cache lengths. Verify all outputs are finite with correct shape.
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let head_dim = 128;
     let num_q_heads = 32;
     let num_kv_heads = 8;
     let max_seq = 512;
 
     let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.3f32..0.3))
+        .map(|_| rng.random_range(-0.3f32..0.3))
         .collect();
     let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.3f32..0.3))
+        .map(|_| rng.random_range(-0.3f32..0.3))
         .collect();
     let k_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &k_data);
     let v_cache = alloc_with_data(&b, &[max_seq, num_kv_heads, head_dim], &v_data);
 
     for &cache_len in &[1usize, 16, 64, 256] {
         let q_data: Vec<f32> = (0..num_q_heads * head_dim)
-            .map(|_| rng.gen_range(-0.3f32..0.3))
+            .map(|_| rng.random_range(-0.3f32..0.3))
             .collect();
         let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
         let out = b.alloc(&[1, num_q_heads, head_dim], DType::FP16).unwrap();
@@ -3197,7 +3197,7 @@ fn test_attention_decode_production_correctness() {
     // cache_len=8. Compare GPU output against CPU scaled dot-product attention with GQA.
     use rand::Rng;
     let b = make_backend();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let head_dim = 128;
     let num_q_heads = 4;
     let num_kv_heads = 2;
@@ -3205,13 +3205,13 @@ fn test_attention_decode_production_correctness() {
     let max_seq = 16usize;
 
     let q_data: Vec<f32> = (0..num_q_heads * head_dim)
-        .map(|_| rng.gen_range(-0.3f32..0.3))
+        .map(|_| rng.random_range(-0.3f32..0.3))
         .collect();
     let k_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.3f32..0.3))
+        .map(|_| rng.random_range(-0.3f32..0.3))
         .collect();
     let v_data: Vec<f32> = (0..max_seq * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.3f32..0.3))
+        .map(|_| rng.random_range(-0.3f32..0.3))
         .collect();
 
     let q = alloc_with_data(&b, &[1, num_q_heads, head_dim], &q_data);
@@ -3363,21 +3363,21 @@ fn test_attention_prefill_production_dims() {
     let num_q_heads = 32usize;
     let num_kv_heads = 8usize;
     let head_dim = 128usize;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Allocate Q with small random data.
     let q_data: Vec<f32> = (0..n_tokens * num_q_heads * head_dim)
-        .map(|_| rng.gen_range(-0.1f32..0.1f32))
+        .map(|_| rng.random_range(-0.1f32..0.1f32))
         .collect();
     let q = alloc_with_data(&b, &[n_tokens, num_q_heads, head_dim], &q_data);
 
     // We need ceil(8/16) = 1 block for kv_len=8 tokens at start_pos=0.
     // Block layout: tokens 0..8 in slot 0..8 of block 0.
     let k_block_data: Vec<f32> = (0..BLOCK_SIZE * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.1f32..0.1f32))
+        .map(|_| rng.random_range(-0.1f32..0.1f32))
         .collect();
     let v_block_data: Vec<f32> = (0..BLOCK_SIZE * num_kv_heads * head_dim)
-        .map(|_| rng.gen_range(-0.1f32..0.1f32))
+        .map(|_| rng.random_range(-0.1f32..0.1f32))
         .collect();
 
     let k_block = alloc_kv_block(&b, num_kv_heads, head_dim, &k_block_data);
