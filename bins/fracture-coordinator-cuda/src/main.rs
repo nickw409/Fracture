@@ -63,6 +63,35 @@ async fn main() -> Result<()> {
 
     // Load config file (fracture.env) → CLI flags as fallback.
     let args: Vec<String> = std::env::args().collect();
+
+    // Reject unknown flags up front so typos like `--workers 2` (which used to
+    // be silently dropped, since this binary uses `--min-workers`) fail loudly.
+    const KNOWN_FLAGS: &[&str] = &[
+        "config",
+        "listen",
+        "model",
+        "min-workers",
+        "http-port",
+        "max-seq-len",
+        "scheduling",
+        "tokenizer",
+        "acceptance-timeout",
+        "batched",
+        "kv-quant",
+        "term",
+    ];
+    if let Err(unknown) = fracture_core::env_config::validate_known_flags(&args, KNOWN_FLAGS) {
+        anyhow::bail!(
+            "unknown CLI flag: --{unknown}\n\
+             known flags: {}",
+            KNOWN_FLAGS
+                .iter()
+                .map(|f| format!("--{f}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let (cfg, cfg_path) = fracture_core::env_config::load_config(&args);
     if let Some(path) = cfg_path {
         tracing::info!("loaded config from {path}");

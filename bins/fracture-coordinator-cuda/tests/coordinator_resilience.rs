@@ -174,3 +174,32 @@ fn stray_tcp_probe_does_not_poison_accept_loop() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Unknown CLI flags must cause the coordinator to exit non-zero with a clear
+/// error instead of being silently ignored. Regression test for the issue where
+/// `--workers <N>` (typo for `--min-workers`) was accepted and dropped, leaving
+/// the binary running with default min-workers and the operator's intent
+/// invisibly thwarted.
+#[test]
+fn unknown_flag_rejected() {
+    let output = Command::new(release_bin("fracture-coordinator-cuda"))
+        .args([
+            "--model",
+            fixture_path().to_str().unwrap(),
+            "--workers", // <-- intentional typo: this is no longer a real flag
+            "1",
+        ])
+        .output()
+        .expect("spawn coordinator");
+
+    assert!(
+        !output.status.success(),
+        "coordinator should have exited non-zero on unknown flag, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown CLI flag") && stderr.contains("--workers"),
+        "expected 'unknown CLI flag' and '--workers' in stderr, got:\n{stderr}"
+    );
+}

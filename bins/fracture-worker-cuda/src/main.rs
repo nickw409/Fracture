@@ -106,6 +106,38 @@ async fn main() -> Result<()> {
 
     // Load config file (fracture.env) -> CLI flags as fallback.
     let args: Vec<String> = std::env::args().collect();
+
+    // Reject unknown flags up front so typos fail loudly instead of being
+    // silently ignored by the hand-rolled arg parser.
+    const KNOWN_FLAGS: &[&str] = &[
+        "config",
+        "coordinator",
+        "election-priority",
+        "gpu",
+        "kv-quant",
+        "model",
+        "no-coordinator",
+        "node-id",
+        "peer-port",
+        "seed",
+        "tq-key-bits",
+        "tq-protected-bits",
+        "tq-protected-layers",
+        "tq-seed",
+        "tq-value-bits",
+    ];
+    if let Err(unknown) = fracture_core::env_config::validate_known_flags(&args, KNOWN_FLAGS) {
+        anyhow::bail!(
+            "unknown CLI flag: --{unknown}\n\
+             known flags: {}",
+            KNOWN_FLAGS
+                .iter()
+                .map(|f| format!("--{f}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let (cfg, cfg_path) = fracture_core::env_config::load_config(&args);
     if let Some(path) = cfg_path {
         tracing::info!("loaded config from {path}");

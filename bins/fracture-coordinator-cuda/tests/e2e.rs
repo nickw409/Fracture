@@ -71,7 +71,7 @@ fn spawn_pipeline_inner(coord_port: u16, http_port: u16, batched: bool) -> (Proc
     let mut args = vec![
         "--model".to_string(), model.to_str().unwrap().to_string(),
         "--listen".to_string(), format!("127.0.0.1:{coord_port}"),
-        "--workers".to_string(), "1".to_string(),
+        "--min-workers".to_string(), "1".to_string(),
         "--http-port".to_string(), http_port.to_string(),
         "--scheduling".to_string(), "equal".to_string(),
     ];
@@ -228,7 +228,7 @@ fn test_e2e_worker_lifecycle() {
 /// Tests that the coordinator handles acceptance timeout gracefully when
 /// not enough workers connect within the timeout window.
 ///
-/// Spawns only the coordinator (no workers) with `--workers 2
+/// Spawns only the coordinator (no workers) with `--min-workers 2
 /// --acceptance-timeout 3`. The HTTP server starts immediately (serving
 /// the dashboard) but requests fail because no pipeline is available.
 #[test]
@@ -241,7 +241,7 @@ fn test_e2e_acceptance_timeout() {
         .args([
             "--model", model.to_str().unwrap(),
             "--listen", "127.0.0.1:9413",
-            "--workers", "2",
+            "--min-workers", "2",
             "--http-port", "8094",
             "--acceptance-timeout", "3",
         ])
@@ -399,7 +399,7 @@ fn test_e2e_network_failure_detection() {
         .args([
             "--model", model.to_str().unwrap(),
             "--listen", &format!("127.0.0.1:{COORD_PORT}"),
-            "--workers", "1",
+            "--min-workers", "1",
             "--http-port", &HTTP_PORT.to_string(),
             "--scheduling", "equal",
         ])
@@ -800,7 +800,7 @@ fn test_e2e_batched_worker_death_aborts_requests() {
         .args([
             "--model", model.to_str().unwrap(),
             "--listen", &format!("127.0.0.1:{COORD_PORT}"),
-            "--workers", "1",
+            "--min-workers", "1",
             "--http-port", &HTTP_PORT.to_string(),
             "--scheduling", "equal",
             "--batched",
@@ -918,7 +918,7 @@ fn test_e2e_worker_reconnection_recovery() {
         .args([
             "--model", model.to_str().unwrap(),
             "--listen", &format!("127.0.0.1:{COORD_PORT}"),
-            "--workers", "1",
+            "--min-workers", "1",
             "--http-port", &HTTP_PORT.to_string(),
             "--scheduling", "equal",
             "--batched",

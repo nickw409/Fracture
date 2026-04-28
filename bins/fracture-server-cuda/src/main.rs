@@ -19,6 +19,28 @@ async fn main() -> Result<()> {
 
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
+
+    // Reject unknown flags up front so typos fail loudly instead of being
+    // silently ignored by the hand-rolled arg parser.
+    const KNOWN_FLAGS: &[&str] = &[
+        "config",
+        "max-seq-len",
+        "model",
+        "port",
+        "tokenizer",
+    ];
+    if let Err(unknown) = fracture_core::env_config::validate_known_flags(&args, KNOWN_FLAGS) {
+        anyhow::bail!(
+            "unknown CLI flag: --{unknown}\n\
+             known flags: {}",
+            KNOWN_FLAGS
+                .iter()
+                .map(|f| format!("--{f}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let model_path = args
         .iter()
         .position(|a| a == "--model")

@@ -96,6 +96,33 @@ fn parse_env_file(path: &str) -> std::io::Result<FractureConfig> {
     Ok(FractureConfig { values })
 }
 
+/// Validate that every `--<name>` token in `args` is present in `known`.
+/// Returns the offending flag name (without leading `--`) on the first
+/// unknown match.
+///
+/// Skips `args[0]` (binary path) and the bare `--` separator. Strips
+/// `=value` suffixes before matching, so both `--flag value` and
+/// `--flag=value` forms work. Tokens that don't start with `--` are
+/// treated as positional values and ignored.
+pub fn validate_known_flags(args: &[String], known: &[&str]) -> Result<(), String> {
+    for arg in args.iter().skip(1) {
+        if arg == "--" {
+            continue;
+        }
+        let Some(rest) = arg.strip_prefix("--") else {
+            continue;
+        };
+        let name = rest.split('=').next().unwrap_or(rest);
+        if name.is_empty() {
+            continue;
+        }
+        if !known.contains(&name) {
+            return Err(name.to_string());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +198,63 @@ mod tests {
         let (config, loaded_path) = load_config(&args);
         assert!(loaded_path.is_none());
         assert_eq!(config.get("ANYTHING"), None);
+    }
+
+    #[test]
+    fn test_validate_known_flags_accepts_known() {
+        let args: Vec<String> = ["bin", "--model", "x.gguf", "--port", "8080"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(validate_known_flags(&args, &["model", "port"]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_known_flags_rejects_unknown() {
+        let args: Vec<String> = ["bin", "--model", "x.gguf", "--workers", "1"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            validate_known_flags(&args, &["model", "min-workers"]),
+            Err("workers".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_known_flags_handles_equals_form() {
+        let args: Vec<String> = ["bin", "--model=x.gguf", "--bogus=value"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            validate_known_flags(&args, &["model"]),
+            Err("bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_known_flags_skips_positional_values() {
+        // Values that follow flags must NOT be matched against the known list.
+        let args: Vec<String> = ["bin", "--listen", "127.0.0.1:9400"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(validate_known_flags(&args, &["listen"]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_known_flags_ignores_double_dash_separator() {
+        let args: Vec<String> = ["bin", "--model", "x.gguf", "--", "extra"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(validate_known_flags(&args, &["model"]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_known_flags_empty_args() {
+        let args: Vec<String> = vec!["bin".to_string()];
+        assert!(validate_known_flags(&args, &["model"]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_known_flags_first_unknown_wins() {
+        let args: Vec<String> = ["bin", "--first-bad", "--second-bad"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            validate_known_flags(&args, &[]),
+            Err("first-bad".to_string())
+        );
     }
 }
