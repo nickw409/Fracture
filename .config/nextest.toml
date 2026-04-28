@@ -1,3 +1,5 @@
+experimental = ["setup-scripts"]
+
 [test-groups.gpu-memory-sensitive]
 # Tests that need exclusive GPU access: model-validation tests load the full
 # 15GB Llama 3.1 8B model, and memory-measurement tests need a stable baseline.
@@ -24,3 +26,15 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(fracture-coordinator-cuda)'
 test-group = 'e2e-distributed'
+
+# E2E tests in fracture-coordinator-cuda spawn the release binaries from
+# target/release/. Without this setup script those binaries can be stale,
+# producing handshake failures that look like "pipeline not ready in 60s".
+# Running the release build via the setup script keeps them in sync with
+# HEAD automatically whenever the e2e group is exercised.
+[scripts.setup.build-release-bins]
+command = 'cargo build --release -p fracture-coordinator-cuda -p fracture-worker-cuda'
+
+[[profile.default.scripts]]
+filter = 'package(fracture-coordinator-cuda)'
+setup = ['build-release-bins']
