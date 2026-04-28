@@ -418,6 +418,7 @@ fn test_gpu_cache_freed_after_generation() {
 
 /// Helper: run a 2-node split forward on a single engine by calling forward_node()
 /// twice (head config, then tail config) and chaining the activation tensor.
+#[allow(clippy::too_many_arguments)] // Test helper threading head+tail engine state.
 fn split_forward(
     engine: &Engine<CudaBackend>,
     token_ids: &[u32],
@@ -715,7 +716,7 @@ fn test_paged_vs_contiguous_decode_steps() {
         let pos = (prompt.len() + step) as u32;
         cont_logits = engine
             .forward(&[token], &[pos], &mut cont_cache, cont_handle, None)
-            .expect(&format!("cont decode step {step}"));
+            .unwrap_or_else(|_| panic!("cont decode step {step}"));
     }
     cont_cache.free(cont_handle, engine.backend()).expect("free");
 
@@ -749,7 +750,7 @@ fn test_paged_vs_contiguous_decode_steps() {
         let pos = (prompt.len() + step) as u32;
         paged_logits = engine
             .forward_paged(&[token], &[pos], &mut paged_cache, paged_handle)
-            .expect(&format!("paged decode step {step}"));
+            .unwrap_or_else(|_| panic!("paged decode step {step}"));
     }
     paged_cache.free(paged_handle).expect("free");
     paged_cache.destroy(engine.backend()).expect("pool destroy");
@@ -818,7 +819,7 @@ fn test_paged_vs_contiguous_multi_block() {
         let pos = (prompt.len() + step) as u32;
         cont_logits = engine
             .forward(&[token], &[pos], &mut cont_cache, cont_handle, None)
-            .expect(&format!("cont decode step {step}"));
+            .unwrap_or_else(|_| panic!("cont decode step {step}"));
     }
     cont_cache.free(cont_handle, engine.backend()).expect("free");
 
@@ -845,7 +846,7 @@ fn test_paged_vs_contiguous_multi_block() {
         let pos = (prompt.len() + step) as u32;
         paged_logits = engine
             .forward_paged(&[token], &[pos], &mut paged_cache, paged_handle)
-            .expect(&format!("paged decode step {step}"));
+            .unwrap_or_else(|_| panic!("paged decode step {step}"));
     }
 
     // Verify block table spans 3 blocks: ceil(35/16) = 3
