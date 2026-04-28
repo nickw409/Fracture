@@ -1,3 +1,7 @@
+// Index-based for loops over fixed test ranges read more clearly than
+// `enumerate().take(n).skip(1)` in assertion-heavy test setups.
+#![allow(clippy::needless_range_loop)]
+
 use super::*;
 use fracture_core::{Backend, DType, DeviceTensor, DeviceTimer, FractureError, TensorId};
 use half::f16;

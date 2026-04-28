@@ -190,6 +190,10 @@ impl ElectionAgent {
 
 #[cfg(test)]
 mod tests {
+    // Index-based for loops over fixed test ranges read more clearly than
+    // `enumerate()` chains in assertion-heavy tests.
+    #![allow(clippy::needless_range_loop)]
+
     use super::*;
 
     fn agent(id: &str, priority: u32) -> ElectionAgent {
