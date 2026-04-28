@@ -216,7 +216,7 @@ mod tests {
     fn test_unsupported_compression_rejected() {
         let mut header = make_header(&[1, 4096], DType::FP16, 8192);
         header.compression = 1; // LZ4 — not supported in Phase 3
-        let mut bytes = encode_tensor_header(&header);
+        let bytes = encode_tensor_header(&header);
         // Manually set compression byte to 1
         // ndim(2) + shape(8) = 10 bytes, then dtype(1), then compression at offset 11
         let result = decode_tensor_header(&bytes);

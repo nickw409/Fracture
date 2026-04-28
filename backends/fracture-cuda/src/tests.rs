@@ -83,7 +83,7 @@ fn test_copy_rows() {
     let src = alloc_with_data(&b, &[4, 2], &src_data);
     // dst: 4 rows, initially zero
     let dst = b.alloc(&[4, 2], DType::FP16).unwrap();
-    let zeros = to_fp16_bytes(&vec![0.0; 8]);
+    let zeros = to_fp16_bytes(&[0.0; 8]);
     b.copy_to_device(&dst, &zeros).unwrap();
 
     // Copy rows 1..3 from src to dst at offset 2
@@ -2915,8 +2915,8 @@ fn test_matmul_gqa_kv_correctness() {
 #[test]
 fn test_silu_mul_shape_mismatch() {
     let b = make_backend();
-    let gate = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
-    let up = alloc_with_data(&b, &[2, 3], &vec![1.0; 6]);
+    let gate = alloc_with_data(&b, &[2, 4], &[1.0; 8]);
+    let up = alloc_with_data(&b, &[2, 3], &[1.0; 6]);
     let out = b.alloc(&[2, 4], DType::FP16).unwrap();
 
     let err = b.silu_mul(&gate, &up, &out);
@@ -2932,8 +2932,8 @@ fn test_silu_mul_shape_mismatch() {
 #[test]
 fn test_add_shape_mismatch() {
     let b = make_backend();
-    let a = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
-    let bt = alloc_with_data(&b, &[3, 4], &vec![1.0; 12]);
+    let a = alloc_with_data(&b, &[2, 4], &[1.0; 8]);
+    let bt = alloc_with_data(&b, &[3, 4], &[1.0; 12]);
     let out = b.alloc(&[2, 4], DType::FP16).unwrap();
 
     let err = b.add(&a, &bt, &out);
@@ -2950,8 +2950,8 @@ fn test_add_shape_mismatch() {
 fn test_gemm_dimension_mismatch() {
     let b = make_backend();
     // A is [2, 4], B is [3, 5] -> K mismatch (4 != 5)
-    let a = alloc_with_data(&b, &[2, 4], &vec![1.0; 8]);
-    let bt = alloc_with_data(&b, &[3, 5], &vec![1.0; 15]);
+    let a = alloc_with_data(&b, &[2, 4], &[1.0; 8]);
+    let bt = alloc_with_data(&b, &[3, 5], &[1.0; 15]);
     let out = b.alloc(&[2, 3], DType::FP16).unwrap();
 
     let err = b.matmul(&a, &bt, &out);
@@ -2970,7 +2970,7 @@ fn test_gemm_dimension_mismatch() {
 fn test_copy_rows_shape_compatibility() {
     let b = make_backend();
     // src has 3 columns, dst has 4 columns -> mismatch
-    let src = alloc_with_data(&b, &[4, 3], &vec![1.0; 12]);
+    let src = alloc_with_data(&b, &[4, 3], &[1.0; 12]);
     let dst = b.alloc(&[4, 4], DType::FP16).unwrap();
 
     let err = b.copy_rows(&src, &dst, 0, 0, 2);
@@ -2985,7 +2985,7 @@ fn test_copy_rows_shape_compatibility() {
 #[test]
 fn test_copy_rows_dtype_mismatch() {
     let b = make_backend();
-    let src = alloc_with_data(&b, &[4, 3], &vec![1.0; 12]);
+    let src = alloc_with_data(&b, &[4, 3], &[1.0; 12]);
     let dst = b.alloc(&[4, 3], DType::FP32).unwrap();
 
     let err = b.copy_rows(&src, &dst, 0, 0, 2);

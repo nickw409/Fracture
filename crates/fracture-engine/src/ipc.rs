@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_logits_response_roundtrip() {
-        let logits = vec![1.0f32, 2.0, -3.5];
+        let logits = [1.0f32, 2.0, -3.5];
         let payload: Vec<u8> = logits.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let msg = IpcMessage::ForwardResponse {

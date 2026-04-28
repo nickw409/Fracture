@@ -463,7 +463,7 @@ mod tests {
 
         // All see each other's ElectionStarts.
         // Track whether each node received a challenge from its perspective.
-        let mut challenged = vec![false; 5];
+        let mut challenged = [false; 5];
         for sender in 0..5 {
             for receiver in 0..5 {
                 if sender == receiver {

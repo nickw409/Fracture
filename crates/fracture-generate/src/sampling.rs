@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn test_temperature_scaling_flattens_distribution() {
         // With high temperature, softmax should produce more uniform probs
-        let logits = vec![10.0, 0.0];
+        let logits = [10.0, 0.0];
 
         // Low temperature (near greedy) - diff should be large
         let low_temp: Vec<f32> = logits.iter().map(|&l| l / 0.1).collect();
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_softmax_valid_distribution() {
         // Verify that the softmax over logits with temp=1.0 produces a valid distribution
-        let logits = vec![1.0, 3.0, 2.0, 0.5, 0.1];
+        let logits = [1.0, 3.0, 2.0, 0.5, 0.1];
 
         // Manually compute softmax
         let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

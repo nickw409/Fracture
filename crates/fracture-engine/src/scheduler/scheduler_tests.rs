@@ -171,7 +171,7 @@ fn test_scheduler_max_batch_tokens_limit() {
 #[test]
 fn test_scheduler_cleanup_on_max_tokens() {
     let backend = MockBackend::new();
-    let mut cache = make_cache(&backend);
+    let _cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -241,7 +241,7 @@ fn test_scheduler_cleanup_sends_length_event() {
 #[test]
 fn test_scheduler_cleanup_on_stop_token() {
     let backend = MockBackend::new();
-    let mut cache = make_cache(&backend);
+    let _cache = make_cache(&backend);
     let mut sched = BatchScheduler::new(64, 4096, 512, 0.1);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
