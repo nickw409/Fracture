@@ -831,7 +831,7 @@ async fn test_streaming_finish_reason() {
             let j: serde_json::Value = serde_json::from_str(e).ok()?;
             if !j["choices"][0]["finish_reason"].is_null() { Some(j) } else { None }
         })
-        .last()
+        .next_back()
         .expect("must have a final chunk with finish_reason");
 
     let finish_reason = final_chunk["choices"][0]["finish_reason"].as_str().unwrap();
@@ -871,7 +871,7 @@ async fn test_streaming_finish_reason_length() {
             let j: serde_json::Value = serde_json::from_str(e).ok()?;
             if !j["choices"][0]["finish_reason"].is_null() { Some(j) } else { None }
         })
-        .last()
+        .next_back()
         .expect("must have a final chunk with finish_reason");
 
     let finish_reason = final_chunk["choices"][0]["finish_reason"].as_str().unwrap();

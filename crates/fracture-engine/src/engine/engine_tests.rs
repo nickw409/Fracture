@@ -1103,7 +1103,7 @@ fn test_single_layer_operation_sequence() {
     // Verify final norm and lm_head matmul appear after the layer ops.
     let tail_rmsnorm = ops[search_from.saturating_sub(1)..].iter().position(|&op| op == "rmsnorm");
     assert!(
-        tail_rmsnorm.is_some() || ops[search_from..].iter().any(|&op| op == "rmsnorm"),
+        tail_rmsnorm.is_some() || ops[search_from..].contains(&"rmsnorm"),
         "output rmsnorm should appear after layer ops. ops so far: {ops:?}"
     );
 

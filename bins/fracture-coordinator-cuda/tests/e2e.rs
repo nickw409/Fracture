@@ -482,9 +482,8 @@ fn test_e2e_network_failure_detection() {
                 // in the JSON, or check that health now reports not-ready.
                 let body: serde_json::Value = resp.json().unwrap_or(serde_json::json!({}));
                 let has_error = body.get("error").is_some()
-                    || body["choices"][0]["finish_reason"]
-                        .as_str()
-                        .map_or(false, |r| r == "error");
+                    || (body["choices"][0]["finish_reason"]
+                        .as_str() == Some("error"));
                 if !has_error {
                     // Verify health degraded after the kill.
                     std::thread::sleep(Duration::from_secs(2));
@@ -1021,7 +1020,7 @@ fn test_e2e_worker_reconnection_recovery() {
         if let Ok(r) = result
             && r.status().is_success() {
                 let body: serde_json::Value = r.json().unwrap_or_default();
-                if body["choices"][0]["text"].as_str().map_or(false, |t| !t.is_empty()) {
+                if body["choices"][0]["text"].as_str().is_some_and(|t| !t.is_empty()) {
                     recovered = true;
                     // Step 5: Verify output is identical (greedy determinism).
                     let text_after = body["choices"][0]["text"].as_str().unwrap();

@@ -402,11 +402,7 @@ fn test_gpu_cache_freed_after_generation() {
     // Allow 8 MB tolerance for CUDA allocator fragmentation, suballocator
     // rounding, and internal cuBLAS workspace state
     let tolerance = 8 * 1024 * 1024;
-    let leaked = if mem_before > mem_after {
-        mem_before - mem_after
-    } else {
-        0
-    };
+    let leaked = mem_before.saturating_sub(mem_after);
     assert!(
         leaked < tolerance,
         "potential GPU memory leak: {leaked} bytes not reclaimed (before={mem_before}, after={mem_after})"

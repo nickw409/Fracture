@@ -851,8 +851,8 @@ mod tests {
             };
             write_message(&mut stream, &req).expect("client failed to write request");
 
-            let response = read_message(&mut stream).expect("client failed to read response");
-            response
+            
+            read_message(&mut stream).expect("client failed to read response")
         });
 
         server.serve_one(&listener, &backend).expect("serve_one failed");
@@ -908,8 +908,8 @@ mod tests {
                 .expect("client failed to connect");
             write_message(&mut stream, &IpcMessage::InfoRequest)
                 .expect("client failed to write InfoRequest");
-            let response = read_message(&mut stream).expect("client failed to read InfoResponse");
-            response
+            
+            read_message(&mut stream).expect("client failed to read InfoResponse")
         });
 
         server.serve_one(&listener, &backend).expect("serve_one failed");

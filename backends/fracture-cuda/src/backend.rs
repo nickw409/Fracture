@@ -652,7 +652,7 @@ impl Backend for CudaBackend {
         ));
 
         // Copy pointer arrays to device (4 arrays)
-        let ptr_size = |ptrs: &[*const c_void]| ptrs.len() * std::mem::size_of::<*const c_void>();
+        let ptr_size = |ptrs: &[*const c_void]| std::mem::size_of_val(ptrs);
 
         let mut kp_dev: *mut c_void = std::ptr::null_mut();
         cuda_check!(cudaMalloc(&mut kp_dev, ptr_size(&kp_ptrs)));

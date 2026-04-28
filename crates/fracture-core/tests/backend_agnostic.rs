@@ -48,7 +48,7 @@ fn test_engine_never_accesses_device_pointers() {
 
     for entry in std::fs::read_dir(&engine_src).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().map_or(true, |e| e != "rs") {
+        if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
         let content = std::fs::read_to_string(&path).unwrap();
