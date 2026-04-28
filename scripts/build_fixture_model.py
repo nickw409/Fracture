@@ -13,6 +13,26 @@ import torch
 from gguf import GGUFWriter
 
 
+def permute_qk_for_gguf(weight: np.ndarray, num_heads: int, head_dim: int) -> np.ndarray:
+    """Permute an HF-layout Q or K weight matrix into GGUF interleaved layout.
+
+    Mirrors what llama.cpp's convert_hf_to_gguf.py applies to Q/K weights. The
+    inverse is fracture-gguf's reverse_qk_permutation, applied at load time.
+
+    Input shape: (num_heads * head_dim, hidden)
+    """
+    assert weight.shape[0] == num_heads * head_dim, (
+        f"weight rows {weight.shape[0]} != num_heads*head_dim "
+        f"{num_heads}*{head_dim}={num_heads * head_dim}"
+    )
+    half = head_dim // 2
+    w = weight.reshape(num_heads, head_dim, -1)
+    out = np.empty_like(w)
+    out[:, 0::2, :] = w[:, :half, :]
+    out[:, 1::2, :] = w[:, half:, :]
+    return out.reshape(weight.shape)
+
+
 def build(config_path: Path, output_path: Path) -> None:
     cfg = json.loads(config_path.read_text())
     torch.manual_seed(cfg["seed"])
@@ -58,8 +78,14 @@ def build(config_path: Path, output_path: Path) -> None:
     writer.add_tensor("token_embd.weight", randn(vocab, hidden))
     for i in range(n_layers):
         writer.add_tensor(f"blk.{i}.attn_norm.weight", ones(hidden))
-        writer.add_tensor(f"blk.{i}.attn_q.weight", randn(hidden, hidden))
-        writer.add_tensor(f"blk.{i}.attn_k.weight", randn(kv_dim, hidden))
+        writer.add_tensor(
+            f"blk.{i}.attn_q.weight",
+            permute_qk_for_gguf(randn(hidden, hidden), n_q, head_dim),
+        )
+        writer.add_tensor(
+            f"blk.{i}.attn_k.weight",
+            permute_qk_for_gguf(randn(kv_dim, hidden), n_kv, head_dim),
+        )
         writer.add_tensor(f"blk.{i}.attn_v.weight", randn(kv_dim, hidden))
         writer.add_tensor(f"blk.{i}.attn_output.weight", randn(hidden, hidden))
         writer.add_tensor(f"blk.{i}.ffn_norm.weight", ones(hidden))
