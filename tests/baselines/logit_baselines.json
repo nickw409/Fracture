@@ -7,16 +7,16 @@
       "notes": "Captured 2026-04-28 from fixture model"
     },
     "real/prompt_0/prefill": {
-      "max_abs_error": 0.0,
-      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+      "max_abs_error": 0.019531,
+      "notes": "Captured 2026-04-28 from Llama 3.1 8B Instruct FP16 GGUF"
     },
     "real/prompt_1/prefill": {
-      "max_abs_error": 0.0,
-      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+      "max_abs_error": 0.023438,
+      "notes": "Captured 2026-04-28 from Llama 3.1 8B Instruct FP16 GGUF"
     },
     "real/decode_step_0": {
-      "max_abs_error": 0.0,
-      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+      "max_abs_error": 0.015625,
+      "notes": "Captured 2026-04-28 from Llama 3.1 8B Instruct FP16 GGUF"
     }
   }
 }
