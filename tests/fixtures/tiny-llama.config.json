@@ -1,0 +1,14 @@
+{
+  "architecture": "llama",
+  "num_layers": 4,
+  "hidden_size": 128,
+  "num_q_heads": 4,
+  "num_kv_heads": 2,
+  "head_dim": 32,
+  "intermediate_size": 256,
+  "vocab_size": 256,
+  "rope_theta": 500000.0,
+  "rms_norm_eps": 1e-5,
+  "max_position_embeddings": 256,
+  "seed": 42
+}
