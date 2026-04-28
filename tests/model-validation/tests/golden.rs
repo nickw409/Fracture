@@ -9,7 +9,7 @@
 //!
 //! Tests skip gracefully when either is missing.
 
-use fracture_engine::KvCacheManager;
+use fracture_engine::PagedKvCacheManager;
 use fracture_generate::{GenerationConfig, GenerationLoop};
 use fracture_model_validation::*;
 use fracture_validation::golden_compare::{compare_token_sequences, load_golden_tokens};
@@ -52,13 +52,18 @@ fn test_golden_generation(prompt_index: usize) {
     let golden_tokens =
         load_golden_tokens(golden_path.to_str().unwrap()).expect("failed to load golden tokens");
 
-    // Run generation with greedy decoding (temperature=0, no top-k/top-p)
-    let mut cache = KvCacheManager::new(
+    // Run generation with greedy decoding (temperature=0, no top-k/top-p).
+    // max_seq_len=2048 to avoid OOM (full 128K would use ~16GB just for the cache).
+    // Block size 16 hardcoded → 2048/16 + 2 = 130 blocks.
+    let num_blocks = 2048usize.div_ceil(16) + 2;
+    let mut cache = PagedKvCacheManager::new(
+        num_blocks,
         config.num_layers,
         config.num_kv_heads,
         config.head_dim,
-        2048, // small max_seq_len to avoid OOM (full 128K would use ~16GB for KV cache)
-    );
+        engine.backend(),
+    )
+    .expect("PagedKvCacheManager::new failed");
 
     let gen_config = GenerationConfig {
         max_tokens: 50,

@@ -237,7 +237,7 @@ fn test_streaming_not_exercised_note() {
 
 /// Concurrent request handling requires a running engine and multiple
 /// simultaneous HTTP connections. The current Phase 1 architecture uses a
-/// shared Mutex<KvCacheManager> which serializes all generation requests.
+/// shared Mutex<PagedKvCacheManager> which serializes all generation requests.
 /// True concurrent request testing requires:
 /// - Multiple tokio tasks issuing requests in parallel
 /// - A concrete Backend with actual GPU resources
@@ -338,11 +338,11 @@ fn test_gen_id_format() {
 
 // ── Full handler integration tests ──────────────────────────────
 //
-// These require an AppState with a mock Backend, Engine, KvCacheManager,
+// These require an AppState with a mock Backend, Engine, PagedKvCacheManager,
 // and Tokenizer. We build a minimal tokenizer from JSON.
 
 use fracture_core::{Backend, DType, DeviceTensor, DeviceTimer, ModelConfig, TensorId};
-use fracture_engine::{Engine, KvCacheManager};
+use fracture_engine::{Engine, PagedKvCacheManager};
 use fracture_gguf::{LayerWeights, WeightStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -391,6 +391,7 @@ impl Backend for ServerMockBackend {
     fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _: &DeviceTensor, _: &[i32], _: &[&DeviceTensor], _: &[&DeviceTensor], _: usize, _: usize, _: usize, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn device_name(&self) -> &str { "server-mock" }
     fn total_memory(&self) -> usize { 8 * 1024 * 1024 * 1024 } // 8 GB
     fn available_memory(&self) -> usize { 4 * 1024 * 1024 * 1024 } // 4 GB
@@ -470,10 +471,12 @@ fn make_test_app_state() -> std::sync::Arc<AppState<ServerMockBackend>> {
     let cfg = test_model_config();
     let backend = ServerMockBackend::new(cfg.vocab_size);
     let weights = test_weights(&cfg);
+    let num_blocks = cfg.max_seq_len.div_ceil(16) + 2;
+    let cache = std::sync::Mutex::new(
+        PagedKvCacheManager::new(num_blocks, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend)
+            .expect("PagedKvCacheManager::new failed in test setup"),
+    );
     let engine = std::sync::Arc::new(Engine::new(backend, weights, 0..cfg.num_layers));
-    let cache = std::sync::Mutex::new(KvCacheManager::new(
-        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
-    ));
     let tokenizer = make_test_tokenizer();
     std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
 }
@@ -1064,6 +1067,7 @@ impl Backend for NeverEosMockBackend {
     fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _: &DeviceTensor, _: &[i32], _: &[&DeviceTensor], _: &[&DeviceTensor], _: usize, _: usize, _: usize, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn device_name(&self) -> &str { "never-eos-mock" }
     fn total_memory(&self) -> usize { 8 * 1024 * 1024 * 1024 }
     fn available_memory(&self) -> usize { 4 * 1024 * 1024 * 1024 }
@@ -1078,10 +1082,12 @@ fn make_never_eos_app_state() -> std::sync::Arc<AppState<NeverEosMockBackend>> {
     let cfg = test_model_config();
     let backend = NeverEosMockBackend::new(cfg.vocab_size);
     let weights = test_weights(&cfg);
+    let num_blocks = cfg.max_seq_len.div_ceil(16) + 2;
+    let cache = std::sync::Mutex::new(
+        PagedKvCacheManager::new(num_blocks, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend)
+            .expect("PagedKvCacheManager::new failed in test setup"),
+    );
     let engine = std::sync::Arc::new(Engine::new(backend, weights, 0..cfg.num_layers));
-    let cache = std::sync::Mutex::new(KvCacheManager::new(
-        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
-    ));
     let tokenizer = make_test_tokenizer();
     std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
 }
@@ -1115,6 +1121,7 @@ impl Backend for ErrorMockBackend {
     fn embedding(&self, _: &[u32], _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn add(&self, _: &DeviceTensor, _: &DeviceTensor, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn copy_rows(&self, _: &DeviceTensor, _: &DeviceTensor, _: usize, _: usize, _: usize) -> fracture_core::Result<()> { Ok(()) }
+    fn attention_paged(&self, _: &DeviceTensor, _: &[i32], _: &[&DeviceTensor], _: &[&DeviceTensor], _: usize, _: usize, _: usize, _: &DeviceTensor) -> fracture_core::Result<()> { Ok(()) }
     fn device_name(&self) -> &str { "error-mock" }
     fn total_memory(&self) -> usize { 8 * 1024 * 1024 * 1024 }
     fn available_memory(&self) -> usize { 4 * 1024 * 1024 * 1024 }
@@ -1129,10 +1136,12 @@ fn make_error_app_state() -> std::sync::Arc<AppState<ErrorMockBackend>> {
     let cfg = test_model_config();
     let backend = ErrorMockBackend::new();
     let weights = test_weights(&cfg);
+    let num_blocks = cfg.max_seq_len.div_ceil(16) + 2;
+    let cache = std::sync::Mutex::new(
+        PagedKvCacheManager::new(num_blocks, cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, &backend)
+            .expect("PagedKvCacheManager::new failed in test setup"),
+    );
     let engine = std::sync::Arc::new(Engine::new(backend, weights, 0..cfg.num_layers));
-    let cache = std::sync::Mutex::new(KvCacheManager::new(
-        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len,
-    ));
     let tokenizer = make_test_tokenizer();
     std::sync::Arc::new(AppState { engine, cache, tokenizer, dashboard: make_test_dashboard_state() })
 }
