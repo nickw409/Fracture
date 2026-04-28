@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Dump reference tensors from Llama 3.1 8B Instruct for Fracture numerical validation.
+Dump reference tensors for Fracture numerical validation.
 
-Loads meta-llama/Meta-Llama-3.1-8B-Instruct in FP16 on CUDA, hooks into every layer
-to capture intermediate activations, and writes tensor files to tests/reference/.
+Two modes:
+- `--mode hf`: load a HuggingFace Llama checkpoint (e.g. Llama 3.1 8B Instruct) in
+  FP16 on CUDA and dump per-layer activations + greedy golden outputs.
+- `--mode fixture`: build a PyTorch Llama from a tiny seeded GGUF fixture (same
+  weights the Fracture runtime loads) so reference data is reproducible without
+  needing a real model checkpoint.
 
-Also generates greedy decoding golden outputs to tests/golden/.
+Hooks every transformer layer to capture intermediate activations and writes
+tensor files under `--output-dir`. Greedy generation goldens go under `--golden-dir`.
 
 Binary format per tensor file:
     [4 bytes: ndim (u32 LE)]
@@ -16,9 +21,22 @@ Binary format per tensor file:
 All intermediate tensors are stored as float32 for maximum reference precision.
 
 Usage:
-    python scripts/dump_reference.py
-    python scripts/dump_reference.py --model-path /data/models/llama-3.1-8b-instruct
-    python scripts/dump_reference.py --layers 0,1,31
+    # Real model (HuggingFace directory):
+    python scripts/dump_reference.py \\
+        --mode hf \\
+        --model-path /data/models/llama-3.1-8b-instruct \\
+        --output-dir tests/reference \\
+        --golden-dir tests/golden \\
+        --layers 0,8,16,24,last
+
+    # Tiny fixture model (committed GGUF):
+    python scripts/dump_reference.py \\
+        --mode fixture \\
+        --model-path tests/fixtures/tiny-llama.gguf \\
+        --config-path tests/fixtures/tiny-llama.config.json \\
+        --output-dir tests/reference-fixture \\
+        --golden-dir tests/golden-fixture \\
+        --layers all
 """
 
 from __future__ import annotations
