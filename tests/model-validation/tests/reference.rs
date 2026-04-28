@@ -154,6 +154,42 @@ fn test_prefill_logits_prompt_1() {
 }
 
 // ---------------------------------------------------------------------------
+// Fixture full-forward test (always-on)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixture_full_forward_greedy_matches_pytorch() {
+    let Some((engine, config)) = fracture_model_validation::setup_fixture_engine() else {
+        eprintln!("skip: CUDA unavailable");
+        return;
+    };
+
+    let ref_dir = fracture_model_validation::fixture_reference_dir().join("prompt_0");
+    let meta_path = ref_dir.join("metadata.json");
+    let meta: PrefillMetadata = serde_json::from_str(
+        &std::fs::read_to_string(&meta_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", meta_path.display())),
+    )
+    .expect("metadata.json parse failed");
+
+    let (engine_logits, mut cache, handle) = run_prefill(&engine, &config, &meta.token_ids);
+    cache.free(handle, engine.backend()).unwrap();
+
+    let engine_greedy = engine_logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0 as u32;
+
+    assert_eq!(
+        engine_greedy, meta.greedy_token,
+        "fixture greedy mismatch: engine={engine_greedy}, ref={}",
+        meta.greedy_token
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Decode step test
 // ---------------------------------------------------------------------------
 

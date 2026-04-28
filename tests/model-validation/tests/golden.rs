@@ -146,3 +146,73 @@ fn test_golden_generation_prompt_0() {
 fn test_golden_generation_prompt_1() {
     test_golden_generation(1);
 }
+
+// ---------------------------------------------------------------------------
+// Fixture golden generation test (always-on)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixture_golden_generation_20_tokens_exact() {
+    let Some((engine, config)) = fracture_model_validation::setup_fixture_engine() else {
+        eprintln!("skip: CUDA unavailable");
+        return;
+    };
+
+    let golden_path = fracture_model_validation::fixture_golden_dir()
+        .join("prompt_0_greedy_20.bin");
+    let meta_path = fracture_model_validation::fixture_golden_dir()
+        .join("prompt_0_greedy_20_meta.json");
+
+    let meta: GoldenMetadata = serde_json::from_str(
+        &std::fs::read_to_string(&meta_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", meta_path.display())),
+    )
+    .expect("meta parse failed");
+
+    let golden_tokens =
+        load_golden_tokens(golden_path.to_str().unwrap()).expect("load golden");
+
+    // Cache sized for max_seq_len (256) at block size 16.
+    let max_seq = config.max_seq_len.min(256);
+    let num_blocks = max_seq.div_ceil(16) + 2;
+    let mut cache = PagedKvCacheManager::new(
+        num_blocks,
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        engine.backend(),
+    )
+    .expect("PagedKvCacheManager::new");
+
+    let gen_config = GenerationConfig {
+        max_tokens: 20,
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        stop_tokens: vec![],
+        seed: None,
+    };
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let result = GenerationLoop::generate(
+        &engine,
+        &meta.prompt_token_ids,
+        &gen_config,
+        &mut cache,
+        &tx,
+    )
+    .expect("generation failed");
+
+    // Build full sequence: prompt + generated.
+    let mut engine_full: Vec<u32> = meta.prompt_token_ids.clone();
+    engine_full.extend_from_slice(&result.tokens);
+
+    let cmp = compare_token_sequences(&engine_full, &golden_tokens);
+    assert!(
+        cmp.matches(),
+        "fixture golden tokens diverge at index {:?}: engine={:?} ref={:?}",
+        cmp.divergence_index,
+        cmp.actual_token_at_divergence,
+        cmp.expected_token_at_divergence,
+    );
+}
