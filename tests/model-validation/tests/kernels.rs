@@ -717,3 +717,718 @@ fn test_kernel_rmsnorm_final() {
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Fixture-driven per-kernel tests (always-on, 4-layer tiny model)
+// ---------------------------------------------------------------------------
+//
+// These tests use the committed `tests/fixtures/tiny-llama.gguf` and
+// `tests/reference-fixture/` dumps. They do NOT skip when the real Llama
+// model is unavailable — they only skip when CUDA itself is unavailable.
+
+mod fixture {
+    use super::*;
+    use fracture_model_validation::{fixture_model_path, fixture_reference_dir};
+
+    /// Reference path for the fixture, prompt 0 prefill.
+    fn fixture_prefill_ref(relative: &str) -> String {
+        fixture_reference_dir()
+            .join("prompt_0")
+            .join(relative)
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Set up backend + fixture weights + config. Panics if fixture missing.
+    /// Returns None only if CUDA is unavailable.
+    fn setup_fixture_backend() -> Option<(CudaBackend, WeightStore, ModelConfig)> {
+        let path = fixture_model_path();
+        assert!(
+            path.exists(),
+            "fixture missing at {}; run scripts/build_fixture_model.py",
+            path.display()
+        );
+        let mut backend = CudaBackend::new(0).ok()?;
+        let weights = WeightStore::load(&path, &backend, None).expect("fixture load failed");
+        let config = weights.config.clone();
+        backend
+            .precompute_rope_freqs(config.head_dim, config.rope_theta)
+            .ok()?;
+        Some((backend, weights, config))
+    }
+
+    macro_rules! cuda_or_skip {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => {
+                    eprintln!("skip: CUDA unavailable");
+                    return;
+                }
+            }
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding (single test, not per-layer)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fixture_kernel_embedding() {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let expected = load_ref(&fixture_prefill_ref("embeddings.bin"));
+        let seq_len = expected.shape[0];
+        let token_ids_ref = load_ref(&fixture_prefill_ref("token_ids.bin"));
+        let token_ids: Vec<u32> = token_ids_ref
+            .to_f32()
+            .iter()
+            .map(|&v| v as u32)
+            .collect();
+        let output = backend
+            .alloc(&[seq_len, config.hidden_size], DType::FP16)
+            .unwrap();
+        backend
+            .embedding(&token_ids, &weights.token_embedding, &output)
+            .unwrap();
+        assert_kernel_close(&backend, &output, &expected, RTOL, ATOL, "fixture_embedding");
+        backend.free(&output).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // RMSNorm (attn) — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_rmsnorm_attn(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/input_hidden.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_attn_norm.bin"
+        )));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.hidden_size], DType::FP16)
+            .unwrap();
+        backend
+            .rmsnorm(
+                &dev_input,
+                &weights.layers[layer].attn_norm,
+                config.rms_norm_eps,
+                &dev_output,
+            )
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            LOOSE_RTOL,
+            LOOSE_ATOL,
+            &format!("fixture_rmsnorm_attn_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_rmsnorm_attn_layer0() {
+        run_fixture_rmsnorm_attn(0);
+    }
+    #[test]
+    fn fixture_rmsnorm_attn_layer1() {
+        run_fixture_rmsnorm_attn(1);
+    }
+    #[test]
+    fn fixture_rmsnorm_attn_layer2() {
+        run_fixture_rmsnorm_attn(2);
+    }
+    #[test]
+    fn fixture_rmsnorm_attn_layer3() {
+        run_fixture_rmsnorm_attn(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // RMSNorm (ffn) — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_rmsnorm_ffn(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_attn_residual.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_ffn_norm.bin"
+        )));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.hidden_size], DType::FP16)
+            .unwrap();
+        backend
+            .rmsnorm(
+                &dev_input,
+                &weights.layers[layer].ffn_norm,
+                config.rms_norm_eps,
+                &dev_output,
+            )
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            LOOSE_RTOL,
+            LOOSE_ATOL,
+            &format!("fixture_rmsnorm_ffn_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_rmsnorm_ffn_layer0() {
+        run_fixture_rmsnorm_ffn(0);
+    }
+    #[test]
+    fn fixture_rmsnorm_ffn_layer1() {
+        run_fixture_rmsnorm_ffn(1);
+    }
+    #[test]
+    fn fixture_rmsnorm_ffn_layer2() {
+        run_fixture_rmsnorm_ffn(2);
+    }
+    #[test]
+    fn fixture_rmsnorm_ffn_layer3() {
+        run_fixture_rmsnorm_ffn(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul Q proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_q_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_attn_norm.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/q.bin")));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.hidden_size], DType::FP16)
+            .unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].q_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_q_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_q_proj_layer0() {
+        run_fixture_matmul_q_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_q_proj_layer1() {
+        run_fixture_matmul_q_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_q_proj_layer2() {
+        run_fixture_matmul_q_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_q_proj_layer3() {
+        run_fixture_matmul_q_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul K proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_k_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_attn_norm.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/k.bin")));
+        let seq_len = input.shape[0];
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend.alloc(&[seq_len, kv_dim], DType::FP16).unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].k_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_k_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_k_proj_layer0() {
+        run_fixture_matmul_k_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_k_proj_layer1() {
+        run_fixture_matmul_k_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_k_proj_layer2() {
+        run_fixture_matmul_k_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_k_proj_layer3() {
+        run_fixture_matmul_k_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul V proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_v_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_attn_norm.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/v.bin")));
+        let seq_len = input.shape[0];
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend.alloc(&[seq_len, kv_dim], DType::FP16).unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].v_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_v_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_v_proj_layer0() {
+        run_fixture_matmul_v_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_v_proj_layer1() {
+        run_fixture_matmul_v_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_v_proj_layer2() {
+        run_fixture_matmul_v_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_v_proj_layer3() {
+        run_fixture_matmul_v_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul gate proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_gate_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_ffn_norm.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/gate.bin"
+        )));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.intermediate_size], DType::FP16)
+            .unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].gate_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_gate_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_gate_proj_layer0() {
+        run_fixture_matmul_gate_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_gate_proj_layer1() {
+        run_fixture_matmul_gate_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_gate_proj_layer2() {
+        run_fixture_matmul_gate_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_gate_proj_layer3() {
+        run_fixture_matmul_gate_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul up proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_up_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/post_ffn_norm.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/up.bin")));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.intermediate_size], DType::FP16)
+            .unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].up_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_up_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_up_proj_layer0() {
+        run_fixture_matmul_up_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_up_proj_layer1() {
+        run_fixture_matmul_up_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_up_proj_layer2() {
+        run_fixture_matmul_up_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_up_proj_layer3() {
+        run_fixture_matmul_up_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatMul down proj — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_matmul_down_proj(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/silu_mul.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/ffn_output.bin"
+        )));
+        let seq_len = input.shape[0];
+        let dev_input = upload_ref(&backend, &input, &[seq_len, config.intermediate_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.hidden_size], DType::FP16)
+            .unwrap();
+        backend
+            .matmul(&dev_input, &weights.layers[layer].down_proj, &dev_output)
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_matmul_down_proj_layer{layer}"),
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_matmul_down_proj_layer0() {
+        run_fixture_matmul_down_proj(0);
+    }
+    #[test]
+    fn fixture_matmul_down_proj_layer1() {
+        run_fixture_matmul_down_proj(1);
+    }
+    #[test]
+    fn fixture_matmul_down_proj_layer2() {
+        run_fixture_matmul_down_proj(2);
+    }
+    #[test]
+    fn fixture_matmul_down_proj_layer3() {
+        run_fixture_matmul_down_proj(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // SiLU × Mul — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_silu_mul(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let _ = weights;
+        let gate = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/gate.bin"
+        )));
+        let up = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/up.bin")));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/silu_mul.bin"
+        )));
+        let seq_len = gate.shape[0];
+        let dev_gate = upload_ref(&backend, &gate, &[seq_len, config.intermediate_size]);
+        let dev_up = upload_ref(&backend, &up, &[seq_len, config.intermediate_size]);
+        let dev_output = backend
+            .alloc(&[seq_len, config.intermediate_size], DType::FP16)
+            .unwrap();
+        backend.silu_mul(&dev_gate, &dev_up, &dev_output).unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            RTOL,
+            ATOL,
+            &format!("fixture_silu_mul_layer{layer}"),
+        );
+        backend.free(&dev_gate).unwrap();
+        backend.free(&dev_up).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_silu_mul_layer0() {
+        run_fixture_silu_mul(0);
+    }
+    #[test]
+    fn fixture_silu_mul_layer1() {
+        run_fixture_silu_mul(1);
+    }
+    #[test]
+    fn fixture_silu_mul_layer2() {
+        run_fixture_silu_mul(2);
+    }
+    #[test]
+    fn fixture_silu_mul_layer3() {
+        run_fixture_silu_mul(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // RoPE — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_rope(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let _ = weights;
+        let q_flat = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/q.bin")));
+        let k_flat = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/k.bin")));
+        let seq_len = q_flat.shape[0];
+        let dev_q = upload_ref(
+            &backend,
+            &q_flat,
+            &[seq_len, config.num_q_heads, config.head_dim],
+        );
+        let dev_k = upload_ref(
+            &backend,
+            &k_flat,
+            &[seq_len, config.num_kv_heads, config.head_dim],
+        );
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        backend
+            .rope(&dev_q, &dev_k, &positions, config.rope_theta, config.head_dim)
+            .unwrap();
+        let expected_q = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/q_rope.bin"
+        )));
+        let expected_k = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/k_rope.bin"
+        )));
+        // RoPE uses trig functions on FP16 — slightly higher tolerance,
+        // matching the real-model rope test.
+        let rope_rtol = 0.01;
+        let rope_atol = 0.025;
+        assert_kernel_close(
+            &backend,
+            &dev_q,
+            &expected_q,
+            rope_rtol,
+            rope_atol,
+            &format!("fixture_rope_q_layer{layer}"),
+        );
+        assert_kernel_close(
+            &backend,
+            &dev_k,
+            &expected_k,
+            rope_rtol,
+            rope_atol,
+            &format!("fixture_rope_k_layer{layer}"),
+        );
+        backend.free(&dev_q).unwrap();
+        backend.free(&dev_k).unwrap();
+    }
+
+    #[test]
+    fn fixture_rope_layer0() {
+        run_fixture_rope(0);
+    }
+    #[test]
+    fn fixture_rope_layer1() {
+        run_fixture_rope(1);
+    }
+    #[test]
+    fn fixture_rope_layer2() {
+        run_fixture_rope(2);
+    }
+    #[test]
+    fn fixture_rope_layer3() {
+        run_fixture_rope(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Attention (includes o_proj) — per layer
+    // -----------------------------------------------------------------------
+
+    fn run_fixture_attention(layer: usize) {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let q_rope_ref = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/q_rope.bin"
+        )));
+        let k_rope_ref = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/k_rope.bin"
+        )));
+        let v_ref = load_ref(&fixture_prefill_ref(&format!("layer_{layer:02}/v.bin")));
+        let expected = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{layer:02}/attn_output.bin"
+        )));
+        let seq_len = q_rope_ref.shape[0];
+        let num_q_heads = config.num_q_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let hidden = config.hidden_size;
+
+        let dev_q = upload_ref(&backend, &q_rope_ref, &[seq_len, num_q_heads, head_dim]);
+        let dev_k_cache = backend
+            .alloc(&[seq_len, num_kv_heads, head_dim], DType::FP16)
+            .unwrap();
+        let dev_v_cache = backend
+            .alloc(&[seq_len, num_kv_heads, head_dim], DType::FP16)
+            .unwrap();
+        let k_bytes = ref_to_fp16_bytes(&k_rope_ref);
+        let v_bytes = ref_to_fp16_bytes(&v_ref);
+        backend.copy_to_device(&dev_k_cache, &k_bytes).unwrap();
+        backend.copy_to_device(&dev_v_cache, &v_bytes).unwrap();
+
+        let dev_attn_raw = backend
+            .alloc(&[seq_len, num_q_heads, head_dim], DType::FP16)
+            .unwrap();
+        backend
+            .attention(
+                &dev_q,
+                &dev_k_cache,
+                &dev_v_cache,
+                num_kv_heads,
+                0,
+                &dev_attn_raw,
+            )
+            .unwrap();
+
+        let dev_attn_flat = dev_attn_raw.reshape(vec![seq_len, hidden]).unwrap();
+        let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
+        backend
+            .matmul(&dev_attn_flat, &weights.layers[layer].o_proj, &dev_output)
+            .unwrap();
+
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            LOOSE_RTOL,
+            LOOSE_ATOL,
+            &format!("fixture_attention_layer{layer}"),
+        );
+
+        backend.free(&dev_q).unwrap();
+        backend.free(&dev_k_cache).unwrap();
+        backend.free(&dev_v_cache).unwrap();
+        backend.free(&dev_attn_raw).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+
+    #[test]
+    fn fixture_attention_layer0() {
+        run_fixture_attention(0);
+    }
+    #[test]
+    fn fixture_attention_layer1() {
+        run_fixture_attention(1);
+    }
+    #[test]
+    fn fixture_attention_layer2() {
+        run_fixture_attention(2);
+    }
+    #[test]
+    fn fixture_attention_layer3() {
+        run_fixture_attention(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Final RMSNorm (output norm)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fixture_rmsnorm_final() {
+        let (backend, weights, config) = cuda_or_skip!(setup_fixture_backend());
+        let last = config.num_layers - 1;
+        let input = load_ref(&fixture_prefill_ref(&format!(
+            "layer_{last:02}/output_hidden.bin"
+        )));
+        let expected = load_ref(&fixture_prefill_ref("final_norm.bin"));
+        let seq_len = input.shape[0];
+        let hidden = config.hidden_size;
+        let dev_input = upload_ref(&backend, &input, &[seq_len, hidden]);
+        let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
+        backend
+            .rmsnorm(
+                &dev_input,
+                &weights.output_norm,
+                config.rms_norm_eps,
+                &dev_output,
+            )
+            .unwrap();
+        assert_kernel_close(
+            &backend,
+            &dev_output,
+            &expected,
+            LOOSE_RTOL,
+            LOOSE_ATOL,
+            "fixture_rmsnorm_final",
+        );
+        backend.free(&dev_input).unwrap();
+        backend.free(&dev_output).unwrap();
+    }
+}
