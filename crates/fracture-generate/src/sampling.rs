@@ -135,7 +135,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..20 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -151,7 +150,6 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..20 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -191,7 +189,6 @@ mod tests {
             top_k: 2,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..100 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -207,7 +204,6 @@ mod tests {
             top_k: 0,
             top_p: 0.01,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..50 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -224,7 +220,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let token = Sampler::sample(&logits, &params).unwrap();
         assert!(token <= 2, "should produce a valid token index");
@@ -238,7 +233,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let first = Sampler::sample(&logits, &params).unwrap();
         for _ in 0..99 {
@@ -265,7 +259,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -287,7 +280,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -309,7 +301,6 @@ mod tests {
             top_k: 5,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
@@ -331,7 +322,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let mut counts = [0u32; 5];
         for _ in 0..1000 {
@@ -369,7 +359,6 @@ mod tests {
             top_k: 3,
             top_p: 0.5,
             seed: None,
-            ..Default::default()
         };
         let valid_tokens: Vec<u32> = vec![0, 1, 2]; // the top-3 by logit value
         for _ in 0..100 {
@@ -429,7 +418,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let result = Sampler::sample(&logits, &params_greedy);
         assert!(result.is_err());
@@ -445,7 +433,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
 
         // With negative temperature, logits are divided by -1.0:
@@ -475,7 +462,6 @@ mod tests {
             top_k: 0,
             top_p: 0.0,
             seed: None,
-            ..Default::default()
         };
         // Since top_p < 1.0 and cumulative > 0.0 on the very first token,
         // cutoff = 1, so only the top token (index 1, logit 3.0) should be selected.
@@ -595,7 +581,6 @@ mod tests {
             top_k: 3,
             top_p: 0.3,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..100 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -617,7 +602,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
 
         let mut counts = vec![0u32; n];
@@ -647,7 +631,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let greedy = Sampler::sample(&logits, &params_temp1).unwrap();
 
@@ -657,7 +640,6 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let with_temp = Sampler::sample(&logits, &params_temp1_topk1).unwrap();
         assert_eq!(greedy, with_temp, "temp=1.0 with top_k=1 should pick the same as greedy");
@@ -674,7 +656,6 @@ mod tests {
             top_k: 3,
             top_p: 0.99,
             seed: None,
-            ..Default::default()
         };
         for _ in 0..200 {
             let token = Sampler::sample(&logits, &params).unwrap();
@@ -707,7 +688,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         let logits = vec![f32::INFINITY, 1.0];
         let result = Sampler::sample(&logits, &params_greedy);
@@ -832,7 +812,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
 
@@ -842,7 +821,6 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
 
@@ -852,7 +830,6 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             seed: None,
-            ..Default::default()
         };
         assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
 
@@ -862,7 +839,6 @@ mod tests {
             top_k: 0,
             top_p: 0.5,
             seed: None,
-            ..Default::default()
         };
         assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
 
@@ -872,7 +848,6 @@ mod tests {
             top_k: 10,
             top_p: 0.1,
             seed: None,
-            ..Default::default()
         };
         assert_eq!(Sampler::sample(&logits, &params).unwrap(), 0);
     }
