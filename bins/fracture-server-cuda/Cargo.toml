@@ -29,6 +29,9 @@ rand = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokenizers = { workspace = true }
+axum = { workspace = true }
 
 [[test]]
 name = "gpu_integration"
@@ -41,3 +44,7 @@ path = "tests/turboquant_gpu.rs"
 [[test]]
 name = "golden"
 path = "tests/golden.rs"
+
+[[test]]
+name = "cancellation"
+path = "tests/cancellation.rs"
