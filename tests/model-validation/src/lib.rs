@@ -78,3 +78,40 @@ macro_rules! skip {
         return;
     }};
 }
+
+/// Path to the always-available fixture model.
+pub fn fixture_model_path() -> PathBuf {
+    project_root().join("tests/fixtures/tiny-llama.gguf")
+}
+
+/// Reference dump directory for the fixture model.
+pub fn fixture_reference_dir() -> PathBuf {
+    project_root().join("tests/reference-fixture")
+}
+
+/// Golden generation directory for the fixture model.
+pub fn fixture_golden_dir() -> PathBuf {
+    project_root().join("tests/golden-fixture")
+}
+
+/// Set up an engine using the committed fixture model. Always available
+/// (no FRACTURE_MODEL_PATH required). Returns None only if CUDA is
+/// unavailable on the host.
+pub fn setup_fixture_engine() -> Option<(Engine<CudaBackend>, ModelConfig)> {
+    let path = fixture_model_path();
+    if !path.exists() {
+        panic!(
+            "fixture missing at {}; run scripts/build_fixture_model.py",
+            path.display()
+        );
+    }
+    let mut backend = CudaBackend::new(0).ok()?;
+    let weights =
+        WeightStore::load(&path, &backend, None).expect("fixture load failed");
+    let config = weights.config.clone();
+    backend
+        .precompute_rope_freqs(config.head_dim, config.rope_theta)
+        .ok()?;
+    let engine = Engine::new(backend, weights, 0..config.num_layers);
+    Some((engine, config))
+}
