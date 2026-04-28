@@ -153,14 +153,14 @@ fn test_kernel_embedding() {
 // RMSNorm
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_rmsnorm_attn_layer0() {
+fn run_real_rmsnorm_attn(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
 
-    let input = load_ref(&prefill_ref("layer_00/input_hidden.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/post_attn_norm.bin"));
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/input_hidden.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/post_attn_norm.bin")));
     let seq_len = input.shape[0];
     let hidden = config.hidden_size;
 
@@ -170,64 +170,7 @@ fn test_kernel_rmsnorm_attn_layer0() {
     backend
         .rmsnorm(
             &dev_input,
-            &weights.layers[0].attn_norm,
-            config.rms_norm_eps,
-            &dev_output,
-        )
-        .unwrap();
-
-    assert_kernel_close(&backend, &dev_output, &expected, LOOSE_RTOL, LOOSE_ATOL, "rmsnorm_attn_layer0");
-    backend.free(&dev_input).unwrap();
-    backend.free(&dev_output).unwrap();
-}
-
-#[test]
-fn test_kernel_rmsnorm_ffn_layer0() {
-    let Some((backend, weights, config)) = setup_backend_and_weights() else {
-        skip!("model or reference data not available");
-    };
-
-    let input = load_ref(&prefill_ref("layer_00/post_attn_residual.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/post_ffn_norm.bin"));
-    let seq_len = input.shape[0];
-    let hidden = config.hidden_size;
-
-    let dev_input = upload_ref(&backend, &input, &[seq_len, hidden]);
-    let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
-
-    backend
-        .rmsnorm(
-            &dev_input,
-            &weights.layers[0].ffn_norm,
-            config.rms_norm_eps,
-            &dev_output,
-        )
-        .unwrap();
-
-    assert_kernel_close(&backend, &dev_output, &expected, LOOSE_RTOL, LOOSE_ATOL, "rmsnorm_ffn_layer0");
-    backend.free(&dev_input).unwrap();
-    backend.free(&dev_output).unwrap();
-}
-
-#[test]
-fn test_kernel_rmsnorm_attn_last_layer() {
-    let Some((backend, weights, config)) = setup_backend_and_weights() else {
-        skip!("model or reference data not available");
-    };
-
-    let last = config.num_layers - 1;
-    let input = load_ref(&prefill_ref(&format!("layer_{last:02}/input_hidden.bin")));
-    let expected = load_ref(&prefill_ref(&format!("layer_{last:02}/post_attn_norm.bin")));
-    let seq_len = input.shape[0];
-    let hidden = config.hidden_size;
-
-    let dev_input = upload_ref(&backend, &input, &[seq_len, hidden]);
-    let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
-
-    backend
-        .rmsnorm(
-            &dev_input,
-            &weights.layers[last].attn_norm,
+            &weights.layers[layer].attn_norm,
             config.rms_norm_eps,
             &dev_output,
         )
@@ -239,24 +182,112 @@ fn test_kernel_rmsnorm_attn_last_layer() {
         &expected,
         LOOSE_RTOL,
         LOOSE_ATOL,
-        &format!("rmsnorm_attn_layer{last}"),
+        &format!("rmsnorm_attn_layer{layer}"),
     );
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_rmsnorm_attn_layer0() {
+    run_real_rmsnorm_attn(0);
+}
+#[test]
+fn test_kernel_rmsnorm_attn_layer8() {
+    run_real_rmsnorm_attn(8);
+}
+#[test]
+fn test_kernel_rmsnorm_attn_layer16() {
+    run_real_rmsnorm_attn(16);
+}
+#[test]
+fn test_kernel_rmsnorm_attn_layer24() {
+    run_real_rmsnorm_attn(24);
+}
+#[test]
+fn test_kernel_rmsnorm_attn_layer31() {
+    run_real_rmsnorm_attn(31);
+}
+
+// Preserved name from the original "last layer" test for CI compatibility.
+#[test]
+fn test_kernel_rmsnorm_attn_last_layer() {
+    let last = {
+        let Some((_, _, config)) = setup_backend_and_weights() else {
+            skip!("model or reference data not available");
+        };
+        config.num_layers - 1
+    };
+    run_real_rmsnorm_attn(last);
+}
+
+fn run_real_rmsnorm_ffn(layer: usize) {
+    let Some((backend, weights, config)) = setup_backend_and_weights() else {
+        skip!("model or reference data not available");
+    };
+
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_attn_residual.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/post_ffn_norm.bin")));
+    let seq_len = input.shape[0];
+    let hidden = config.hidden_size;
+
+    let dev_input = upload_ref(&backend, &input, &[seq_len, hidden]);
+    let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
+
+    backend
+        .rmsnorm(
+            &dev_input,
+            &weights.layers[layer].ffn_norm,
+            config.rms_norm_eps,
+            &dev_output,
+        )
+        .unwrap();
+
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        LOOSE_RTOL,
+        LOOSE_ATOL,
+        &format!("rmsnorm_ffn_layer{layer}"),
+    );
+    backend.free(&dev_input).unwrap();
+    backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_rmsnorm_ffn_layer0() {
+    run_real_rmsnorm_ffn(0);
+}
+#[test]
+fn test_kernel_rmsnorm_ffn_layer8() {
+    run_real_rmsnorm_ffn(8);
+}
+#[test]
+fn test_kernel_rmsnorm_ffn_layer16() {
+    run_real_rmsnorm_ffn(16);
+}
+#[test]
+fn test_kernel_rmsnorm_ffn_layer24() {
+    run_real_rmsnorm_ffn(24);
+}
+#[test]
+fn test_kernel_rmsnorm_ffn_layer31() {
+    run_real_rmsnorm_ffn(31);
 }
 
 // ---------------------------------------------------------------------------
 // MatMul — QKV projections (layer 0)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_matmul_q_proj_layer0() {
+fn run_real_matmul_q_proj(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
-
-    let input = load_ref(&prefill_ref("layer_00/post_attn_norm.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/q.bin"));
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_attn_norm.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/q.bin")));
     let seq_len = input.shape[0];
 
     let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
@@ -265,22 +296,99 @@ fn test_kernel_matmul_q_proj_layer0() {
         .unwrap();
 
     backend
-        .matmul(&dev_input, &weights.layers[0].q_proj, &dev_output)
+        .matmul(&dev_input, &weights.layers[layer].q_proj, &dev_output)
         .unwrap();
 
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_q_proj_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_q_proj_layer{layer}"),
+    );
+    backend.free(&dev_input).unwrap();
+    backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_matmul_q_proj_layer0() {
+    run_real_matmul_q_proj(0);
+}
+#[test]
+fn test_kernel_matmul_q_proj_layer8() {
+    run_real_matmul_q_proj(8);
+}
+#[test]
+fn test_kernel_matmul_q_proj_layer16() {
+    run_real_matmul_q_proj(16);
+}
+#[test]
+fn test_kernel_matmul_q_proj_layer24() {
+    run_real_matmul_q_proj(24);
+}
+#[test]
+fn test_kernel_matmul_q_proj_layer31() {
+    run_real_matmul_q_proj(31);
+}
+
+fn run_real_matmul_k_proj(layer: usize) {
+    let Some((backend, weights, config)) = setup_backend_and_weights() else {
+        skip!("model or reference data not available");
+    };
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_attn_norm.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/k.bin")));
+    let seq_len = input.shape[0];
+    let kv_dim = config.num_kv_heads * config.head_dim;
+
+    let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+    let dev_output = backend.alloc(&[seq_len, kv_dim], DType::FP16).unwrap();
+
+    backend
+        .matmul(&dev_input, &weights.layers[layer].k_proj, &dev_output)
+        .unwrap();
+
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_k_proj_layer{layer}"),
+    );
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
 }
 
 #[test]
 fn test_kernel_matmul_k_proj_layer0() {
+    run_real_matmul_k_proj(0);
+}
+#[test]
+fn test_kernel_matmul_k_proj_layer8() {
+    run_real_matmul_k_proj(8);
+}
+#[test]
+fn test_kernel_matmul_k_proj_layer16() {
+    run_real_matmul_k_proj(16);
+}
+#[test]
+fn test_kernel_matmul_k_proj_layer24() {
+    run_real_matmul_k_proj(24);
+}
+#[test]
+fn test_kernel_matmul_k_proj_layer31() {
+    run_real_matmul_k_proj(31);
+}
+
+fn run_real_matmul_v_proj(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
-
-    let input = load_ref(&prefill_ref("layer_00/post_attn_norm.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/k.bin"));
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_attn_norm.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/v.bin")));
     let seq_len = input.shape[0];
     let kv_dim = config.num_kv_heads * config.head_dim;
 
@@ -288,49 +396,53 @@ fn test_kernel_matmul_k_proj_layer0() {
     let dev_output = backend.alloc(&[seq_len, kv_dim], DType::FP16).unwrap();
 
     backend
-        .matmul(&dev_input, &weights.layers[0].k_proj, &dev_output)
+        .matmul(&dev_input, &weights.layers[layer].v_proj, &dev_output)
         .unwrap();
 
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_k_proj_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_v_proj_layer{layer}"),
+    );
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
 }
 
 #[test]
 fn test_kernel_matmul_v_proj_layer0() {
-    let Some((backend, weights, config)) = setup_backend_and_weights() else {
-        skip!("model or reference data not available");
-    };
-
-    let input = load_ref(&prefill_ref("layer_00/post_attn_norm.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/v.bin"));
-    let seq_len = input.shape[0];
-    let kv_dim = config.num_kv_heads * config.head_dim;
-
-    let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
-    let dev_output = backend.alloc(&[seq_len, kv_dim], DType::FP16).unwrap();
-
-    backend
-        .matmul(&dev_input, &weights.layers[0].v_proj, &dev_output)
-        .unwrap();
-
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_v_proj_layer0");
-    backend.free(&dev_input).unwrap();
-    backend.free(&dev_output).unwrap();
+    run_real_matmul_v_proj(0);
+}
+#[test]
+fn test_kernel_matmul_v_proj_layer8() {
+    run_real_matmul_v_proj(8);
+}
+#[test]
+fn test_kernel_matmul_v_proj_layer16() {
+    run_real_matmul_v_proj(16);
+}
+#[test]
+fn test_kernel_matmul_v_proj_layer24() {
+    run_real_matmul_v_proj(24);
+}
+#[test]
+fn test_kernel_matmul_v_proj_layer31() {
+    run_real_matmul_v_proj(31);
 }
 
 // ---------------------------------------------------------------------------
 // MatMul — FFN projections (layer 0)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_matmul_gate_proj_layer0() {
+fn run_real_matmul_gate_proj(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
-
-    let input = load_ref(&prefill_ref("layer_00/post_ffn_norm.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/gate.bin"));
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_ffn_norm.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/gate.bin")));
     let seq_len = input.shape[0];
 
     let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
@@ -339,46 +451,100 @@ fn test_kernel_matmul_gate_proj_layer0() {
         .unwrap();
 
     backend
-        .matmul(&dev_input, &weights.layers[0].gate_proj, &dev_output)
+        .matmul(&dev_input, &weights.layers[layer].gate_proj, &dev_output)
         .unwrap();
 
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_gate_proj_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_gate_proj_layer{layer}"),
+    );
+    backend.free(&dev_input).unwrap();
+    backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_matmul_gate_proj_layer0() {
+    run_real_matmul_gate_proj(0);
+}
+#[test]
+fn test_kernel_matmul_gate_proj_layer8() {
+    run_real_matmul_gate_proj(8);
+}
+#[test]
+fn test_kernel_matmul_gate_proj_layer16() {
+    run_real_matmul_gate_proj(16);
+}
+#[test]
+fn test_kernel_matmul_gate_proj_layer24() {
+    run_real_matmul_gate_proj(24);
+}
+#[test]
+fn test_kernel_matmul_gate_proj_layer31() {
+    run_real_matmul_gate_proj(31);
+}
+
+fn run_real_matmul_up_proj(layer: usize) {
+    let Some((backend, weights, config)) = setup_backend_and_weights() else {
+        skip!("model or reference data not available");
+    };
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/post_ffn_norm.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/up.bin")));
+    let seq_len = input.shape[0];
+
+    let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
+    let dev_output = backend
+        .alloc(&[seq_len, config.intermediate_size], DType::FP16)
+        .unwrap();
+
+    backend
+        .matmul(&dev_input, &weights.layers[layer].up_proj, &dev_output)
+        .unwrap();
+
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_up_proj_layer{layer}"),
+    );
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
 }
 
 #[test]
 fn test_kernel_matmul_up_proj_layer0() {
-    let Some((backend, weights, config)) = setup_backend_and_weights() else {
-        skip!("model or reference data not available");
-    };
-
-    let input = load_ref(&prefill_ref("layer_00/post_ffn_norm.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/up.bin"));
-    let seq_len = input.shape[0];
-
-    let dev_input = upload_ref(&backend, &input, &[seq_len, config.hidden_size]);
-    let dev_output = backend
-        .alloc(&[seq_len, config.intermediate_size], DType::FP16)
-        .unwrap();
-
-    backend
-        .matmul(&dev_input, &weights.layers[0].up_proj, &dev_output)
-        .unwrap();
-
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_up_proj_layer0");
-    backend.free(&dev_input).unwrap();
-    backend.free(&dev_output).unwrap();
+    run_real_matmul_up_proj(0);
+}
+#[test]
+fn test_kernel_matmul_up_proj_layer8() {
+    run_real_matmul_up_proj(8);
+}
+#[test]
+fn test_kernel_matmul_up_proj_layer16() {
+    run_real_matmul_up_proj(16);
+}
+#[test]
+fn test_kernel_matmul_up_proj_layer24() {
+    run_real_matmul_up_proj(24);
+}
+#[test]
+fn test_kernel_matmul_up_proj_layer31() {
+    run_real_matmul_up_proj(31);
 }
 
-#[test]
-fn test_kernel_matmul_down_proj_layer0() {
+fn run_real_matmul_down_proj(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
-
-    let input = load_ref(&prefill_ref("layer_00/silu_mul.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/ffn_output.bin"));
+    let dir = format!("layer_{layer:02}");
+    let input = load_ref(&prefill_ref(&format!("{dir}/silu_mul.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/ffn_output.bin")));
     let seq_len = input.shape[0];
 
     let dev_input = upload_ref(&backend, &input, &[seq_len, config.intermediate_size]);
@@ -387,28 +553,56 @@ fn test_kernel_matmul_down_proj_layer0() {
         .unwrap();
 
     backend
-        .matmul(&dev_input, &weights.layers[0].down_proj, &dev_output)
+        .matmul(&dev_input, &weights.layers[layer].down_proj, &dev_output)
         .unwrap();
 
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "matmul_down_proj_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("matmul_down_proj_layer{layer}"),
+    );
     backend.free(&dev_input).unwrap();
     backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_matmul_down_proj_layer0() {
+    run_real_matmul_down_proj(0);
+}
+#[test]
+fn test_kernel_matmul_down_proj_layer8() {
+    run_real_matmul_down_proj(8);
+}
+#[test]
+fn test_kernel_matmul_down_proj_layer16() {
+    run_real_matmul_down_proj(16);
+}
+#[test]
+fn test_kernel_matmul_down_proj_layer24() {
+    run_real_matmul_down_proj(24);
+}
+#[test]
+fn test_kernel_matmul_down_proj_layer31() {
+    run_real_matmul_down_proj(31);
 }
 
 // ---------------------------------------------------------------------------
 // SiLU × Mul
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_silu_mul_layer0() {
+fn run_real_silu_mul(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
     let _ = weights; // only needed for model loading side-effect
 
-    let gate = load_ref(&prefill_ref("layer_00/gate.bin"));
-    let up = load_ref(&prefill_ref("layer_00/up.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/silu_mul.bin"));
+    let dir = format!("layer_{layer:02}");
+    let gate = load_ref(&prefill_ref(&format!("{dir}/gate.bin")));
+    let up = load_ref(&prefill_ref(&format!("{dir}/up.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/silu_mul.bin")));
     let seq_len = gate.shape[0];
 
     let dev_gate = upload_ref(&backend, &gate, &[seq_len, config.intermediate_size]);
@@ -419,26 +613,54 @@ fn test_kernel_silu_mul_layer0() {
 
     backend.silu_mul(&dev_gate, &dev_up, &dev_output).unwrap();
 
-    assert_kernel_close(&backend, &dev_output, &expected, RTOL, ATOL, "silu_mul_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_output,
+        &expected,
+        RTOL,
+        ATOL,
+        &format!("silu_mul_layer{layer}"),
+    );
     backend.free(&dev_gate).unwrap();
     backend.free(&dev_up).unwrap();
     backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_silu_mul_layer0() {
+    run_real_silu_mul(0);
+}
+#[test]
+fn test_kernel_silu_mul_layer8() {
+    run_real_silu_mul(8);
+}
+#[test]
+fn test_kernel_silu_mul_layer16() {
+    run_real_silu_mul(16);
+}
+#[test]
+fn test_kernel_silu_mul_layer24() {
+    run_real_silu_mul(24);
+}
+#[test]
+fn test_kernel_silu_mul_layer31() {
+    run_real_silu_mul(31);
 }
 
 // ---------------------------------------------------------------------------
 // RoPE
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_rope_layer0() {
+fn run_real_rope(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
     let _ = weights;
 
+    let dir = format!("layer_{layer:02}");
     // Load pre-RoPE Q and K (flat projections), reshape to multi-head format
-    let q_flat = load_ref(&prefill_ref("layer_00/q.bin"));
-    let k_flat = load_ref(&prefill_ref("layer_00/k.bin"));
+    let q_flat = load_ref(&prefill_ref(&format!("{dir}/q.bin")));
+    let k_flat = load_ref(&prefill_ref(&format!("{dir}/k.bin")));
     let seq_len = q_flat.shape[0];
 
     // Upload as multi-head shape: [seq_len, num_heads, head_dim]
@@ -459,16 +681,51 @@ fn test_kernel_rope_layer0() {
         .unwrap();
 
     // Load expected post-RoPE tensors [seq_len, num_heads, head_dim]
-    let expected_q = load_ref(&prefill_ref("layer_00/q_rope.bin"));
-    let expected_k = load_ref(&prefill_ref("layer_00/k_rope.bin"));
+    let expected_q = load_ref(&prefill_ref(&format!("{dir}/q_rope.bin")));
+    let expected_k = load_ref(&prefill_ref(&format!("{dir}/k_rope.bin")));
 
     // RoPE uses trig functions on FP16 values — slightly higher tolerance needed
     let rope_rtol = 0.01;
     let rope_atol = 0.025;
-    assert_kernel_close(&backend, &dev_q, &expected_q, rope_rtol, rope_atol, "rope_q_layer0");
-    assert_kernel_close(&backend, &dev_k, &expected_k, rope_rtol, rope_atol, "rope_k_layer0");
+    assert_kernel_close(
+        &backend,
+        &dev_q,
+        &expected_q,
+        rope_rtol,
+        rope_atol,
+        &format!("rope_q_layer{layer}"),
+    );
+    assert_kernel_close(
+        &backend,
+        &dev_k,
+        &expected_k,
+        rope_rtol,
+        rope_atol,
+        &format!("rope_k_layer{layer}"),
+    );
     backend.free(&dev_q).unwrap();
     backend.free(&dev_k).unwrap();
+}
+
+#[test]
+fn test_kernel_rope_layer0() {
+    run_real_rope(0);
+}
+#[test]
+fn test_kernel_rope_layer8() {
+    run_real_rope(8);
+}
+#[test]
+fn test_kernel_rope_layer16() {
+    run_real_rope(16);
+}
+#[test]
+fn test_kernel_rope_layer24() {
+    run_real_rope(24);
+}
+#[test]
+fn test_kernel_rope_layer31() {
+    run_real_rope(31);
 }
 
 // ---------------------------------------------------------------------------
@@ -608,16 +865,16 @@ fn test_kernel_silu_mul_decode() {
 // Attention kernel (prefill, layer 0)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_kernel_attention_layer0() {
+fn run_real_attention(layer: usize) {
     let Some((backend, weights, config)) = setup_backend_and_weights() else {
         skip!("model or reference data not available");
     };
 
-    let q_rope_ref = load_ref(&prefill_ref("layer_00/q_rope.bin"));
-    let k_rope_ref = load_ref(&prefill_ref("layer_00/k_rope.bin"));
-    let v_ref = load_ref(&prefill_ref("layer_00/v.bin"));
-    let expected = load_ref(&prefill_ref("layer_00/attn_output.bin"));
+    let dir = format!("layer_{layer:02}");
+    let q_rope_ref = load_ref(&prefill_ref(&format!("{dir}/q_rope.bin")));
+    let k_rope_ref = load_ref(&prefill_ref(&format!("{dir}/k_rope.bin")));
+    let v_ref = load_ref(&prefill_ref(&format!("{dir}/v.bin")));
+    let expected = load_ref(&prefill_ref(&format!("{dir}/attn_output.bin")));
 
     // q_rope: [seq_len, num_q_heads, head_dim]
     // k_rope: [seq_len, num_kv_heads, head_dim]
@@ -668,7 +925,7 @@ fn test_kernel_attention_layer0() {
     // Apply output projection: [seq_len, hidden] x o_proj -> [seq_len, hidden]
     let dev_output = backend.alloc(&[seq_len, hidden], DType::FP16).unwrap();
     backend
-        .matmul(&dev_attn_flat, &weights.layers[0].o_proj, &dev_output)
+        .matmul(&dev_attn_flat, &weights.layers[layer].o_proj, &dev_output)
         .unwrap();
 
     // attn_output.bin is the full self-attention block output (after o_proj),
@@ -679,7 +936,7 @@ fn test_kernel_attention_layer0() {
         &expected,
         LOOSE_RTOL,
         LOOSE_ATOL,
-        "attention_layer0",
+        &format!("attention_layer{layer}"),
     );
 
     backend.free(&dev_q).unwrap();
@@ -687,6 +944,27 @@ fn test_kernel_attention_layer0() {
     backend.free(&dev_v_cache).unwrap();
     backend.free(&dev_attn_raw).unwrap();
     backend.free(&dev_output).unwrap();
+}
+
+#[test]
+fn test_kernel_attention_layer0() {
+    run_real_attention(0);
+}
+#[test]
+fn test_kernel_attention_layer8() {
+    run_real_attention(8);
+}
+#[test]
+fn test_kernel_attention_layer16() {
+    run_real_attention(16);
+}
+#[test]
+fn test_kernel_attention_layer24() {
+    run_real_attention(24);
+}
+#[test]
+fn test_kernel_attention_layer31() {
+    run_real_attention(31);
 }
 
 // ---------------------------------------------------------------------------
