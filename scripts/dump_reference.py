@@ -336,6 +336,105 @@ def load_model(model_path: str) -> tuple[LlamaForCausalLM, Any]:
     return model, tokenizer
 
 
+def load_fixture_model(gguf_path: str, config_path: str) -> tuple[torch.nn.Module, Any]:
+    """Build a PyTorch Llama matching the fixture GGUF, load weights from GGUF."""
+    import gguf as gguf_lib
+    from transformers import LlamaConfig, LlamaForCausalLM as _LlamaForCausalLM
+
+    print(f"Loading fixture config from {config_path}...")
+    cfg = json.loads(Path(config_path).read_text())
+    print(f"Building LlamaForCausalLM (FP16, CUDA) with fixture dimensions...")
+    hf_cfg = LlamaConfig(
+        vocab_size=cfg["vocab_size"],
+        hidden_size=cfg["hidden_size"],
+        intermediate_size=cfg["intermediate_size"],
+        num_hidden_layers=cfg["num_layers"],
+        num_attention_heads=cfg["num_q_heads"],
+        num_key_value_heads=cfg["num_kv_heads"],
+        max_position_embeddings=cfg["max_position_embeddings"],
+        rms_norm_eps=cfg["rms_norm_eps"],
+        rope_theta=cfg["rope_theta"],
+        torch_dtype=torch.float16,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(SEED)
+    model = _LlamaForCausalLM(hf_cfg).to(dtype=torch.float16, device="cuda")
+
+    print(f"Reading GGUF tensors from {gguf_path}...")
+    reader = gguf_lib.GGUFReader(gguf_path)
+    tensor_map = {t.name: torch.from_numpy(t.data.copy()) for t in reader.tensors}
+    print(f"  Found {len(tensor_map)} GGUF tensors")
+
+    sd = model.state_dict()
+
+    def assign(hf_name: str, gg_name: str) -> None:
+        if gg_name not in tensor_map:
+            raise KeyError(f"GGUF tensor '{gg_name}' not found (needed for HF '{hf_name}')")
+        src = tensor_map[gg_name]
+        dst = sd[hf_name]
+        if src.shape != dst.shape:
+            # GGUF stores 2-D linear weights in [out, in] which usually matches HF nn.Linear.
+            # If shapes are transposed, attempt a transpose recovery.
+            if src.dim() == 2 and dst.dim() == 2 and src.shape == (dst.shape[1], dst.shape[0]):
+                src = src.t().contiguous()
+            else:
+                raise ValueError(
+                    f"Shape mismatch for {hf_name} <- {gg_name}: "
+                    f"GGUF {tuple(src.shape)} vs HF {tuple(dst.shape)}"
+                )
+        dst.copy_(src.to(dst.dtype).reshape(dst.shape))
+
+    top_pairs = [
+        ("model.embed_tokens.weight", "token_embd.weight"),
+        ("model.norm.weight", "output_norm.weight"),
+        ("lm_head.weight", "output.weight"),
+    ]
+    for hf, gg in top_pairs:
+        assign(hf, gg)
+    for i in range(cfg["num_layers"]):
+        layer_pairs = [
+            (f"model.layers.{i}.input_layernorm.weight", f"blk.{i}.attn_norm.weight"),
+            (f"model.layers.{i}.self_attn.q_proj.weight", f"blk.{i}.attn_q.weight"),
+            (f"model.layers.{i}.self_attn.k_proj.weight", f"blk.{i}.attn_k.weight"),
+            (f"model.layers.{i}.self_attn.v_proj.weight", f"blk.{i}.attn_v.weight"),
+            (f"model.layers.{i}.self_attn.o_proj.weight", f"blk.{i}.attn_output.weight"),
+            (f"model.layers.{i}.post_attention_layernorm.weight", f"blk.{i}.ffn_norm.weight"),
+            (f"model.layers.{i}.mlp.gate_proj.weight", f"blk.{i}.ffn_gate.weight"),
+            (f"model.layers.{i}.mlp.up_proj.weight", f"blk.{i}.ffn_up.weight"),
+            (f"model.layers.{i}.mlp.down_proj.weight", f"blk.{i}.ffn_down.weight"),
+        ]
+        for hf, gg in layer_pairs:
+            assign(hf, gg)
+
+    model.load_state_dict(sd)
+    model.eval()
+
+    # Ensure pad_token_id is set so model.generate doesn't complain.
+    if model.config.pad_token_id is None:
+        model.config.pad_token_id = 0
+    if model.generation_config is not None and model.generation_config.pad_token_id is None:
+        model.generation_config.pad_token_id = 0
+
+    class FixtureTokenizer:
+        def __init__(self, vocab: int):
+            self.vocab_size = vocab
+            self.eos_token_id = 2
+            self.pad_token_id = 0
+
+        def __call__(self, prompt: str, return_tensors: str = "pt") -> dict[str, torch.Tensor]:
+            ids = [3 + (ord(c) % (self.vocab_size - 3)) for c in prompt][:32] or [3]
+            return {"input_ids": torch.tensor([ids], dtype=torch.long).cuda()}
+
+        def decode(self, ids, skip_special_tokens: bool = True) -> str:
+            try:
+                n = len(ids)
+            except TypeError:
+                n = 1
+            return f"<{n} tokens>"
+
+    return model, FixtureTokenizer(cfg["vocab_size"])
+
+
 # ---------------------------------------------------------------------------
 # Prefill dump: full forward pass with all intermediates
 # ---------------------------------------------------------------------------
@@ -631,27 +730,44 @@ def parse_layers(layers_str: str, num_layers: int) -> list[int] | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dump reference tensors from Llama 3.1 8B Instruct for Fracture validation.",
+        description="Dump reference tensors for Fracture validation (HF model or fixture GGUF).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["hf", "fixture"],
+        required=True,
+        help="Source of weights: 'hf' (HuggingFace dir) or 'fixture' (GGUF + JSON config).",
     )
     parser.add_argument(
         "--model-path",
-        default=MODEL_ID,
-        help=f"HuggingFace model path (default: {MODEL_ID})",
+        required=True,
+        help="HuggingFace model dir (hf mode) or path to GGUF file (fixture mode).",
+    )
+    parser.add_argument(
+        "--config-path",
+        default=None,
+        help="Path to fixture config JSON. Required when --mode fixture.",
     )
     parser.add_argument(
         "--output-dir",
-        default="tests/reference",
-        help="Output directory for reference tensors (default: tests/reference)",
+        required=True,
+        help="Output directory for reference tensors.",
     )
     parser.add_argument(
         "--golden-dir",
-        default="tests/golden",
-        help="Output directory for golden generation outputs (default: tests/golden)",
+        required=True,
+        help="Output directory for golden generation outputs.",
+    )
+    parser.add_argument(
+        "--prompts",
+        nargs="+",
+        default=None,
+        help="Prompt strings (default: built-in TEST_PROMPTS).",
     )
     parser.add_argument(
         "--layers",
-        default="all",
-        help="Comma-separated layer indices or 'all' (default: all). Supports ranges: '0-3,31'.",
+        default="0,last",
+        help="Comma-separated layer indices, 'all', or 'last' as a sentinel (default: '0,last'). Supports ranges: '0-3,31'.",
     )
     parser.add_argument(
         "--generate-tokens",
@@ -661,15 +777,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.mode == "fixture" and not args.config_path:
+        parser.error("--config-path is required when --mode fixture")
+
+    prompts = args.prompts if args.prompts is not None else list(TEST_PROMPTS)
+
     output_dir = Path(args.output_dir)
     golden_dir = Path(args.golden_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     golden_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Mode:             {args.mode}")
     print(f"Reference output: {output_dir.resolve()}")
     print(f"Golden output:    {golden_dir.resolve()}")
     print(f"Model:            {args.model_path}")
-    print(f"Prompts:          {TEST_PROMPTS}")
+    if args.mode == "fixture":
+        print(f"Config:           {args.config_path}")
+    print(f"Prompts:          {prompts}")
     print(f"Seed:             {SEED}")
 
     if not torch.cuda.is_available():
@@ -680,11 +804,27 @@ def main() -> None:
 
     torch.manual_seed(SEED)
 
-    model, tokenizer = load_model(args.model_path)
+    if args.mode == "hf":
+        model, tokenizer = load_model(args.model_path)
+    else:
+        model, tokenizer = load_fixture_model(args.model_path, args.config_path)
 
     num_layers = model.config.num_hidden_layers
+
+    # Resolve 'last' sentinel in --layers before parsing (parse_layers accepts ints/'all').
+    layers_arg = args.layers
+    if layers_arg and layers_arg.lower() != "all":
+        parts = []
+        for part in layers_arg.split(","):
+            p = part.strip()
+            if p.lower() == "last":
+                parts.append(str(num_layers - 1))
+            else:
+                parts.append(p)
+        layers_arg = ",".join(parts)
+
     try:
-        layer_indices = parse_layers(args.layers, num_layers)
+        layer_indices = parse_layers(layers_arg, num_layers)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
@@ -697,7 +837,7 @@ def main() -> None:
     # --- Prefill dumps for each prompt ---
     t_total = time.time()
     prefill_results = []
-    for i, prompt in enumerate(TEST_PROMPTS):
+    for i, prompt in enumerate(prompts):
         result = dump_prefill(model, tokenizer, prompt, i, output_dir, layer_indices)
         prefill_results.append(result)
 
@@ -705,15 +845,17 @@ def main() -> None:
     dump_decode_step(model, tokenizer, prefill_results[0], output_dir, layer_indices)
 
     # --- Greedy generation golden outputs ---
-    dump_greedy_generation(model, tokenizer, TEST_PROMPTS, golden_dir, args.generate_tokens)
+    dump_greedy_generation(model, tokenizer, prompts, golden_dir, args.generate_tokens)
 
     # --- Write generation info ---
     gen_info = {
+        "mode": args.mode,
         "model_id": args.model_path,
+        "config_path": args.config_path,
         "torch_version": torch.__version__,
         "cuda_device": torch.cuda.get_device_name(0),
         "seed": SEED,
-        "prompts": TEST_PROMPTS,
+        "prompts": prompts,
         "generate_tokens": args.generate_tokens,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

@@ -1,0 +1,632 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_index": 0,
+  "token_ids": [
+    87,
+    107,
+    104,
+    35,
+    102,
+    100,
+    115,
+    108,
+    119,
+    100,
+    111,
+    35,
+    114,
+    105,
+    35,
+    73,
+    117,
+    100,
+    113,
+    102,
+    104,
+    35,
+    108,
+    118
+  ],
+  "seq_len": 24,
+  "greedy_token": 64,
+  "model_config": {
+    "hidden_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "intermediate_size": 256,
+    "num_hidden_layers": 4,
+    "vocab_size": 256,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 500000.0,
+    "head_dim": 32
+  },
+  "layers_dumped": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "tensors": {
+    "token_ids.bin": {
+      "shape": [
+        24
+      ],
+      "dtype": "int32",
+      "bytes": 96
+    },
+    "greedy_token.bin": {
+      "shape": [
+        1
+      ],
+      "dtype": "int32",
+      "bytes": 4
+    },
+    "embeddings.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "final_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/attn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/ffn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/gate.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_00/input_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/k.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_00/k_rope.bin": {
+      "shape": [
+        24,
+        2,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_00/output_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/post_attn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/post_attn_residual.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/post_ffn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/q.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/q_rope.bin": {
+      "shape": [
+        24,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_00/silu_mul.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_00/up.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_00/v.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_01/attn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/ffn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/gate.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_01/input_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/k.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_01/k_rope.bin": {
+      "shape": [
+        24,
+        2,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_01/output_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/post_attn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/post_attn_residual.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/post_ffn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/q.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/q_rope.bin": {
+      "shape": [
+        24,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_01/silu_mul.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_01/up.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_01/v.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_02/attn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/ffn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/gate.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_02/input_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/k.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_02/k_rope.bin": {
+      "shape": [
+        24,
+        2,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_02/output_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/post_attn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/post_attn_residual.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/post_ffn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/q.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/q_rope.bin": {
+      "shape": [
+        24,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_02/silu_mul.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_02/up.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_02/v.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_03/attn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/ffn_output.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/gate.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_03/input_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/k.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_03/k_rope.bin": {
+      "shape": [
+        24,
+        2,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "layer_03/output_hidden.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/post_attn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/post_attn_residual.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/post_ffn_norm.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/q.bin": {
+      "shape": [
+        1,
+        24,
+        128
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/q_rope.bin": {
+      "shape": [
+        24,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "bytes": 12288
+    },
+    "layer_03/silu_mul.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_03/up.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    },
+    "layer_03/v.bin": {
+      "shape": [
+        1,
+        24,
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 6144
+    },
+    "logits.bin": {
+      "shape": [
+        1,
+        24,
+        256
+      ],
+      "dtype": "float32",
+      "bytes": 24576
+    }
+  }
+}

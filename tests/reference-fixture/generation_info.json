@@ -1,0 +1,14 @@
+{
+  "mode": "fixture",
+  "model_id": "tests/fixtures/tiny-llama.gguf",
+  "config_path": "tests/fixtures/tiny-llama.config.json",
+  "torch_version": "2.11.0+cu130",
+  "cuda_device": "NVIDIA GeForce RTX 5090",
+  "seed": 42,
+  "prompts": [
+    "The capital of France is",
+    "Write a Python function that sorts a list using merge sort"
+  ],
+  "generate_tokens": 20,
+  "timestamp": "2026-04-28T09:54:09-0700"
+}
