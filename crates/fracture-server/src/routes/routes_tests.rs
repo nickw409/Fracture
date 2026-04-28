@@ -242,6 +242,7 @@ fn test_streaming_not_exercised_note() {
 /// - Multiple tokio tasks issuing requests in parallel
 /// - A concrete Backend with actual GPU resources
 /// - Verification that one request completing/failing doesn't corrupt another
+///
 /// This is deferred to integration testing (and eventually Phase 4 continuous batching).
 #[test]
 #[ignore]

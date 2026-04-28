@@ -1437,8 +1437,8 @@ fn test_alloc_huge_memory() {
 fn test_alloc_packed_dtype() {
     let b = make_backend();
     let t = b.alloc(&[100], DType::INT4).unwrap();
-    // numel=100, size_bytes = (100+1)/2 = 50
-    assert_eq!(t.size_bytes(), (100 + 1) / 2);
+    // numel=100, size_bytes = ceil(100/2) = 50
+    assert_eq!(t.size_bytes(), 100_usize.div_ceil(2));
     assert_eq!(t.numel(), 100);
     b.free(&t).unwrap();
 }
@@ -3324,41 +3324,6 @@ fn alloc_kv_block(
     data: &[f32],
 ) -> DeviceTensor {
     alloc_with_data(backend, &[BLOCK_SIZE, num_kv_heads, head_dim], data)
-}
-
-/// Build a block of shape [BLOCK_SIZE, num_kv_heads, head_dim] where token slot
-/// `slot` in [0..BLOCK_SIZE) is filled with `token_data` and all other slots are 0.
-fn block_with_token(
-    num_kv_heads: usize,
-    head_dim: usize,
-    slot: usize,
-    token_data: &[f32],
-) -> Vec<f32> {
-    let stride = num_kv_heads * head_dim;
-    let mut data = vec![0.0f32; BLOCK_SIZE * stride];
-    let base = slot * stride;
-    data[base..base + token_data.len()].copy_from_slice(token_data);
-    data
-}
-
-/// Build a block of shape [BLOCK_SIZE, num_kv_heads, head_dim] filled with
-/// sequential slots: slot `i` gets `per_slot[i]` (head-replicated across kv heads).
-fn block_with_slots(
-    num_kv_heads: usize,
-    head_dim: usize,
-    per_slot: &[Vec<f32>],
-) -> Vec<f32> {
-    let stride = num_kv_heads * head_dim;
-    let mut data = vec![0.0f32; BLOCK_SIZE * stride];
-    for (slot, slot_data) in per_slot.iter().enumerate().take(BLOCK_SIZE) {
-        let base = slot * stride;
-        // Replicate across all KV heads.
-        for kv_h in 0..num_kv_heads {
-            let offset = base + kv_h * head_dim;
-            data[offset..offset + head_dim].copy_from_slice(slot_data);
-        }
-    }
-    data
 }
 
 #[test]
