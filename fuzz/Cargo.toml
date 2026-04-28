@@ -1,0 +1,16 @@
+[package]
+name = "fracture-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fracture-gguf = { path = "../crates/fracture-gguf" }
+fracture-protocol = { path = "../crates/fracture-protocol" }
+
+# Fuzz targets are added in subsequent tasks (5.2, 5.3). Until then, this crate
+# has no [[bin]] entries and `cargo build` here is a no-op.

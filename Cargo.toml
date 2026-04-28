@@ -15,6 +15,7 @@ members = [
     "bins/fracture-coordinator-cuda",
     "tests/validation",
     "tests/model-validation",
+    "fuzz",
 ]
 
 [workspace.package]
