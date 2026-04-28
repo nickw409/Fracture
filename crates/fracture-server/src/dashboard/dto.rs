@@ -131,6 +131,45 @@ pub struct SequenceSnapshotEntry {
     pub remaining_prefill: usize,
 }
 
+impl SchedulerSnapshot {
+    pub fn to_response(&self) -> SchedulerResponse {
+        let allocated = self.total_blocks.saturating_sub(self.free_blocks);
+        let utilization = if self.total_blocks > 0 {
+            allocated as f64 / self.total_blocks as f64
+        } else {
+            0.0
+        };
+
+        SchedulerResponse {
+            active_sequences: self.active_sequences,
+            max_sequences: self.max_sequences,
+            decode_queue: self.decode_count,
+            prefill_queue: self.prefill_queue_count,
+            prefill_chunk_size: self.prefill_chunk_size,
+            kv_cache: KvCacheInfo {
+                block_size: self.block_size,
+                total_blocks: self.total_blocks,
+                allocated_blocks: allocated,
+                free_blocks: self.free_blocks,
+                utilization,
+            },
+            sequences: self
+                .sequences
+                .iter()
+                .map(|s| SequenceInfo {
+                    id: format!("seq-{}", s.seq_id),
+                    state: s.state,
+                    tokens_generated: s.tokens_generated,
+                    max_tokens: s.max_tokens,
+                    prefill_tokens: s.remaining_prefill,
+                    cache_blocks_held: 0, // not tracked at scheduler level
+                    started_at: String::new(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,44 +308,5 @@ mod tests {
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["throughput_tokens_per_sec"], 45.0);
         assert_eq!(json["worker_heartbeats"][1], 150);
-    }
-}
-
-impl SchedulerSnapshot {
-    pub fn to_response(&self) -> SchedulerResponse {
-        let allocated = self.total_blocks.saturating_sub(self.free_blocks);
-        let utilization = if self.total_blocks > 0 {
-            allocated as f64 / self.total_blocks as f64
-        } else {
-            0.0
-        };
-
-        SchedulerResponse {
-            active_sequences: self.active_sequences,
-            max_sequences: self.max_sequences,
-            decode_queue: self.decode_count,
-            prefill_queue: self.prefill_queue_count,
-            prefill_chunk_size: self.prefill_chunk_size,
-            kv_cache: KvCacheInfo {
-                block_size: self.block_size,
-                total_blocks: self.total_blocks,
-                allocated_blocks: allocated,
-                free_blocks: self.free_blocks,
-                utilization,
-            },
-            sequences: self
-                .sequences
-                .iter()
-                .map(|s| SequenceInfo {
-                    id: format!("seq-{}", s.seq_id),
-                    state: s.state,
-                    tokens_generated: s.tokens_generated,
-                    max_tokens: s.max_tokens,
-                    prefill_tokens: s.remaining_prefill,
-                    cache_blocks_held: 0, // not tracked at scheduler level
-                    started_at: String::new(),
-                })
-                .collect(),
-        }
     }
 }

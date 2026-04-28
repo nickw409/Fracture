@@ -111,6 +111,28 @@ impl Default for MetricsCollector {
     }
 }
 
+fn chrono_iso8601_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    // Simple ISO 8601 without pulling in chrono crate.
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        1970 + secs / 31_556_952, // approximate year
+        // For dashboard purposes, an approximate timestamp is fine.
+        // Real ISO 8601 would need a full calendar library.
+        (secs % 31_556_952) / 2_629_746 + 1,
+        (secs % 2_629_746) / 86400 + 1,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        millis,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,26 +243,4 @@ mod tests {
         assert!(snap.timestamp.contains('T'));
         assert!(snap.timestamp.ends_with('Z'));
     }
-}
-
-fn chrono_iso8601_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    // Simple ISO 8601 without pulling in chrono crate.
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        1970 + secs / 31_556_952, // approximate year
-        // For dashboard purposes, an approximate timestamp is fine.
-        // Real ISO 8601 would need a full calendar library.
-        (secs % 31_556_952) / 2_629_746 + 1,
-        (secs % 2_629_746) / 86400 + 1,
-        (secs % 86400) / 3600,
-        (secs % 3600) / 60,
-        secs % 60,
-        millis,
-    )
 }
