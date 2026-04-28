@@ -83,7 +83,20 @@ pub async fn accept_and_setup_pipeline(
         tracing::info!("worker connected from {addr}");
         let mut conn = FramedConnection::new(stream);
 
-        let (header, payload) = conn.recv().await?;
+        // Per-connection failures (truncated reads, malformed payloads, duplicate
+        // registrations) must NOT terminate the accept loop. A stray TCP probe
+        // (health check, port scanner, load balancer) closing without sending a
+        // Register frame would otherwise kill this task and leave the
+        // coordinator unable to accept any future worker.
+        let (header, payload) = match conn.recv().await {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read frame from {addr}: {e} — dropping connection"
+                );
+                continue;
+            }
+        };
         if header.msg_type != MessageType::Register {
             tracing::warn!(
                 "expected Register from {addr}, got {:?} — dropping",
@@ -92,7 +105,15 @@ pub async fn accept_and_setup_pipeline(
             continue;
         }
 
-        let reg_msg: RegisterPayload = FramedConnection::deserialize_payload(&payload)?;
+        let reg_msg: RegisterPayload = match FramedConnection::deserialize_payload(&payload) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to deserialize Register from {addr}: {e} — dropping connection"
+                );
+                continue;
+            }
+        };
         tracing::info!(
             "worker '{}' registered: {} ({:.1} GB available, decode={:.2} ms/layer)",
             reg_msg.node_id,
@@ -111,7 +132,13 @@ pub async fn accept_and_setup_pipeline(
         };
 
         let mut reg = registry.lock().await;
-        reg.register(caps, conn)?;
+        if let Err(e) = reg.register(caps, conn) {
+            tracing::warn!(
+                "failed to register '{}' from {addr}: {e} — dropping connection",
+                reg_msg.node_id
+            );
+            continue;
+        }
     }
 
     tracing::info!("all {} workers registered — running scheduler", expected_workers);
