@@ -70,7 +70,7 @@ Tests are serialized by GPU memory sensitivity via `.config/nextest.toml`:
 
 ```bash
 cargo check          # Verify workspace compiles
-cargo nextest run    # Run all tests (983 tests: unit + GPU kernel + integration + e2e + fuzz regressions + fixture)
+cargo nextest run    # Run all tests (992 tests: unit + GPU kernel + integration + e2e + fuzz regressions + fixture)
 cargo clippy         # Lint
 ```
 
