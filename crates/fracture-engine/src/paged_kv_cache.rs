@@ -376,10 +376,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
+    /// (src_id, dst_id, src_off, dst_off, count)
+    type CopyRowsCall = (u64, u64, usize, usize, usize);
+
     /// MockBackend that tracks alloc/free and supports copy_rows.
     struct MockBackend {
         next_id: AtomicU64,
-        copy_rows_log: Mutex<Vec<(u64, u64, usize, usize, usize)>>, // (src_id, dst_id, src_off, dst_off, count)
+        copy_rows_log: Mutex<Vec<CopyRowsCall>>,
     }
 
     impl MockBackend {

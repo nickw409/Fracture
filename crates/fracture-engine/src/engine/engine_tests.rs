@@ -318,11 +318,13 @@ fn test_forward_no_profiling_skips_timers() {
 
 // ── CopyRowsRecordingBackend ─────────────────────────────────
 
+/// (src_id, dst_id, src_offset, dst_offset, count)
+type CopyRowsCall = (u64, u64, usize, usize, usize);
+
 /// Records copy_rows calls to verify KV cache append behavior.
 struct CopyRowsRecordingBackend {
     next_id: AtomicU64,
-    /// (src_id, dst_id, src_offset, dst_offset, count)
-    copy_rows_calls: Mutex<Vec<(u64, u64, usize, usize, usize)>>,
+    copy_rows_calls: Mutex<Vec<CopyRowsCall>>,
 }
 
 impl CopyRowsRecordingBackend {

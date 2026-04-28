@@ -736,11 +736,14 @@ fn test_weight_store_layer_range_validation() {
     );
 }
 
+/// (shape, dtype, bytes) recorded from a single copy_to_device call.
+type CapturedTensor = (Vec<usize>, DType, Vec<u8>);
+
 /// A MockBackend that captures the bytes passed to copy_to_device for each tensor.
 struct CapturingMockBackend {
     next_id: AtomicU64,
-    /// Maps TensorId -> (shape, dtype, bytes) for each copy_to_device call.
-    captured: std::sync::Mutex<HashMap<u64, (Vec<usize>, DType, Vec<u8>)>>,
+    /// Maps TensorId -> captured-tensor record for each copy_to_device call.
+    captured: std::sync::Mutex<HashMap<u64, CapturedTensor>>,
 }
 
 impl CapturingMockBackend {
