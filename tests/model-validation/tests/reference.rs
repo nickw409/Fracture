@@ -120,6 +120,10 @@ fn test_prefill_logits(prompt_index: usize) {
         "Prompt {prompt_index} prefill logits: max_abs_error={:.4}, mean_abs_error={:.6}, mismatches={}/{}",
         result.max_abs_error, result.mean_abs_error, result.num_mismatches, result.total_elements
     );
+    eprintln!(
+        "BASELINE_CAPTURE real/prompt_{prompt_index}/prefill: max_abs_error={:.6} mean_abs_error={:.6}",
+        result.max_abs_error, result.mean_abs_error
+    );
 
     // Primary correctness check: greedy token must match
     let engine_greedy = engine_logits
@@ -135,12 +139,13 @@ fn test_prefill_logits(prompt_index: usize) {
         meta.greedy_token
     );
 
-    // Secondary check: overall logits similarity (warn but don't fail on tolerance)
-    if !result.matches {
-        eprintln!(
-            "WARNING: prompt_{prompt_index} logits exceed strict tolerance but greedy token matches.\n{result}"
-        );
-    }
+    // Secondary check: hard baseline assertion against committed limit.
+    let baselines = fracture_model_validation::load_baselines();
+    fracture_model_validation::assert_within_baseline(
+        &format!("real/prompt_{prompt_index}/prefill"),
+        result.max_abs_error,
+        &baselines,
+    );
 }
 
 #[test]
@@ -174,6 +179,35 @@ fn fixture_full_forward_greedy_matches_pytorch() {
 
     let (engine_logits, mut cache, handle) = run_prefill(&engine, &config, &meta.token_ids);
     cache.free(handle, engine.backend()).unwrap();
+
+    // Compare engine logits against PyTorch reference at the last position.
+    let ref_logits = fracture_validation::tensor_compare::load_reference_tensor(
+        ref_dir.join("logits.bin").to_str().unwrap()
+    ).expect("load fixture logits");
+    let ref_all = ref_logits.to_f32();
+    let vocab_size = config.vocab_size;
+    let ref_last = &ref_all[ref_all.len() - vocab_size..];
+    let result = fracture_validation::tensor_compare::compare_tensors(
+        &f32_to_bytes(&engine_logits),
+        fracture_validation::tensor_compare::DType::F32,
+        &fracture_validation::tensor_compare::ReferenceTensor {
+            shape: vec![vocab_size],
+            dtype: fracture_validation::tensor_compare::DType::F32,
+            data: f32_to_bytes(ref_last),
+        },
+        0.05,
+        0.5,
+    );
+    eprintln!(
+        "BASELINE_CAPTURE fixture/prompt_0/prefill: max_abs_error={:.6} mean_abs_error={:.6}",
+        result.max_abs_error, result.mean_abs_error
+    );
+    let baselines = fracture_model_validation::load_baselines();
+    fracture_model_validation::assert_within_baseline(
+        "fixture/prompt_0/prefill",
+        result.max_abs_error,
+        &baselines,
+    );
 
     let engine_greedy = engine_logits
         .iter()
@@ -282,10 +316,15 @@ fn test_decode_step_0() {
         "decode_step_0 logits: max_abs_error={:.4}, mean_abs_error={:.6}, mismatches={}/{}",
         result.max_abs_error, result.mean_abs_error, result.num_mismatches, result.total_elements
     );
+    eprintln!(
+        "BASELINE_CAPTURE real/decode_step_0: max_abs_error={:.6} mean_abs_error={:.6}",
+        result.max_abs_error, result.mean_abs_error
+    );
 
-    if !result.matches {
-        eprintln!(
-            "WARNING: decode_step_0 logits exceed strict tolerance but greedy token matches.\n{result}"
-        );
-    }
+    let baselines = fracture_model_validation::load_baselines();
+    fracture_model_validation::assert_within_baseline(
+        "real/decode_step_0",
+        result.max_abs_error,
+        &baselines,
+    );
 }

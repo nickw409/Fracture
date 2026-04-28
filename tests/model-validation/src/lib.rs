@@ -115,3 +115,48 @@ pub fn setup_fixture_engine() -> Option<(Engine<CudaBackend>, ModelConfig)> {
     let engine = Engine::new(backend, weights, 0..config.num_layers);
     Some((engine, config))
 }
+
+#[derive(serde::Deserialize)]
+pub struct Baselines {
+    pub schema_version: u32,
+    pub tolerance_factor: f32,
+    pub baselines: std::collections::HashMap<String, BaselineEntry>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct BaselineEntry {
+    pub max_abs_error: f32,
+    #[serde(default)]
+    pub notes: String,
+}
+
+pub fn load_baselines() -> Baselines {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap().parent().unwrap()
+        .join("tests/baselines/logit_baselines.json");
+    let s = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("baselines file missing at {}: {e}", path.display()));
+    serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("baselines parse failed: {e}"))
+}
+
+/// Assert that `observed` does not exceed the committed baseline by more than
+/// the configured `tolerance_factor`. Panics if `key` is not present in the
+/// JSON, or if the observed value is too large.
+pub fn assert_within_baseline(key: &str, observed: f32, baselines: &Baselines) {
+    let entry = baselines.baselines.get(key).unwrap_or_else(|| {
+        panic!(
+            "no baseline entry for key {key}; add it to tests/baselines/logit_baselines.json \
+             or refresh via scripts/refresh_logit_baselines.py"
+        )
+    });
+    let limit = entry.max_abs_error * baselines.tolerance_factor;
+    assert!(
+        observed <= limit,
+        "{key}: max_abs_error={observed:.6} exceeds baseline {:.6} * {} = {limit:.6}\n\
+         If this drift is expected, update tests/baselines/logit_baselines.json via \
+         scripts/refresh_logit_baselines.py.",
+        entry.max_abs_error,
+        baselines.tolerance_factor
+    );
+}
