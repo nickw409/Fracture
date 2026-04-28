@@ -3261,3 +3261,418 @@ async fn test_seed_discovery_skips_unreachable_tries_next() {
     assert_eq!(found, Some("10.0.0.1:9400".into()));
     seed_task.await.unwrap();
 }
+
+// ── Byzantine worker tests (Task 8.1) ───────────────────────────────────
+//
+// These tests confirm the coordinator handles malformed worker responses
+// gracefully (returns Err, doesn't panic, doesn't hang). They use a raw
+// TCP-level mock worker that handles cache alloc/heartbeat/shutdown
+// correctly, but injects misbehavior on the response to a Forward request.
+
+#[derive(Clone, Copy, Debug)]
+enum BadResponse {
+    /// Return a forward-result payload whose activation tensor has the wrong shape.
+    WrongShapeActivations,
+    /// Reply with a frame whose declared payload size exceeds MAX_PAYLOAD_SIZE.
+    OversizedPayload,
+    /// Serialize a frame normally, then flip a byte in the CRC field before send.
+    CorruptedCrc,
+    /// Write the frame header and immediately close the socket without sending payload.
+    DropMidMessage,
+    /// Reply with a frame whose msg_type byte is undefined (0xFF).
+    UnknownMessageType,
+}
+
+/// Spawn a Byzantine mock worker that responds to CacheAlloc/CacheFree/Shutdown
+/// normally, but on the next Forward request injects the requested bad response.
+///
+/// Uses raw `TcpStream` I/O instead of `FramedConnection` so we can write
+/// arbitrary malformed bytes (bad CRC, bad msg_type, oversized header, mid-frame
+/// disconnect, etc.) without going through the well-formed encode path.
+async fn spawn_byzantine_mock_worker(
+    listener: TcpListener,
+    bad: BadResponse,
+    hidden_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        // Helper: read a single frame (header + payload + CRC) from the stream.
+        // Returns (msg_type_byte, seq_id, payload_bytes) or None on EOF.
+        async fn read_frame(
+            stream: &mut tokio::net::TcpStream,
+        ) -> Option<(u8, u64, Vec<u8>)> {
+            let mut hdr = [0u8; fracture_protocol::frame::HEADER_SIZE];
+            stream.read_exact(&mut hdr).await.ok()?;
+            let msg_type = hdr[3];
+            let seq_id = u64::from_be_bytes(hdr[4..12].try_into().unwrap());
+            let payload_len = u32::from_be_bytes(hdr[12..16].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; payload_len];
+            if payload_len > 0 {
+                stream.read_exact(&mut payload).await.ok()?;
+            }
+            let mut crc = [0u8; 4];
+            stream.read_exact(&mut crc).await.ok()?;
+            Some((msg_type, seq_id, payload))
+        }
+
+        // Helper: write a well-formed frame (header + payload + CRC).
+        async fn write_well_formed(
+            stream: &mut tokio::net::TcpStream,
+            msg_type: MessageType,
+            seq_id: u64,
+            payload: &[u8],
+        ) {
+            let header = fracture_protocol::frame::FrameHeader {
+                msg_type,
+                seq_id,
+                payload_len: payload.len() as u32,
+            };
+            let frame = fracture_protocol::frame::encode_frame(&header, payload);
+            stream.write_all(&frame).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+
+        loop {
+            let Some((msg_type_byte, seq_id, _payload)) = read_frame(&mut stream).await
+            else {
+                break;
+            };
+
+            // 0x07 = CacheAlloc, 0x08 = CacheFree, 0x09 = Shutdown,
+            // 0x05 = Heartbeat, 0x03 = Forward.
+            match msg_type_byte {
+                0x07 => {
+                    // CacheAlloc → CacheAllocAck
+                    write_well_formed(
+                        &mut stream,
+                        MessageType::CacheAllocAck,
+                        seq_id,
+                        &[],
+                    )
+                    .await;
+                }
+                0x08 => {
+                    // CacheFree — no response.
+                }
+                0x05 => {
+                    // Heartbeat → HeartbeatAck (echo timestamp/nonce zeros).
+                    let ack = HeartbeatAckPayload {
+                        timestamp_echo: 0,
+                        nonce_echo: 0,
+                        gpu_memory_used: 0,
+                        active_sequences: 0,
+                        free_blocks: 0,
+                    };
+                    let bytes = bincode::serialize(&ack).unwrap();
+                    write_well_formed(
+                        &mut stream,
+                        MessageType::HeartbeatAck,
+                        seq_id,
+                        &bytes,
+                    )
+                    .await;
+                }
+                0x09 => {
+                    // Shutdown
+                    break;
+                }
+                0x03 => {
+                    // Forward — inject the bad response.
+                    match bad {
+                        BadResponse::WrongShapeActivations => {
+                            // Build activations whose last-dim doesn't match
+                            // hidden_size. Coordinator validates shape and
+                            // should return Pipeline error.
+                            let bad_last_dim = (hidden_size as u32).wrapping_add(1);
+                            let data_len = bad_last_dim as usize * 2; // FP16
+                            let payload = ForwardResultPayload {
+                                output: ForwardOutputWire::Activations {
+                                    tensor_header: TensorWireHeader {
+                                        ndim: 2,
+                                        shape: vec![1, bad_last_dim],
+                                        dtype: 0,
+                                        compression: 0,
+                                        data_len: data_len as u32,
+                                    },
+                                    tensor_data: vec![0u8; data_len],
+                                },
+                            };
+                            let bytes = bincode::serialize(&payload).unwrap();
+                            write_well_formed(
+                                &mut stream,
+                                MessageType::ForwardResult,
+                                seq_id,
+                                &bytes,
+                            )
+                            .await;
+                        }
+                        BadResponse::OversizedPayload => {
+                            // Header lies: declares payload_len > MAX_PAYLOAD_SIZE.
+                            // Don't actually send the payload — coordinator
+                            // should reject on header decode.
+                            let mut hdr =
+                                [0u8; fracture_protocol::frame::HEADER_SIZE];
+                            hdr[0] = 0x46;
+                            hdr[1] = 0x52;
+                            hdr[2] = 0x01; // version
+                            hdr[3] = MessageType::ForwardResult as u8;
+                            hdr[4..12].copy_from_slice(&seq_id.to_be_bytes());
+                            let big = fracture_protocol::frame::MAX_PAYLOAD_SIZE
+                                .wrapping_add(1);
+                            hdr[12..16].copy_from_slice(&big.to_be_bytes());
+                            stream.write_all(&hdr).await.unwrap();
+                            stream.flush().await.unwrap();
+                            // Then close — coordinator should already have errored.
+                            break;
+                        }
+                        BadResponse::CorruptedCrc => {
+                            // Build a well-formed empty-logits frame, then
+                            // flip one CRC byte at the end.
+                            let payload = ForwardResultPayload {
+                                output: ForwardOutputWire::Logits { data: vec![] },
+                            };
+                            let bytes = bincode::serialize(&payload).unwrap();
+                            let header = fracture_protocol::frame::FrameHeader {
+                                msg_type: MessageType::ForwardResult,
+                                seq_id,
+                                payload_len: bytes.len() as u32,
+                            };
+                            let mut frame =
+                                fracture_protocol::frame::encode_frame(&header, &bytes);
+                            // Corrupt the last CRC byte.
+                            let last = frame.len() - 1;
+                            frame[last] ^= 0xFF;
+                            stream.write_all(&frame).await.unwrap();
+                            stream.flush().await.unwrap();
+                        }
+                        BadResponse::DropMidMessage => {
+                            // Write a header declaring some payload, then drop.
+                            let mut hdr =
+                                [0u8; fracture_protocol::frame::HEADER_SIZE];
+                            hdr[0] = 0x46;
+                            hdr[1] = 0x52;
+                            hdr[2] = 0x01;
+                            hdr[3] = MessageType::ForwardResult as u8;
+                            hdr[4..12].copy_from_slice(&seq_id.to_be_bytes());
+                            // Claim 1024 bytes of payload but send none.
+                            hdr[12..16].copy_from_slice(&1024u32.to_be_bytes());
+                            stream.write_all(&hdr).await.unwrap();
+                            stream.flush().await.unwrap();
+                            // Drop the socket immediately.
+                            drop(stream);
+                            return;
+                        }
+                        BadResponse::UnknownMessageType => {
+                            // Build a frame with msg_type = 0xFF (undefined).
+                            // Compute CRC manually so the only failure is
+                            // the unknown type — not a CRC mismatch.
+                            let mut hdr =
+                                [0u8; fracture_protocol::frame::HEADER_SIZE];
+                            hdr[0] = 0x46;
+                            hdr[1] = 0x52;
+                            hdr[2] = 0x01;
+                            hdr[3] = 0xFF; // unknown message type
+                            hdr[4..12].copy_from_slice(&seq_id.to_be_bytes());
+                            hdr[12..16].copy_from_slice(&0u32.to_be_bytes());
+                            let crc = crc32c::crc32c(&hdr);
+                            let mut frame = hdr.to_vec();
+                            frame.extend_from_slice(&crc.to_be_bytes());
+                            stream.write_all(&frame).await.unwrap();
+                            stream.flush().await.unwrap();
+                        }
+                    }
+                }
+                _ => {
+                    // Ignore unexpected message types.
+                }
+            }
+        }
+    })
+}
+
+/// Helper: build a single-tail-node pipeline backed by one Byzantine worker.
+/// Returns (pipeline, registry, _worker_handle).
+async fn setup_byzantine_tail(
+    bad: BadResponse,
+) -> (
+    DistributedPipeline,
+    PeerRegistry,
+    tokio::task::JoinHandle<()>,
+) {
+    let hidden_size = 4096;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let worker = spawn_byzantine_mock_worker(listener, bad, hidden_size).await;
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let conn = FramedConnection::new(stream);
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("byz"), conn).unwrap();
+
+    let assignment = LayerAssignment {
+        node_id: "byz".into(),
+        layer_range: 0..32,
+        role: NodeRole::Tail,
+        expected_decode_ms: 32.0,
+        weight_memory_gb: 12.0,
+        cache_memory_gb: 2.0,
+    };
+    registry.assign("byz", assignment.clone()).unwrap();
+
+    let pipeline = DistributedPipeline::new(&[assignment], hidden_size).unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
+
+    (pipeline, registry, worker)
+}
+
+#[tokio::test]
+async fn coordinator_rejects_wrong_shape_activations() {
+    // Two-node pipeline: byzantine head returns activations with wrong last-dim,
+    // normal tail returns logits. Coordinator should reject between stages.
+    let hidden_size = 4096;
+    let vocab_size = 128256;
+
+    let head_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let head_addr = head_listener.local_addr().unwrap();
+    let tail_addr = tail_listener.local_addr().unwrap();
+
+    let _head = spawn_byzantine_mock_worker(
+        head_listener,
+        BadResponse::WrongShapeActivations,
+        hidden_size,
+    )
+    .await;
+    let _tail = spawn_mock_worker(tail_listener, true, hidden_size, vocab_size).await;
+
+    let head_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(head_addr).await.unwrap(),
+    );
+    let tail_conn = FramedConnection::new(
+        tokio::net::TcpStream::connect(tail_addr).await.unwrap(),
+    );
+
+    let mut registry = PeerRegistry::new();
+    registry.register(make_caps("head"), head_conn).unwrap();
+    registry.register(make_caps("tail"), tail_conn).unwrap();
+
+    let assignments = vec![
+        LayerAssignment {
+            node_id: "head".into(),
+            layer_range: 0..16,
+            role: NodeRole::Head,
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        },
+        LayerAssignment {
+            node_id: "tail".into(),
+            layer_range: 16..32,
+            role: NodeRole::Tail,
+            expected_decode_ms: 16.0,
+            weight_memory_gb: 6.0,
+            cache_memory_gb: 1.0,
+        },
+    ];
+    for a in &assignments {
+        registry.assign(&a.node_id, a.clone()).unwrap();
+    }
+
+    let pipeline = DistributedPipeline::new(&assignments, hidden_size).unwrap();
+    pipeline.alloc_cache(&mut registry, 1).await.unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipeline.forward(&mut registry, 1, &[1, 2], &[0, 1], true),
+    )
+    .await
+    .expect("forward should not hang on wrong-shape activations");
+
+    let err = result.expect_err("expected error on wrong-shape activations");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hidden_size") || msg.contains("last dim") || msg.contains("shape"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_rejects_oversized_payload() {
+    let (pipeline, mut registry, _worker) =
+        setup_byzantine_tail(BadResponse::OversizedPayload).await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipeline.forward(&mut registry, 1, &[1], &[0], true),
+    )
+    .await
+    .expect("forward should not hang on oversized payload");
+
+    assert!(
+        result.is_err(),
+        "expected error on oversized payload header, got Ok"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_rejects_corrupted_crc() {
+    let (pipeline, mut registry, _worker) =
+        setup_byzantine_tail(BadResponse::CorruptedCrc).await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipeline.forward(&mut registry, 1, &[1], &[0], true),
+    )
+    .await
+    .expect("forward should not hang on corrupted CRC");
+
+    let err = result.expect_err("expected error on CRC mismatch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CRC") || msg.to_lowercase().contains("crc"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_handles_drop_mid_message() {
+    let (pipeline, mut registry, _worker) =
+        setup_byzantine_tail(BadResponse::DropMidMessage).await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipeline.forward(&mut registry, 1, &[1], &[0], true),
+    )
+    .await
+    .expect("forward should not hang on dropped socket");
+
+    assert!(
+        result.is_err(),
+        "expected I/O error on mid-message disconnect, got Ok"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_rejects_unknown_message_type() {
+    let (pipeline, mut registry, _worker) =
+        setup_byzantine_tail(BadResponse::UnknownMessageType).await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipeline.forward(&mut registry, 1, &[1], &[0], true),
+    )
+    .await
+    .expect("forward should not hang on unknown message type");
+
+    let err = result.expect_err("expected error on unknown message type");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown message type") || msg.contains("0xFF"),
+        "unexpected error message: {msg}"
+    );
+}

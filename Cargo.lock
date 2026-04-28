@@ -473,6 +473,8 @@ dependencies = [
 name = "fracture-coordinator"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "crc32c",
  "fracture-core",
  "fracture-protocol",
  "rand",
