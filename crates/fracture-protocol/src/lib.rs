@@ -18,6 +18,6 @@ pub mod tensor;
 
 // Re-export key types for convenience
 pub use connection::{FramedConnection, FramedReader, FramedWriter};
-pub use frame::{FrameHeader, MessageType};
+pub use frame::{decode_frame_from_bytes, FrameHeader, MessageType};
 pub use messages::*;
 pub use tensor::TensorWireHeader;

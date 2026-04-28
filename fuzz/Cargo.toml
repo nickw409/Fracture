@@ -17,3 +17,9 @@ name = "gguf_parser"
 path = "fuzz_targets/gguf_parser.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "wire_frame"
+path = "fuzz_targets/wire_frame.rs"
+test = false
+doc = false

@@ -179,6 +179,65 @@ pub fn verify_crc(header_and_payload: &[u8], expected_crc: u32) -> Result<()> {
     Ok(())
 }
 
+/// Decode a single wire frame from a byte slice.
+///
+/// Returns the decoded header and a copy of the payload bytes, or `Err` on
+/// malformed/truncated input. Performs the same validation as the async
+/// [`FramedConnection::recv`](crate::connection::FramedConnection::recv) path:
+/// magic, version, message-type, payload-length cap, and CRC32C.
+///
+/// This sync byte-slice entry point is the primary surface for fuzzing the
+/// wire-frame decoder. It must never panic on adversarial input — only
+/// return `Err`.
+pub fn decode_frame_from_bytes(bytes: &[u8]) -> Result<(FrameHeader, Vec<u8>)> {
+    // Need at least a full header before we even look at lengths.
+    if bytes.len() < HEADER_SIZE {
+        return Err(FractureError::Protocol(format!(
+            "frame truncated: need {} header bytes, got {}",
+            HEADER_SIZE,
+            bytes.len()
+        )));
+    }
+    let hdr_buf: &[u8; HEADER_SIZE] = bytes[..HEADER_SIZE]
+        .try_into()
+        .expect("slice length checked above");
+    let header = decode_header(hdr_buf)?;
+
+    let payload_len = header.payload_len as usize;
+
+    // Bounds-check payload + CRC against the input length BEFORE allocating
+    // anything proportional to payload_len. Use checked arithmetic to defend
+    // against pathological additions on 32-bit targets (HEADER + CRC is small,
+    // but payload_len is up to 256 MB and we want to be explicit).
+    let frame_end = HEADER_SIZE
+        .checked_add(payload_len)
+        .and_then(|n| n.checked_add(CRC_SIZE))
+        .ok_or_else(|| {
+            FractureError::Protocol("frame size arithmetic overflow".to_string())
+        })?;
+    if bytes.len() < frame_end {
+        return Err(FractureError::Protocol(format!(
+            "frame truncated: need {} bytes (header + {} payload + crc), got {}",
+            frame_end,
+            payload_len,
+            bytes.len()
+        )));
+    }
+
+    let payload_start = HEADER_SIZE;
+    let payload_end = payload_start + payload_len;
+    let payload = &bytes[payload_start..payload_end];
+
+    let crc_bytes: [u8; CRC_SIZE] = bytes[payload_end..payload_end + CRC_SIZE]
+        .try_into()
+        .expect("slice length checked above");
+    let expected_crc = u32::from_be_bytes(crc_bytes);
+
+    verify_crc(&bytes[..payload_end], expected_crc)?;
+
+    Ok((header, payload.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +457,76 @@ mod tests {
             .unwrap();
         let expected_crc = u32::from_be_bytes(crc_bytes);
         verify_crc(&frame[..HEADER_SIZE], expected_crc).unwrap();
+    }
+
+    #[test]
+    fn test_decode_frame_from_bytes_roundtrip() {
+        let header = FrameHeader {
+            msg_type: MessageType::Forward,
+            seq_id: 0xCAFEBABE,
+            payload_len: 5,
+        };
+        let frame = encode_frame(&header, b"hello");
+        let (decoded_header, payload) = decode_frame_from_bytes(&frame).unwrap();
+        assert_eq!(decoded_header, header);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn test_decode_frame_from_bytes_truncated_header() {
+        // Empty buffer — must return Err, not panic.
+        assert!(decode_frame_from_bytes(&[]).is_err());
+        // Half a header.
+        assert!(decode_frame_from_bytes(&[0x46, 0x52, 0x01]).is_err());
+        // Just under HEADER_SIZE.
+        let buf = vec![0u8; HEADER_SIZE - 1];
+        assert!(decode_frame_from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_frame_from_bytes_truncated_payload() {
+        // Header claims 1024 bytes of payload but supplies none.
+        let header = FrameHeader {
+            msg_type: MessageType::Forward,
+            seq_id: 0,
+            payload_len: 1024,
+        };
+        let mut hdr = [0u8; HEADER_SIZE];
+        encode_header(&header, &mut hdr);
+        let mut buf = hdr.to_vec();
+        // Add a few payload bytes but not the full 1024 + CRC.
+        buf.extend_from_slice(&[0xAA; 8]);
+        let result = decode_frame_from_bytes(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_frame_from_bytes_oversized_payload_len() {
+        // payload_len exceeds MAX_PAYLOAD_SIZE — must error in decode_header
+        // before any allocation is attempted.
+        let header = FrameHeader {
+            msg_type: MessageType::Forward,
+            seq_id: 0,
+            payload_len: MAX_PAYLOAD_SIZE + 1,
+        };
+        let mut hdr = [0u8; HEADER_SIZE];
+        encode_header(&header, &mut hdr);
+        let result = decode_frame_from_bytes(&hdr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_frame_from_bytes_bad_crc() {
+        let header = FrameHeader {
+            msg_type: MessageType::Heartbeat,
+            seq_id: 0,
+            payload_len: 3,
+        };
+        let mut frame = encode_frame(&header, b"abc");
+        // Flip a CRC byte.
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+        assert!(decode_frame_from_bytes(&frame).is_err());
     }
 
     #[test]
