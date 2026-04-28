@@ -195,7 +195,7 @@ mod tests {
             assert_eq!(t.numel(), 32, "numel wrong for {dtype}");
 
             let expected_bytes = if dtype.is_packed() {
-                (32 + 1) / 2 // INT4: ceil(32/2) = 16
+                32_usize.div_ceil(2) // INT4: ceil(32/2) = 16
             } else {
                 32 * dtype.size_bytes()
             };

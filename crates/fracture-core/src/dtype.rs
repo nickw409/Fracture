@@ -30,6 +30,18 @@ impl DType {
     }
 }
 
+impl std::fmt::Display for DType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DType::FP16 => write!(f, "fp16"),
+            DType::FP32 => write!(f, "fp32"),
+            DType::BF16 => write!(f, "bf16"),
+            DType::INT8 => write!(f, "int8"),
+            DType::INT4 => write!(f, "int4"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,18 +80,6 @@ mod tests {
             let json = serde_json::to_string(dt).unwrap();
             let back: DType = serde_json::from_str(&json).unwrap();
             assert_eq!(*dt, back, "roundtrip failed for {dt}");
-        }
-    }
-}
-
-impl std::fmt::Display for DType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DType::FP16 => write!(f, "fp16"),
-            DType::FP32 => write!(f, "fp32"),
-            DType::BF16 => write!(f, "bf16"),
-            DType::INT8 => write!(f, "int8"),
-            DType::INT4 => write!(f, "int4"),
         }
     }
 }

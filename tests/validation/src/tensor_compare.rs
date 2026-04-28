@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_load_reference_tensor_f16() {
-        let values = [0.5f32, -1.0, 3.14];
+        let values = [0.5f32, -1.0, 1.75];
         let raw = f16_bytes(&values);
         let blob = build_tensor_bytes(&[3], DType::F16, &raw);
 

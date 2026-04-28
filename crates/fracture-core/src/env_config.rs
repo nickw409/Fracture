@@ -107,7 +107,7 @@ mod tests {
         let path = dir.path().join("test.env");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "# Comment").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "COORDINATOR=192.168.1.10:9400").unwrap();
         writeln!(f, "SEEDS = host1:9400,host2:9400").unwrap();
         writeln!(f, "MODEL=\"/path/to/model.gguf\"").unwrap();
