@@ -370,7 +370,9 @@ async fn distributed_loop_task(
         };
         let can_admit = free_blocks > config.min_free_blocks_reserve || free_blocks == 0;
 
-        while !pending.is_empty() && can_admit {
+        // Admit at most one request per outer iteration so free-block stats
+        // get re-checked between admissions.
+        if !pending.is_empty() && can_admit {
             let req = pending.remove(0);
             let seq_id = req.seq_id;
 
@@ -407,8 +409,6 @@ async fn distributed_loop_task(
                     ));
                 }
             }
-            // Only admit one per iteration to re-check free blocks.
-            break;
         }
 
         if active.is_empty() {
