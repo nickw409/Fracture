@@ -1,6 +1,10 @@
 // Index-based for loops over fixed test ranges read more clearly than
 // `enumerate().take(n).skip(1)` in assertion-heavy test setups.
 #![allow(clippy::needless_range_loop)]
+// Strided multi-dim indexing keeps `head_idx * stride_h + kv_idx * stride_kv + d`
+// shape even when individual factors are 0 or 1 in test fixtures. Dropping the
+// constants would obscure which axis each term represents.
+#![allow(clippy::identity_op, clippy::erasing_op)]
 
 use super::*;
 use fracture_core::{Backend, DType, DeviceTensor, DeviceTimer, FractureError, TensorId};

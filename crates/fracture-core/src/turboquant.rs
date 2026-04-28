@@ -707,7 +707,10 @@ mod tests {
             );
         }
 
-        // Check a diagonal element (row self-dot = 1)
+        // Check a diagonal element (row self-dot = 1).
+        // `0 * d + k` mirrors the `i * d + k` indexing used above so the
+        // self-dot of row 0 reads parallel to the orthogonality check.
+        #[allow(clippy::erasing_op)]
         let self_dot: f32 = (0..d).map(|k| q[0 * d + k] * q[0 * d + k]).sum();
         assert!(
             (self_dot - 1.0).abs() < 1e-3,
