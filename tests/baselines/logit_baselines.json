@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "tolerance_factor": 1.5,
+  "baselines": {
+    "fixture/prompt_0/prefill": {
+      "max_abs_error": 0.046875,
+      "notes": "Captured 2026-04-28 from fixture model"
+    },
+    "real/prompt_0/prefill": {
+      "max_abs_error": 0.0,
+      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+    },
+    "real/prompt_1/prefill": {
+      "max_abs_error": 0.0,
+      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+    },
+    "real/decode_step_0": {
+      "max_abs_error": 0.0,
+      "notes": "TODO: populate via scripts/refresh_logit_baselines.py with FRACTURE_MODEL_PATH set"
+    }
+  }
+}
