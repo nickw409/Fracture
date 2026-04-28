@@ -1200,11 +1200,10 @@ async fn test_full_lifecycle_over_wire() {
             if let Ok(Ok((header, payload))) = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 reader.lock().await.recv(),
-            ).await {
-                if header.msg_type == MessageType::HeartbeatAck {
+            ).await
+                && header.msg_type == MessageType::HeartbeatAck {
                     ack_result = FramedConnection::deserialize_payload::<HeartbeatAckPayload>(&payload).ok();
                 }
-            }
         }
         if let Some(ack) = &ack_result {
             tracker.process_ack(registry, &workers[0], ack);

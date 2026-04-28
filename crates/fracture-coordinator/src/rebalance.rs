@@ -94,8 +94,8 @@ pub async fn forced_rebalance(
                         assignment.node_id
                     ))
                 })?;
-            if let Some(entry) = reg.get_mut(&assignment.node_id) {
-                if let Err(e) = entry
+            if let Some(entry) = reg.get_mut(&assignment.node_id)
+                && let Err(e) = entry
                     .writer
                     .send(MessageType::Reconfigure, 0, &ack)
                     .await
@@ -107,7 +107,6 @@ pub async fn forced_rebalance(
                     // Mark worker as dead — it can't participate.
                     reg.mark_dead(&assignment.node_id);
                 }
-            }
         }
     }
 

@@ -122,11 +122,10 @@ fn spawn_pipeline_inner(coord_port: u16, http_port: u16, batched: bool) -> (Proc
                 "temperature": 0.0,
             }))
             .send();
-        if let Ok(resp) = result {
-            if resp.status().is_success() {
+        if let Ok(resp) = result
+            && resp.status().is_success() {
                 break;
             }
-        }
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -441,11 +440,10 @@ fn test_e2e_network_failure_detection() {
             let _ = worker.wait();
             panic!("HTTP server not ready within 60 seconds");
         }
-        if let Ok(resp) = client.get(format!("http://127.0.0.1:{HTTP_PORT}/health")).send() {
-            if resp.status().is_success() {
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{HTTP_PORT}/health")).send()
+            && resp.status().is_success() {
                 break;
             }
-        }
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -855,9 +853,8 @@ fn test_e2e_batched_worker_death_aborts_requests() {
                 "temperature": 0.0,
             }))
             .send();
-        if let Ok(resp) = result {
-            if resp.status().is_success() { break; }
-        }
+        if let Ok(resp) = result
+            && resp.status().is_success() { break; }
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -972,9 +969,8 @@ fn test_e2e_worker_reconnection_recovery() {
                 "temperature": 0.0,
             }))
             .send();
-        if let Ok(resp) = result {
-            if resp.status().is_success() { break; }
-        }
+        if let Ok(resp) = result
+            && resp.status().is_success() { break; }
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -1022,8 +1018,8 @@ fn test_e2e_worker_reconnection_recovery() {
             }))
             .send();
 
-        if let Ok(r) = result {
-            if r.status().is_success() {
+        if let Ok(r) = result
+            && r.status().is_success() {
                 let body: serde_json::Value = r.json().unwrap_or_default();
                 if body["choices"][0]["text"].as_str().map_or(false, |t| !t.is_empty()) {
                     recovered = true;
@@ -1036,7 +1032,6 @@ fn test_e2e_worker_reconnection_recovery() {
                     break;
                 }
             }
-        }
         std::thread::sleep(Duration::from_secs(2));
     }
 

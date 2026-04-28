@@ -908,8 +908,7 @@ async fn main() -> Result<()> {
                 && coordinator_capable
                 && disconnect_time.elapsed() >= election_timeout
                 && cluster_manifest.lock().await.is_some()
-            {
-                if let Some(ref mut agent) = election_agent {
+                && let Some(ref mut agent) = election_agent {
                     let term = agent.start_election();
                     election_started = true;
                     tracing::info!(
@@ -975,7 +974,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-            }
             // Apply +/-25% jitter to prevent thundering herd
             let jitter_range = backoff.as_millis() as f64 * 0.25;
             let jitter_ms = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
@@ -1210,14 +1208,14 @@ async fn main() -> Result<()> {
                                 let req = WhoIsCoordinatorPayload {
                                     node_id: node_id.clone(),
                                 };
-                                if seed_conn.send(MessageType::WhoIsCoordinator, 0, &req).await.is_ok() {
-                                    if let Ok(Ok((hdr, pay))) = tokio::time::timeout(
+                                if seed_conn.send(MessageType::WhoIsCoordinator, 0, &req).await.is_ok()
+                                    && let Ok(Ok((hdr, pay))) = tokio::time::timeout(
                                         Duration::from_secs(2),
                                         seed_conn.recv(),
-                                    ).await {
-                                        if hdr.msg_type == MessageType::WhoIsCoordinatorResponse {
-                                            if let Ok(resp) = FramedConnection::deserialize_payload::<WhoIsCoordinatorResponsePayload>(&pay) {
-                                                if let Some(addr) = resp.coordinator_addr {
+                                    ).await
+                                        && hdr.msg_type == MessageType::WhoIsCoordinatorResponse
+                                            && let Ok(resp) = FramedConnection::deserialize_payload::<WhoIsCoordinatorResponsePayload>(&pay)
+                                                && let Some(addr) = resp.coordinator_addr {
                                                     if addr != coordinator_addr {
                                                         tracing::info!(
                                                             "seed discovery: coordinator moved to {addr} (was {coordinator_addr})"
@@ -1226,10 +1224,6 @@ async fn main() -> Result<()> {
                                                     }
                                                     break;
                                                 }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
                     }

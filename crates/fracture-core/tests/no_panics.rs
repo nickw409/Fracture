@@ -73,11 +73,10 @@ fn scan_dir(dir: &Path, violations: &mut Vec<(String, usize, String)>) {
 
 fn scan_file(path: &Path, violations: &mut Vec<(String, usize, String)>) {
     // Skip dedicated test modules (files named *_tests.rs).
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if stem.ends_with("_tests") {
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && stem.ends_with("_tests") {
             return;
         }
-    }
 
     let content = fs::read_to_string(path).unwrap();
     let lines: Vec<&str> = content.lines().collect();

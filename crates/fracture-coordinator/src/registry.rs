@@ -151,11 +151,10 @@ impl PeerRegistry {
     /// Mark a worker as draining (intent to leave). No new work should be
     /// scheduled to this worker, but existing sequences continue until complete.
     pub fn mark_draining(&mut self, node_id: &str) {
-        if let Some(entry) = self.workers.get_mut(node_id) {
-            if entry.status == WorkerStatus::Ready {
+        if let Some(entry) = self.workers.get_mut(node_id)
+            && entry.status == WorkerStatus::Ready {
                 entry.status = WorkerStatus::Draining;
             }
-        }
     }
 
     /// Mark a worker as pending (waiting to join the pipeline via rebalance).
