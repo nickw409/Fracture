@@ -206,6 +206,17 @@ pub struct TensorInfo {
     pub(crate) gguf_dtype: u32,
 }
 
+/// Parsed GGUF header (everything before tensor data) as obtained from a raw
+/// byte slice. Used by the fuzz target and any caller that has already loaded
+/// the header bytes into memory.
+#[derive(Debug)]
+pub struct GgufHeader {
+    pub config: ModelConfig,
+    pub metadata: HashMap<String, MetadataValue>,
+    pub tensors: Vec<TensorInfo>,
+    pub tensor_data_offset: usize,
+}
+
 /// Result of parsing a GGUF file.
 pub struct GgufFile {
     // Debug is manually implemented below because Mmap doesn't derive Debug.
@@ -236,87 +247,124 @@ impl GgufParser {
     pub fn parse(path: &Path) -> Result<GgufFile> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let mut cursor = Cursor::new(mmap.as_ref());
-
-        // Header
-        let magic = cursor.read_u32::<LittleEndian>()?;
-        if magic != GGUF_MAGIC {
-            return Err(FractureError::GgufParse(format!(
-                "invalid magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
-            )));
-        }
-
-        let version = cursor.read_u32::<LittleEndian>()?;
-        if version != GGUF_VERSION {
-            return Err(FractureError::GgufParse(format!(
-                "unsupported GGUF version: {version} (only v3 supported)"
-            )));
-        }
-
-        let tensor_count = cursor.read_u64::<LittleEndian>()? as usize;
-        let metadata_kv_count = cursor.read_u64::<LittleEndian>()? as usize;
-
-        tracing::info!(
-            "GGUF v{version}: {tensor_count} tensors, {metadata_kv_count} metadata entries"
-        );
-
-        // Metadata
-        let mut metadata = HashMap::with_capacity(metadata_kv_count);
-        for _ in 0..metadata_kv_count {
-            let key = read_gguf_string(&mut cursor)?;
-            let value = read_metadata_value(&mut cursor)?;
-            metadata.insert(key, value);
-        }
-
-        // Tensor info table
-        let mut tensors = Vec::with_capacity(tensor_count);
-        for _ in 0..tensor_count {
-            let name = read_gguf_string(&mut cursor)?;
-            let ndims = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut shape = Vec::with_capacity(ndims);
-            for _ in 0..ndims {
-                shape.push(cursor.read_u64::<LittleEndian>()? as usize);
-            }
-            // GGUF stores dimensions innermost-first. Reverse to match the
-            // row-major convention used by the engine.
-            shape.reverse();
-            let dtype_code = cursor.read_u32::<LittleEndian>()?;
-            let gguf_dtype = GgufDType::from_u32(dtype_code)?;
-            let dtype = gguf_dtype.to_fracture_dtype()?;
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            tensors.push(TensorInfo {
-                name,
-                shape,
-                dtype,
-                offset,
-                gguf_dtype: dtype_code,
-            });
-        }
-
-        // Tensor data starts after the header, aligned to GGUF_DEFAULT_ALIGNMENT (32 bytes for v3)
-        let current_pos = cursor.position() as usize;
-        let alignment = get_alignment(&metadata);
-        let tensor_data_offset = align_offset(current_pos, alignment);
-
-        tracing::info!(
-            "tensor data starts at offset 0x{tensor_data_offset:X} (alignment={alignment})"
-        );
-
-        let config = extract_model_config(&metadata)?;
-
+        let header = parse_header_bytes(mmap.as_ref())?;
         Ok(GgufFile {
-            config,
-            metadata,
-            tensors,
+            config: header.config,
+            metadata: header.metadata,
+            tensors: header.tensors,
             mmap,
-            tensor_data_offset,
+            tensor_data_offset: header.tensor_data_offset,
         })
     }
+}
+
+/// Parse a GGUF header from a raw byte slice. Used by the fuzz target and the
+/// regression-test harness — neither needs the memory map, only the parsed
+/// metadata and tensor descriptors. Public so out-of-tree fuzz drivers and
+/// crash-regression tests can exercise the parser without writing to disk.
+pub fn parse_header_from_bytes(bytes: &[u8]) -> Result<GgufHeader> {
+    parse_header_bytes(bytes)
+}
+
+/// Internal parser body. Pure-function-of-bytes — no I/O, no mmap.
+fn parse_header_bytes(bytes: &[u8]) -> Result<GgufHeader> {
+    let mut cursor = Cursor::new(bytes);
+
+    // Header
+    let magic = cursor.read_u32::<LittleEndian>()?;
+    if magic != GGUF_MAGIC {
+        return Err(FractureError::GgufParse(format!(
+            "invalid magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
+        )));
+    }
+
+    let version = cursor.read_u32::<LittleEndian>()?;
+    if version != GGUF_VERSION {
+        return Err(FractureError::GgufParse(format!(
+            "unsupported GGUF version: {version} (only v3 supported)"
+        )));
+    }
+
+    let tensor_count = cursor.read_u64::<LittleEndian>()? as usize;
+    let metadata_kv_count = cursor.read_u64::<LittleEndian>()? as usize;
+
+    tracing::info!(
+        "GGUF v{version}: {tensor_count} tensors, {metadata_kv_count} metadata entries"
+    );
+
+    // Bound the with_capacity allocations: an attacker can write u64::MAX into
+    // these fields, which would otherwise cause Vec/HashMap to abort the process
+    // on allocation. Cap to "no more bytes than remain in the input" — every
+    // entry consumes at least one byte (in practice many more), so this is a
+    // safe upper bound that still preserves performance for honest inputs.
+    let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+    let metadata_cap = metadata_kv_count.min(remaining);
+    let tensor_cap = tensor_count.min(remaining);
+
+    // Metadata
+    let mut metadata = HashMap::with_capacity(metadata_cap);
+    for _ in 0..metadata_kv_count {
+        let key = read_gguf_string(&mut cursor)?;
+        let value = read_metadata_value(&mut cursor)?;
+        metadata.insert(key, value);
+    }
+
+    // Tensor info table
+    let mut tensors = Vec::with_capacity(tensor_cap);
+    for _ in 0..tensor_count {
+        let name = read_gguf_string(&mut cursor)?;
+        let ndims = cursor.read_u32::<LittleEndian>()? as usize;
+        let mut shape = Vec::with_capacity(ndims.min(remaining));
+        for _ in 0..ndims {
+            shape.push(cursor.read_u64::<LittleEndian>()? as usize);
+        }
+        // GGUF stores dimensions innermost-first. Reverse to match the
+        // row-major convention used by the engine.
+        shape.reverse();
+        let dtype_code = cursor.read_u32::<LittleEndian>()?;
+        let gguf_dtype = GgufDType::from_u32(dtype_code)?;
+        let dtype = gguf_dtype.to_fracture_dtype()?;
+        let offset = cursor.read_u64::<LittleEndian>()?;
+        tensors.push(TensorInfo {
+            name,
+            shape,
+            dtype,
+            offset,
+            gguf_dtype: dtype_code,
+        });
+    }
+
+    // Tensor data starts after the header, aligned to GGUF_DEFAULT_ALIGNMENT (32 bytes for v3)
+    let current_pos = cursor.position() as usize;
+    let alignment = get_alignment(&metadata);
+    let tensor_data_offset = align_offset(current_pos, alignment);
+
+    tracing::info!(
+        "tensor data starts at offset 0x{tensor_data_offset:X} (alignment={alignment})"
+    );
+
+    let config = extract_model_config(&metadata)?;
+
+    Ok(GgufHeader {
+        config,
+        metadata,
+        tensors,
+        tensor_data_offset,
+    })
 }
 
 /// Read a GGUF string: u64 length prefix followed by UTF-8 bytes (no null terminator).
 fn read_gguf_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     let len = cursor.read_u64::<LittleEndian>()? as usize;
+    // Reject lengths that exceed the remaining input. Without this check an
+    // attacker-supplied u64::MAX would cause `vec![0u8; len]` to abort the
+    // process before `read_exact` ever gets a chance to error.
+    let remaining = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
+    if len > remaining {
+        return Err(FractureError::GgufParse(format!(
+            "string length {len} exceeds remaining input {remaining}"
+        )));
+    }
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf)?;
     String::from_utf8(buf)
@@ -351,7 +399,13 @@ fn read_typed_value(cursor: &mut Cursor<&[u8]>, typ: GgufMetadataType) -> Result
             let elem_type_code = cursor.read_u32::<LittleEndian>()?;
             let elem_type = GgufMetadataType::from_u32(elem_type_code)?;
             let len = cursor.read_u64::<LittleEndian>()? as usize;
-            let mut values = Vec::with_capacity(len);
+            // Cap with_capacity at the remaining input so an adversarial
+            // huge `len` cannot abort the process via Vec allocation.
+            let remaining = cursor
+                .get_ref()
+                .len()
+                .saturating_sub(cursor.position() as usize);
+            let mut values = Vec::with_capacity(len.min(remaining));
             for _ in 0..len {
                 values.push(read_typed_value(cursor, elem_type)?);
             }
@@ -369,7 +423,12 @@ fn get_alignment(metadata: &HashMap<String, MetadataValue>) -> usize {
 }
 
 fn align_offset(offset: usize, alignment: usize) -> usize {
-    (offset + alignment - 1) & !(alignment - 1)
+    if alignment == 0 {
+        return offset;
+    }
+    // Use saturating arithmetic so adversarial offset/alignment values don't
+    // overflow when the parser is fed garbage.
+    offset.saturating_add(alignment - 1) & !(alignment - 1)
 }
 
 /// Extract ModelConfig from GGUF metadata using standard llama.cpp key names.
@@ -414,6 +473,11 @@ fn extract_model_config(metadata: &HashMap<String, MetadataValue>) -> Result<Mod
         })
         .ok_or_else(|| FractureError::GgufParse("cannot determine vocab_size".into()))?;
 
+    if num_q_heads == 0 {
+        return Err(FractureError::GgufParse(format!(
+            "{arch}.attention.head_count must be > 0"
+        )));
+    }
     let head_dim = hidden_size / num_q_heads;
     let rope_theta = get_f64(&format!("{arch}.rope.freq_base"), 500000.0);
     let rms_norm_eps = get_f64(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
