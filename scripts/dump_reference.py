@@ -913,8 +913,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--layers",
-        default="0,last",
-        help="Comma-separated layer indices, 'all', or 'last' as a sentinel (default: '0,last'). Supports ranges: '0-3,31'.",
+        default="0,8,16,24,last",
+        help="Comma-separated layer indices, 'all', or 'last' as a sentinel (default: '0,8,16,24,last'). Supports ranges: '0-3,31'. Mid-stack layers catch errors that compound across the depth of the network.",
     )
     parser.add_argument(
         "--generate-tokens",
